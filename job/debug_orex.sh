@@ -5,7 +5,7 @@
 #SBATCH -o job/reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
@@ -17,7 +17,6 @@ set -euo pipefail
 # Distributed launch
 # -----------------------------
 NPROC=4
-NTASKS=$((SLURM_NNODES * NPROC))
 
 # -----------------------------
 # Project / environment
@@ -33,7 +32,6 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
-export MASTER_ADDR MASTER_PORT
 
 # -----------------------------
 # Physics / PT config
@@ -75,7 +73,13 @@ RUN_NAME="${RUN_NAME:-debug_orex_obc_T${T}_L${L}_r8_bs${BS}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(
-  python
+  torchrun
+  --nnodes="$SLURM_NNODES"
+  --node_rank="$SLURM_NODEID"
+  --nproc_per_node="$NPROC"
+  --rdzv_id="$SLURM_JOB_ID"
+  --rdzv_backend=c10d
+  --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   main/main_pt_obc.py
   --algorithm orex
   --D "$D"
@@ -109,9 +113,7 @@ CMD=(
 )
 
 echo "Running command:"
-printf ' %q' srun --ntasks="$NTASKS" --ntasks-per-node="$NPROC" --cpu-bind=none bash -c \
-  'export RANK="$SLURM_PROCID"; export WORLD_SIZE="$SLURM_NTASKS"; export LOCAL_RANK="$SLURM_LOCALID"; exec "$@"' bash "${CMD[@]}"
+printf ' %q' "${CMD[@]}"
 echo
 
-srun --ntasks="$NTASKS" --ntasks-per-node="$NPROC" --cpu-bind=none bash -c \
-  'export RANK="$SLURM_PROCID"; export WORLD_SIZE="$SLURM_NTASKS"; export LOCAL_RANK="$SLURM_LOCALID"; exec "$@"' bash "${CMD[@]}"
+srun "${CMD[@]}"
