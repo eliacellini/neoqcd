@@ -119,17 +119,17 @@ class HBOR():
         #heatbath
         for mu in range(self.D):
             for eo in range(2):
-                current_mask = mask[eo+mu*2,:]
+                current_mask = mask[eo+mu*2,:].to(dtype=torch.bool)
                 cfgs_new = self.hb_update(cfgs, mu, rand, defect)
-                cfgs = current_mask * cfgs_new + (1-current_mask) * cfgs
+                cfgs = torch.where(current_mask, cfgs_new, cfgs)
 
         #overrelaxation
         for o in range(self.orsteps):
             for mu in range(self.D):
                 for eo in range(2):
-                    current_mask = mask[eo+mu*2,:]
+                    current_mask = mask[eo+mu*2,:].to(dtype=torch.bool)
                     cfgs_new = self.over_update(cfgs, mu, defect)
-                    cfgs = current_mask * cfgs_new + (1-current_mask) * cfgs
+                    cfgs = torch.where(current_mask, cfgs_new, cfgs)
         return cfgs
 
     def haar(self, cfgs):
