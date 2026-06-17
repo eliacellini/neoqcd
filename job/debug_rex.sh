@@ -82,7 +82,9 @@ RUN_NAME="${RUN_NAME:-debug_neorex_obc_T${T}_L${L}_r8_bs${BS}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(
-  torchrun
+  python
+  -m
+  torch.distributed.run
   --nnodes="$SLURM_NNODES"
   --node_rank="$SLURM_NODEID"
   --nproc_per_node="$NPROC"
