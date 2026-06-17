@@ -29,6 +29,7 @@ source .sunenv/bin/activate
 
 export NCCL_SHM_DISABLE=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
@@ -139,5 +140,8 @@ CMD=(
 echo "Running command:"
 printf ' %q' "${CMD[@]}"
 echo
+echo "WANDB_MODE=$WANDB_MODE"
+echo "W&B offline sync command after the job:"
+echo "  wandb sync ${OUTPUT_DIR}/wandb/offline-run-*"
 
 srun "${CMD[@]}"
