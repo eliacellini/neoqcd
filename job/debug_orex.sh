@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --account=INF26_sft
 #SBATCH --job-name=neoqcd-orex-debug
 #SBATCH -e job/reports/errors_%x_%j
 #SBATCH -o job/reports/output_%x_%j
@@ -21,7 +22,6 @@ NPROC=4
 # Project / environment
 # -----------------------------
 PROJECT_DIR="${PROJECT_DIR:-/leonardo_work/INF26_sft/ecellini/neoqcd}"
-cd "$PROJECT_DIR"
 
 module load profile/deeplrn
 module load cineca-ai/
@@ -43,14 +43,14 @@ N=3
 BETA=6.0
 BC_MIN=0.0
 BC_MAX=1.0
-BS=8
+BS=16
 
 DEFECT_SIZE=2
 TIME_SLICE=4
 SPACE_SLICE=3
 
 THERMAL_STEPS=20
-STEPS=200
+STEPS=20
 SWEEP=1
 SWAP_EVERY=1
 SWAP_PARITY=alternating
@@ -59,7 +59,7 @@ OREX_SCHEDULE=even_odd
 # -----------------------------
 # O-REX config
 # -----------------------------
-OREX_PROTOCOL_STEPS=8
+OREX_PROTOCOL_STEPS=4
 OREX_MCMC_STEPS_PER_STEP=1
 
 # -----------------------------
