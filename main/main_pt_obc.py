@@ -503,6 +503,9 @@ def main(args: argparse.Namespace) -> None:
                     "parameter_local_min",
                     "parameter_local_max",
                     "elapsed_seconds",
+                    "thermalization_seconds",
+                    "measurement_elapsed_seconds",
+                    "total_elapsed_seconds",
                 ]
             )
 
@@ -655,6 +658,7 @@ def main(args: argparse.Namespace) -> None:
     cfgs = torch.eye(args.N, dtype=torch.cdouble, device=device)
     cfgs = cfgs.view(1, 1, 1, 1, 1, args.N, args.N).repeat(args.batch_size, args.D, args.T, args.L, args.L, args.L, 1, 1)
 
+    thermalization_t0 = time.time()
     for _ in range(args.thermal_steps):
         cfgs = local_hbor_sweep(
             cfgs=cfgs,
@@ -664,6 +668,15 @@ def main(args: argparse.Namespace) -> None:
             mask=mask,
             defect_mask=defect_mask,
         )
+    thermalization_elapsed = time.time() - thermalization_t0
+    if rank == 0:
+        print(
+            f"thermalization_steps={args.thermal_steps}  "
+            f"thermalization_elapsed_s={thermalization_elapsed:.2f}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.summary["timing/thermalization_seconds"] = float(thermalization_elapsed)
 
     t0 = time.time()
     total_swap_accepted = 0
@@ -767,6 +780,7 @@ def main(args: argparse.Namespace) -> None:
             )
             work_step = float(stats.get("work_mean", float("nan")))
             flow_loss_step = float(stats.get("flow_loss", float("nan")))
+            measurement_elapsed_step = time.time() - t0
             work_cum = (
                 total_work_sum / total_work_count
                 if total_work_count > 0
@@ -775,6 +789,9 @@ def main(args: argparse.Namespace) -> None:
             wb = {
                 "step": step + 1,
                 "train_flow": int(train_flow),
+                "timing/thermalization_seconds": float(thermalization_elapsed),
+                "timing/measurement_elapsed_seconds": float(measurement_elapsed_step),
+                "timing/total_elapsed_seconds": float(thermalization_elapsed + measurement_elapsed_step),
                 "swap/n_accepted": int(stats.get("n_accepted", 0)),
                 "swap/n_proposed": int(stats.get("n_proposed", 0)),
                 "swap/acceptance_step": float(swap_acc_step),
@@ -831,13 +848,15 @@ def main(args: argparse.Namespace) -> None:
             lmin = pt.local_parameters.min().item()
             lmax = pt.local_parameters.max().item()
             elapsed = time.time() - t0
+            total_elapsed = thermalization_elapsed + elapsed
             elapsed_since_last_log = elapsed - last_log_elapsed
             last_log_elapsed = elapsed
             print(
                 f"step={step+1:5d}  swap_acc={swap_acc:.3f}  "
                 f"work_mean={step_work_mean:.6e}  work_sem={step_work_sem:.3e}  "
                 f"flow_loss={step_flow_loss:.6e}  train_flow={int(train_flow)}  "
-                f"elapsed_s={elapsed:.2f}  dt_log_s={elapsed_since_last_log:.2f}  "
+                f"measurement_elapsed_s={elapsed:.2f}  total_elapsed_s={total_elapsed:.2f}  "
+                f"dt_log_s={elapsed_since_last_log:.2f}  "
                 f"parameter_name={pt.parameter_name}  "
                 f"parameter_local=[{lmin:.6f}, {lmax:.6f}]",
                 flush=True,
@@ -864,10 +883,15 @@ def main(args: argparse.Namespace) -> None:
                         float(lmin),
                         float(lmax),
                         float(elapsed),
+                        float(thermalization_elapsed),
+                        float(elapsed),
+                        float(total_elapsed),
                     ]
                 )
 
     if rank == 0:
+        measurement_elapsed = time.time() - t0
+        total_elapsed = thermalization_elapsed + measurement_elapsed
         mean_swap_acc = (
             total_swap_accepted / total_swap_proposed
             if total_swap_proposed > 0
@@ -880,6 +904,21 @@ def main(args: argparse.Namespace) -> None:
             f"swap_attempts={total_swap_attempts}",
             flush=True,
         )
+        print(
+            f"timing_thermalization_s={thermalization_elapsed:.2f}  "
+            f"timing_measurement_s={measurement_elapsed:.2f}  "
+            f"timing_total_s={total_elapsed:.2f}",
+            flush=True,
+        )
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["timing"] = {
+            "thermalization_seconds": float(thermalization_elapsed),
+            "measurement_seconds": float(measurement_elapsed),
+            "total_seconds": float(total_elapsed),
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
         if args.algorithm in {"orex", "neorex"}:
             run_work_mean, run_work_sem = _mean_sem_from_moments(
                 total_work_sum,
@@ -906,6 +945,8 @@ def main(args: argparse.Namespace) -> None:
                 flush=True,
             )
         if wandb_run is not None:
+            wandb_run.summary["timing/measurement_seconds"] = float(measurement_elapsed)
+            wandb_run.summary["timing/total_seconds"] = float(total_elapsed)
             wandb_run.finish()
 
     dist.barrier()
