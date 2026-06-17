@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
 #SBATCH --job-name=neoqcd-neorex-debug
-#SBATCH -e job/reports/errors_%x_%j
-#SBATCH -o job/reports/output_%x_%j
+#SBATCH -e reports/errors_%x_%j
+#SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
@@ -65,9 +65,9 @@ NEOREX_HEATBATH_STEPS_PER_STEP=1
 NEOREX_WORK_MODE=logdet
 NEOREX_FLOW_LR=1e-3
 NEOREX_GRAD_CLIP_NORM=0.0
-TRAIN_STEPS=100
+TRAIN_STEPS=20
 
-HYPER_SMEARING_MODE=per_link
+HYPER_SMEARING_MODE=class
 HYPER_TIME_EMBEDDING_DIM=8
 HYPER_HIDDEN_DIM=16
 HYPER_RHO_INIT=1e-3

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
 #SBATCH --job-name=neoqcd-orex-debug
-#SBATCH -e job/reports/errors_%x_%j
-#SBATCH -o job/reports/output_%x_%j
+#SBATCH -e reports/errors_%x_%j
+#SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
@@ -38,8 +38,8 @@ MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 # Physics / PT config
 # -----------------------------
 D=4
-T=2
-L=2
+T=8
+L=8
 N=3
 BETA=6.0
 BC_MIN=0.0
@@ -50,8 +50,8 @@ DEFECT_SIZE=2
 TIME_SLICE=0
 SPACE_SLICE=0
 
-THERMAL_STEPS=2
-STEPS=2
+THERMAL_STEPS=20
+STEPS=20
 SWEEP=1
 SWAP_EVERY=1
 SWAP_PARITY=alternating
