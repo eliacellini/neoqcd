@@ -74,7 +74,6 @@ class HBOR():
         self.device = flow_pars.device
 
         self.beta = beta
-        self.defect_par = defect_par
 
         if self.N==2:
             self.hb_update=self.SU2_link_update_hb
@@ -85,33 +84,37 @@ class HBOR():
             self.haar_hb_update=self.SU3_link_haar_hb
             self.over_update=self.SU3_link_update_over
 
-        if self.defect_par < 1.0:
+        self.set_defect_parameter(defect_par)
+
+    def _defect_parameter_uses_defect(self) -> bool:
+        if torch.is_tensor(self.defect_par):
+            return bool((self.defect_par < 1.0).any().item())
+        return bool(self.defect_par < 1.0)
+
+    def set_defect_parameter(self, defect_par):
+        if torch.is_tensor(defect_par):
+            self.defect_par = defect_par.detach().to(device=self.device, dtype=torch.float64).reshape(-1)
+        else:
+            self.defect_par = float(defect_par)
+        if self._defect_parameter_uses_defect():
             self.sum_of_staples = self.sum_of_staples_defect
             self.heatbath = self.heatbath_defect
         else:
             self.sum_of_staples = self.sum_of_staples_standard
             self.heatbath = self.heatbath_standard
 
-    def set_defect_parameter(self, defect_par: float):
-        self.defect_par = float(defect_par)
-        if self.defect_par < 1.0:
-            self.sum_of_staples = self.sum_of_staples_defect
-            self.heatbath = self.heatbath_defect
-        else:
-            self.sum_of_staples = self.sum_of_staples_standard
-            self.heatbath = self.heatbath_standard
 
+    def __call__(self, cfgs, mask, defect, rand=None):
 
-    def __call__(self, cfgs, mask, defect):
-
-        rn_shape = list(cfgs.shape[:-2])
-        if self.N == 3:
-            rn_shape.insert(1, 18)
-        elif self.N == 2:
-            rn_shape.insert(1, 6)
-        rn_shape = tuple(rn_shape)
-        #extracting random numbers
-        rand = torch.rand(rn_shape, device=cfgs.device, dtype=cfgs.real.dtype)
+        if rand is None:
+            rn_shape = list(cfgs.shape[:-2])
+            if self.N == 3:
+                rn_shape.insert(1, 18)
+            elif self.N == 2:
+                rn_shape.insert(1, 6)
+            rn_shape = tuple(rn_shape)
+            #extracting random numbers
+            rand = torch.rand(rn_shape, device=cfgs.device, dtype=cfgs.real.dtype)
 
         #heatbath
         for mu in range(self.D):
@@ -143,16 +146,56 @@ class HBOR():
 
         return self.haar_hb_update(cfgs, rand)
     
+    def _batch_kappa(self, cfgs, defect):
+        defect = defect.to(device=cfgs.device, dtype=cfgs.real.dtype)
+        if torch.is_tensor(self.defect_par):
+            p = self.defect_par.to(device=cfgs.device, dtype=cfgs.real.dtype)
+            if p.numel() == 1:
+                return defect[0, :] + defect[1, :] * p.reshape(())
+            if p.numel() != int(cfgs.shape[0]):
+                raise ValueError(
+                    f"defect_par has shape ({p.numel()},), expected batch size {int(cfgs.shape[0])}"
+                )
+            view_shape = (int(cfgs.shape[0]),) + (1,) * (defect.dim() - 1)
+            return defect[0, :].unsqueeze(0) + defect[1, :].unsqueeze(0) * p.view(view_shape)
+        return defect[0, :] + defect[1, :] * float(self.defect_par)
+
+    def _kappa_link(self, kappa, mu):
+        if kappa.dim() == self.D + 2:
+            return kappa[:, mu]
+        return kappa[mu]
+
+    def _beta_for_staples(self, k):
+        beta = torch.as_tensor(self.beta, device=k.device, dtype=k.dtype)
+        if beta.dim() == 0:
+            return beta
+        beta = beta.reshape(-1)
+        if beta.numel() == 1:
+            return beta.reshape(())
+        if beta.numel() != int(k.shape[0]):
+            raise ValueError(f"beta has shape ({beta.numel()},), expected batch size {int(k.shape[0])}")
+        return beta.view((int(k.shape[0]),) + (1,) * (k.dim() - 1))
+
     def sum_of_staples_defect(self, cfgs, mu, defect):
         staple = torch.zeros(cfgs[:,0].shape, dtype=cfgs.dtype, device=cfgs.device)
-        kappa = defect[0,:] + defect[1,:] * self.defect_par
+        kappa = self._batch_kappa(cfgs, defect)
 
         for nu in range(self.D):
             if nu != mu:
-                kappamunu = kappa[mu] * torch.roll(kappa, 1, dims=(-self.D + mu))[nu] * torch.roll(kappa, 1, dims=(-self.D + nu))[mu] * kappa[nu]
+                kappamunu = (
+                    self._kappa_link(kappa, mu)
+                    * self._kappa_link(torch.roll(kappa, 1, dims=(-self.D + mu)), nu)
+                    * self._kappa_link(torch.roll(kappa, 1, dims=(-self.D + nu)), mu)
+                    * self._kappa_link(kappa, nu)
+                )
                 staple += kappamunu.unsqueeze(-1).unsqueeze(-1) * sun.pstaple(cfgs, mu, nu, self.D)
                 
-                kappamunu = kappa[mu] * torch.roll(kappa, (1,-1), dims=(-self.D + mu,-self.D + nu))[nu] * torch.roll(kappa, -1, dims=(-self.D + nu))[mu] * torch.roll(kappa, -1, dims=(-self.D + nu))[nu]
+                kappamunu = (
+                    self._kappa_link(kappa, mu)
+                    * self._kappa_link(torch.roll(kappa, (1,-1), dims=(-self.D + mu,-self.D + nu)), nu)
+                    * self._kappa_link(torch.roll(kappa, -1, dims=(-self.D + nu)), mu)
+                    * self._kappa_link(torch.roll(kappa, -1, dims=(-self.D + nu)), nu)
+                )
                 staple += kappamunu.unsqueeze(-1).unsqueeze(-1) * sun.nstaple(cfgs, mu, nu, self.D)
 
         return staple
@@ -179,7 +222,7 @@ class HBOR():
 
     def heatbath_standard(self, staples, rand, factor):
         k = torch.sqrt(sun.SUN_determinant(staples).abs())
-        xi = factor / (self.beta * k)
+        xi = factor / (self._beta_for_staples(k) * k)
 
         #WARNING: if rand[:,0] and one of the two other rand are simultaneously 0 a NaN occurs in the gradient of mod. Probably very unlikely
         lam2 = (- 0.5 * xi * (torch.log(1.0 - rand[:,0,:]) + torch.cos(2.0 * torch.pi *(1.0 - rand[:,1,:]))**2 * torch.log(1.0 - rand[:,2,:])))
@@ -207,7 +250,7 @@ class HBOR():
         #this guarantees that links whose sum of staples has zero determinant do not generate nans. To do the heatbath a random SU(2) matrix is generated instead.
         k0 = k > 0.0
         k = k * k0 + torch.ones_like(k) * ~k0
-        xi = factor / (self.beta * k)
+        xi = factor / (self._beta_for_staples(k) * k)
 
         #WARNING: if rand[:,0] and one of the two other rand are simultaneously 0 a NaN occurs in the gradient of mod. Probably very unlikely
         #the second addend generates a random SU(2) matrix for staples that have zero determinant
@@ -378,6 +421,11 @@ class DefectMCMCAdapter:
         )
         self._hbor_cache: dict[float, HBOR] = {}
         self._action_cache: dict[float, Wilson_action] = {}
+        self._batch_hbor = HBOR(
+            self.flow_pars,
+            beta=self.beta,
+            defect_par=float(default_parameter),
+        )
 
     def _normalize_parameter(
         self,
@@ -522,22 +570,15 @@ class DefectMCMCAdapter:
         if self._current_parameter is None:
             raise RuntimeError("Call set_parameter(...) before using DefectMCMCAdapter.")
 
-        p = self._current_parameter.to(device=x.device)
+        p = self._normalize_parameter(
+            self._current_parameter,
+            device=x.device,
+            expected_batch_size=int(x.shape[0]),
+        )
         out = x
         mask = self.flow_pars.mask.to(device=x.device)
         defect_mask = self.defect_mask.to(device=x.device)
         for _ in range(int(nsteps)):
-            out_next = out.clone()
-            for p_val in torch.unique(p):
-                sel = torch.nonzero(p == p_val, as_tuple=False).squeeze(-1)
-                if sel.numel() == 0:
-                    continue
-                updater = self._get_hbor(float(p_val.item()))
-                updated = updater(
-                    out.index_select(0, sel),
-                    mask,
-                    defect_mask,
-                )
-                out_next.index_copy_(0, sel, updated)
-            out = out_next
+            self._batch_hbor.set_defect_parameter(p)
+            out = self._batch_hbor(out, mask, defect_mask)
         return out
