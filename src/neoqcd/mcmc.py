@@ -1,7 +1,11 @@
 import torch
 import torch.utils.checkpoint as checkpoint
 import neoqcd.sun_utils as sun
-from neoqcd.theory import Wilson_action
+from neoqcd.theory import (
+    Wilson_action,
+    build_nf_halo_plaquette_masks,
+    local_nf_action_change as theory_local_nf_action_change,
+)
 from typing import Optional
 
 
@@ -426,6 +430,13 @@ class DefectMCMCAdapter:
             beta=self.beta,
             defect_par=float(default_parameter),
         )
+        self._nf_halo_plaquette_masks = None
+        if getattr(self.flow_pars, "defect", None) is not None:
+            self._nf_halo_plaquette_masks = build_nf_halo_plaquette_masks(
+                self.flow_pars,
+                self.defect_mask,
+                device=self.flow_pars.device,
+            )
 
     def _normalize_parameter(
         self,
@@ -557,6 +568,42 @@ class DefectMCMCAdapter:
                 delta = delta + torch.sum((weight_old - weight_new) * retr / float(self.flow_pars.N), dims)
 
         return delta * float(self.beta)
+
+    def local_nf_action_change(
+        self,
+        x_old: torch.Tensor,
+        x_new: torch.Tensor,
+        parameter_old: torch.Tensor,
+        parameter_new: torch.Tensor,
+        parameter_name: str = "bc",
+    ) -> torch.Tensor:
+        if str(parameter_name) != self.parameter_name:
+            raise ValueError(
+                f"Unsupported parameter_name={parameter_name!r}, expected {self.parameter_name!r}"
+            )
+        p_old = self._normalize_parameter(
+            parameter_old,
+            device=x_old.device,
+            expected_batch_size=int(x_old.shape[0]),
+        )
+        p_new = self._normalize_parameter(
+            parameter_new,
+            device=x_old.device,
+            expected_batch_size=int(x_old.shape[0]),
+        )
+        if self._nf_halo_plaquette_masks is None:
+            raise RuntimeError("local_nf_action_change requires flow_pars.defect")
+        return theory_local_nf_action_change(
+            x_old=x_old,
+            x_new=x_new,
+            defect_mask=self.defect_mask,
+            beta=self.beta,
+            parameter_old=p_old,
+            parameter_new=p_new,
+            plaquette_masks=self._nf_halo_plaquette_masks,
+            D=self.flow_pars.D,
+            N=self.flow_pars.N,
+        )
 
     @torch.no_grad()
     def __call__(

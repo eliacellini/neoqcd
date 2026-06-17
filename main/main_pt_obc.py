@@ -276,7 +276,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweeps-per-step", type=int, default=1)
     parser.add_argument("--sweep", type=int, default=None, help="Alias of --sweeps-per-step")
     parser.add_argument("--swap-every", type=int, default=1)
-    parser.add_argument("--orsteps", type=int, default=1)
+    parser.add_argument("--orsteps", type=int, default=4)
     parser.add_argument("--updates-per-layer", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")

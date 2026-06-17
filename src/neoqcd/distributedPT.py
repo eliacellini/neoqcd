@@ -842,6 +842,31 @@ class NEOREXProtocolWrapper(nn.Module):
         except AttributeError:
             return _call_action_fn(self.theory, x, parameter, self.parameter_name)
 
+    def action_change(
+        self,
+        x_old: torch.Tensor,
+        x_new: torch.Tensor,
+        parameter_old: torch.Tensor,
+        parameter_new: torch.Tensor,
+    ):
+        if hasattr(self.theory, "local_nf_action_change"):
+            try:
+                return self.theory.local_nf_action_change(
+                    x_old,
+                    x_new,
+                    parameter_old,
+                    parameter_new,
+                    parameter_name=self.parameter_name,
+                )
+            except TypeError:
+                return self.theory.local_nf_action_change(
+                    x_old,
+                    x_new,
+                    parameter_old,
+                    parameter_new,
+                )
+        return self.action(x_new, parameter_new) - self.action(x_old, parameter_old)
+
     def _call_nf(self, x: torch.Tensor, parameter: torch.Tensor, delta_parameter: torch.Tensor):
         try:
             out = self.nf_layer(
@@ -887,14 +912,12 @@ class NEOREXProtocolWrapper(nn.Module):
         delta_parameter: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
-        if self.work_mode == "logdet":
-            action_0 = self.action(x, parameter_0)
         x_next, aux = self._call_nf(x, parameter_0, delta_parameter)
         aux = aux.to(device=x.device, dtype=work_dtype)
         if self.work_mode == "work":
             dwork = aux
         else:
-            dwork = self.action(x_next, parameter_1) - action_0 - aux
+            dwork = self.action_change(x, x_next, parameter_0, parameter_1) - aux
         return x_next, dwork
 
     def forward(
@@ -1221,15 +1244,6 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             x_in = x_curr.detach()
             x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active)
             step_stats = self._train_flow_from_work(dwork, active)
-            total_stats["_flow_loss_sum"] += float(step_stats.get("_flow_loss_sum", 0.0))
-            total_stats["_flow_loss_count"] += int(step_stats.get("_flow_loss_count", 0))
-            step_link_sum = step_stats.get("_flow_loss_link_sum", [])
-            step_link_count = step_stats.get("_flow_loss_link_count", [])
-            for k in range(len(total_stats["_flow_loss_link_sum"])):
-                if k < len(step_link_sum):
-                    total_stats["_flow_loss_link_sum"][k] += float(step_link_sum[k])
-                if k < len(step_link_count):
-                    total_stats["_flow_loss_link_count"][k] += int(step_link_count[k])
             total_stats["applied_updates"] += int(step_stats.get("applied_updates", 0))
             total_stats["skipped_nan_grad_updates"] += int(
                 step_stats.get("skipped_nan_grad_updates", 0)
@@ -1241,11 +1255,15 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             if bool(module.nf_first):
                 x_curr = self._run_stochastic_blocks_active(module, x_curr, beta_1, active_idx)
 
+        link_loss_sum, link_loss_count = self._flow_loss_link_moments(total_work.detach(), active)
+        total_stats["_flow_loss_link_sum"] = link_loss_sum
+        total_stats["_flow_loss_link_count"] = link_loss_count
+        total_stats["_flow_loss_sum"] = float(sum(link_loss_sum))
+        total_stats["_flow_loss_count"] = int(sum(link_loss_count))
         return x_curr, total_work, total_stats
 
     def _train_flow_from_work(self, local_work: torch.Tensor, active: torch.Tensor) -> dict:
         n_links = max(0, self.world_size - 1)
-        link_loss_sum, link_loss_count = self._flow_loss_link_moments(local_work, active)
         if not any(p.requires_grad for p in self.ddp_flow.parameters()):
             return {
                 "_flow_loss_sum": 0.0,
@@ -1317,18 +1335,11 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             )
         self.optimizer.step()
 
-        detached_local_sum = torch.where(
-            finite_active,
-            local_work.detach(),
-            torch.zeros_like(local_work.detach()),
-        ).sum()
-        detached_global_sum = detached_local_sum.clone()
-        dist.all_reduce(detached_global_sum, op=dist.ReduceOp.SUM)
         return {
-            "_flow_loss_sum": float(detached_global_sum.item()),
-            "_flow_loss_count": global_count_int,
-            "_flow_loss_link_sum": link_loss_sum,
-            "_flow_loss_link_count": link_loss_count,
+            "_flow_loss_sum": 0.0,
+            "_flow_loss_count": 0,
+            "_flow_loss_link_sum": [0.0] * n_links,
+            "_flow_loss_link_count": [0] * n_links,
             "applied_updates": 1,
             "skipped_nan_grad_updates": 0,
         }
