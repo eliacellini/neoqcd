@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.sunenv/
 env/
 venv/
 ENV/
@@ -216,3 +217,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project outputs
+results/
+job/reports/
+plot/*.pdf

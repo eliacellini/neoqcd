@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neoqcd"
+version = "0.1.0"
+authors = [
+    {name = "Elia Cellini", email = "elia.cellini@ed.ac.uk"},
+
+]
+description = "NEO techniques for SU(3) and full QCD"
+readme = "README.md"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "torch",
+    "jupyter",
+    "ipython",
+    "scipy",
+    "autograd",
+    "numdifftools",
+    "pandas",
+    "tqdm",
+    "wandb",
+]
