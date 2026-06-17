@@ -5,6 +5,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
+#SBATCH -p boost_usr_prod
+#SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
 
 set -euo pipefail
