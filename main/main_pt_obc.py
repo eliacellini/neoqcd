@@ -308,7 +308,7 @@ def parse_args() -> argparse.Namespace:
         use_hyper_smearing=True,
         hyper_normalize_by_nstep=False,
         hyper_scale_by_delta=True,
-        log_gpu_memory=True,
+        log_gpu_memory=False,
     )
     args = parser.parse_args()
     if args.sweep is not None:
