@@ -1,10 +1,11 @@
 #!/bin/bash
+#SBATCH --account=INF26_sft
 #SBATCH --job-name=neoqcd-rex-debug
 #SBATCH -e job/reports/errors_%x_%j
 #SBATCH -o job/reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=4
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
@@ -16,12 +17,12 @@ set -euo pipefail
 # Distributed launch
 # -----------------------------
 NPROC=4
+NTASKS=$((SLURM_NNODES * NPROC))
 
 # -----------------------------
 # Project / environment
 # -----------------------------
 PROJECT_DIR="${PROJECT_DIR:-/leonardo_work/INF26_sft/ecellini/neoqcd}"
-cd "$PROJECT_DIR"
 
 module load profile/deeplrn
 module load cineca-ai/
@@ -32,6 +33,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
+export MASTER_ADDR MASTER_PORT
 
 # -----------------------------
 # Physics / PT config
@@ -43,14 +45,14 @@ N=3
 BETA=6.0
 BC_MIN=0.0
 BC_MAX=1.0
-BS=8
+BS=16
 
 DEFECT_SIZE=2
 TIME_SLICE=4
 SPACE_SLICE=3
 
 THERMAL_STEPS=20
-STEPS=200
+STEPS=20
 SWEEP=1
 SWAP_EVERY=1
 SWAP_PARITY=alternating
@@ -59,7 +61,7 @@ OREX_SCHEDULE=even_odd
 # -----------------------------
 # NEO-REX config
 # -----------------------------
-NEOREX_PROTOCOL_STEPS=2
+NEOREX_PROTOCOL_STEPS=4
 NEOREX_HEATBATH_STEPS_PER_STEP=1
 NEOREX_WORK_MODE=logdet
 NEOREX_FLOW_LR=1e-3
@@ -82,13 +84,7 @@ RUN_NAME="${RUN_NAME:-debug_neorex_obc_T${T}_L${L}_r8_bs${BS}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(
-  torchrun
-  --nnodes="$SLURM_NNODES"
-  --node_rank="$SLURM_NODEID"
-  --nproc_per_node="$NPROC"
-  --rdzv_id="$SLURM_JOB_ID"
-  --rdzv_backend=c10d
-  --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
+  python
   main/main_pt_obc.py
   --algorithm neorex
   --D "$D"
@@ -135,7 +131,9 @@ CMD=(
 )
 
 echo "Running command:"
-printf ' %q' "${CMD[@]}"
+printf ' %q' srun --ntasks="$NTASKS" --ntasks-per-node="$NPROC" --cpu-bind=none bash -c \
+  'export RANK="$SLURM_PROCID"; export WORLD_SIZE="$SLURM_NTASKS"; export LOCAL_RANK="$SLURM_LOCALID"; exec "$@"' bash "${CMD[@]}"
 echo
 
-"${CMD[@]}"
+srun --ntasks="$NTASKS" --ntasks-per-node="$NPROC" --cpu-bind=none bash -c \
+  'export RANK="$SLURM_PROCID"; export WORLD_SIZE="$SLURM_NTASKS"; export LOCAL_RANK="$SLURM_LOCALID"; exec "$@"' bash "${CMD[@]}"
