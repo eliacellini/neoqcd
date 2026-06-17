@@ -8,6 +8,7 @@
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
+#SBATCH --chdir=/leonardo_work/INF26_sft/ecellini/neoqcd
 
 set -euo pipefail
 
@@ -19,8 +20,7 @@ NPROC=4
 # -----------------------------
 # Project / environment
 # -----------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="${PROJECT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-/leonardo_work/INF26_sft/ecellini/neoqcd}"
 cd "$PROJECT_DIR"
 
 module load profile/deeplrn
