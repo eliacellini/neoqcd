@@ -5,7 +5,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 
 set -euo pipefail
 
