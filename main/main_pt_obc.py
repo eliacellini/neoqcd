@@ -50,6 +50,21 @@ def _mean_sem_from_moments(sum_x: float, sum_x2: float, count: int) -> tuple[flo
     return mean, sem
 
 
+def _rank0_cuda_memory_metrics(device: torch.device, enabled: bool) -> dict[str, float]:
+    if not enabled or device.type != "cuda" or not torch.cuda.is_available():
+        return {}
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    scale = float(1024 ** 3)
+    return {
+        "gpu_memory/allocated_gb": float(torch.cuda.memory_allocated(device)) / scale,
+        "gpu_memory/reserved_gb": float(torch.cuda.memory_reserved(device)) / scale,
+        "gpu_memory/max_allocated_gb": float(torch.cuda.max_memory_allocated(device)) / scale,
+        "gpu_memory/max_reserved_gb": float(torch.cuda.max_memory_reserved(device)) / scale,
+        "gpu_memory/free_gb": float(free_bytes) / scale,
+        "gpu_memory/total_gb": float(total_bytes) / scale,
+    }
+
+
 class DefectSNFProtocolLayer(torch.nn.Module):
     """
     Deterministic defect-coupling NF block compatible with NEOREXProtocolWrapper.
@@ -271,6 +286,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default="neo-pt")
     parser.add_argument("--wandb-entity", type=str, default="lqft-snf")
     parser.add_argument("--wandb-run-name", type=str, default="")
+    parser.add_argument(
+        "--log-gpu-memory",
+        dest="log_gpu_memory",
+        action="store_true",
+        help="Log rank-0 CUDA memory metrics to W&B/CSV when CUDA is available.",
+    )
+    parser.add_argument(
+        "--no-log-gpu-memory",
+        dest="log_gpu_memory",
+        action="store_false",
+        help="Disable rank-0 CUDA memory logging.",
+    )
 
     # Accepted for command-template compatibility; not used in this standard PT main.
     parser.add_argument("--update", type=str, default="heatbath")
@@ -281,6 +308,7 @@ def parse_args() -> argparse.Namespace:
         use_hyper_smearing=True,
         hyper_normalize_by_nstep=False,
         hyper_scale_by_delta=True,
+        log_gpu_memory=True,
     )
     args = parser.parse_args()
     if args.sweep is not None:
@@ -506,6 +534,12 @@ def main(args: argparse.Namespace) -> None:
                     "thermalization_seconds",
                     "measurement_elapsed_seconds",
                     "total_elapsed_seconds",
+                    "gpu_memory_allocated_gb",
+                    "gpu_memory_reserved_gb",
+                    "gpu_memory_max_allocated_gb",
+                    "gpu_memory_max_reserved_gb",
+                    "gpu_memory_free_gb",
+                    "gpu_memory_total_gb",
                 ]
             )
 
@@ -804,6 +838,7 @@ def main(args: argparse.Namespace) -> None:
                 "work/mean_cumulative": float(work_cum),
                 "flow_loss/mean_step": float(flow_loss_step),
             }
+            wb.update(_rank0_cuda_memory_metrics(device, bool(args.log_gpu_memory)))
             for k in range(n_links):
                 wb[f"swap/link_{k}_acceptance_step"] = float(link_acceptance_step[k])
                 wb[f"swap/link_{k}_acceptance_cumulative"] = (
@@ -849,8 +884,16 @@ def main(args: argparse.Namespace) -> None:
             lmax = pt.local_parameters.max().item()
             elapsed = time.time() - t0
             total_elapsed = thermalization_elapsed + elapsed
+            gpu_memory = _rank0_cuda_memory_metrics(device, bool(args.log_gpu_memory))
             elapsed_since_last_log = elapsed - last_log_elapsed
             last_log_elapsed = elapsed
+            memory_msg = ""
+            if gpu_memory:
+                memory_msg = (
+                    f"  gpu_alloc_gb={gpu_memory['gpu_memory/allocated_gb']:.3f}  "
+                    f"gpu_reserved_gb={gpu_memory['gpu_memory/reserved_gb']:.3f}  "
+                    f"gpu_max_alloc_gb={gpu_memory['gpu_memory/max_allocated_gb']:.3f}"
+                )
             print(
                 f"step={step+1:5d}  swap_acc={swap_acc:.3f}  "
                 f"work_mean={step_work_mean:.6e}  work_sem={step_work_sem:.3e}  "
@@ -858,7 +901,8 @@ def main(args: argparse.Namespace) -> None:
                 f"measurement_elapsed_s={elapsed:.2f}  total_elapsed_s={total_elapsed:.2f}  "
                 f"dt_log_s={elapsed_since_last_log:.2f}  "
                 f"parameter_name={pt.parameter_name}  "
-                f"parameter_local=[{lmin:.6f}, {lmax:.6f}]",
+                f"parameter_local=[{lmin:.6f}, {lmax:.6f}]"
+                f"{memory_msg}",
                 flush=True,
             )
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -886,6 +930,12 @@ def main(args: argparse.Namespace) -> None:
                         float(thermalization_elapsed),
                         float(elapsed),
                         float(total_elapsed),
+                        float(gpu_memory.get("gpu_memory/allocated_gb", float("nan"))),
+                        float(gpu_memory.get("gpu_memory/reserved_gb", float("nan"))),
+                        float(gpu_memory.get("gpu_memory/max_allocated_gb", float("nan"))),
+                        float(gpu_memory.get("gpu_memory/max_reserved_gb", float("nan"))),
+                        float(gpu_memory.get("gpu_memory/free_gb", float("nan"))),
+                        float(gpu_memory.get("gpu_memory/total_gb", float("nan"))),
                     ]
                 )
 
@@ -917,6 +967,12 @@ def main(args: argparse.Namespace) -> None:
             "measurement_seconds": float(measurement_elapsed),
             "total_seconds": float(total_elapsed),
         }
+        final_gpu_memory = _rank0_cuda_memory_metrics(device, bool(args.log_gpu_memory))
+        if final_gpu_memory:
+            meta["gpu_memory"] = {
+                key.removeprefix("gpu_memory/"): float(value)
+                for key, value in final_gpu_memory.items()
+            }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
         if args.algorithm in {"orex", "neorex"}:
@@ -947,6 +1003,8 @@ def main(args: argparse.Namespace) -> None:
         if wandb_run is not None:
             wandb_run.summary["timing/measurement_seconds"] = float(measurement_elapsed)
             wandb_run.summary["timing/total_seconds"] = float(total_elapsed)
+            for key, value in final_gpu_memory.items():
+                wandb_run.summary[key] = float(value)
             wandb_run.finish()
 
     dist.barrier()

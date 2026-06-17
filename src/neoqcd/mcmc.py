@@ -454,6 +454,62 @@ class DefectMCMCAdapter:
             out.index_copy_(0, sel, vals)
         return out
 
+    def _kappa_for_parameter(self, parameter: torch.Tensor, defect_mask: torch.Tensor) -> torch.Tensor:
+        defect = defect_mask.to(device=parameter.device, dtype=parameter.dtype)
+        view_shape = (int(parameter.numel()),) + (1,) * (defect.dim() - 1)
+        p = parameter.view(view_shape)
+        return defect[0].unsqueeze(0) + defect[1].unsqueeze(0) * p
+
+    def action_difference(
+        self,
+        x: torch.Tensor,
+        parameter_old: torch.Tensor,
+        parameter_new: torch.Tensor,
+        parameter_name: str = "bc",
+    ) -> torch.Tensor:
+        if str(parameter_name) != self.parameter_name:
+            raise ValueError(
+                f"Unsupported parameter_name={parameter_name!r}, expected {self.parameter_name!r}"
+            )
+        p_old = self._normalize_parameter(
+            parameter_old,
+            device=x.device,
+            expected_batch_size=int(x.shape[0]),
+        )
+        p_new = self._normalize_parameter(
+            parameter_new,
+            device=x.device,
+            expected_batch_size=int(x.shape[0]),
+        )
+        work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+        p_old = p_old.to(dtype=work_dtype)
+        p_new = p_new.to(dtype=work_dtype)
+        defect_mask = self.defect_mask.to(device=x.device, dtype=work_dtype)
+        kappa_old = self._kappa_for_parameter(p_old, defect_mask)
+        kappa_new = self._kappa_for_parameter(p_new, defect_mask)
+        delta = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
+        dims = tuple(range(1, self.flow_pars.D + 1))
+
+        for nu in range(1, self.flow_pars.D):
+            for mu in range(0, nu):
+                plaq = sun.SUN_mul(sun.pstaple(x, mu, nu, self.flow_pars.D), x[:, mu])
+                retr = sun.SUN_trace(plaq).real
+                weight_old = (
+                    kappa_old[:, mu]
+                    * torch.roll(kappa_old, 1, dims=(-self.flow_pars.D + mu))[:, nu]
+                    * torch.roll(kappa_old, 1, dims=(-self.flow_pars.D + nu))[:, mu]
+                    * kappa_old[:, nu]
+                )
+                weight_new = (
+                    kappa_new[:, mu]
+                    * torch.roll(kappa_new, 1, dims=(-self.flow_pars.D + mu))[:, nu]
+                    * torch.roll(kappa_new, 1, dims=(-self.flow_pars.D + nu))[:, mu]
+                    * kappa_new[:, nu]
+                )
+                delta = delta + torch.sum((weight_old - weight_new) * retr / float(self.flow_pars.N), dims)
+
+        return delta * float(self.beta)
+
     @torch.no_grad()
     def __call__(
         self,

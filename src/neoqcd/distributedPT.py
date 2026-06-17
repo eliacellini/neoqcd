@@ -412,6 +412,45 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             f"Tried targets {[type(t).__name__ for t in targets]} with parameter_name={self.parameter_name!r}."
         ) from last_error
 
+    def action_difference(
+        self,
+        mcmc,
+        x: torch.Tensor,
+        parameter_old: torch.Tensor,
+        parameter_new: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Evaluate S(x; parameter_new) - S(x; parameter_old).
+        Specialized targets can implement this without two full action calls.
+        """
+        targets = [mcmc]
+        if hasattr(mcmc, "sampler"):
+            targets.append(mcmc.sampler)
+        last_error = None
+        for target in targets:
+            if not hasattr(target, "action_difference"):
+                continue
+            try:
+                return target.action_difference(
+                    x,
+                    parameter_old,
+                    parameter_new,
+                    parameter_name=self.parameter_name,
+                )
+            except TypeError:
+                try:
+                    return target.action_difference(x, parameter_old, parameter_new)
+                except Exception as err:
+                    last_error = err
+            except Exception as err:
+                last_error = err
+        if last_error is not None:
+            raise TypeError(
+                "Unable to evaluate specialized protocol action difference from mcmc object. "
+                f"Tried targets {[type(t).__name__ for t in targets]} with parameter_name={self.parameter_name!r}."
+            ) from last_error
+        return self.action(mcmc, x, parameter_new) - self.action(mcmc, x, parameter_old)
+
     @torch.no_grad()
     def step(self, x: torch.Tensor, mcmc) -> tuple[torch.Tensor, dict]:
         """
@@ -638,7 +677,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         active_view = self._sample_mask_view(active, x)
 
         if n_protocol == 0:
-            dwork = self.action(mcmc, x_curr, target_parameters) - self.action(mcmc, x_curr, start_parameters)
+            dwork = self.action_difference(mcmc, x_curr, start_parameters, target_parameters)
             work = torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
             return x_curr, work
 
@@ -648,7 +687,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             parameter_0 = start_parameters + lambda_0 * parameter_delta
             parameter_1 = start_parameters + lambda_1 * parameter_delta
 
-            dwork = self.action(mcmc, x_curr, parameter_1) - self.action(mcmc, x_curr, parameter_0)
+            dwork = self.action_difference(mcmc, x_curr, parameter_0, parameter_1)
             work = work + torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
 
             if n_mcmc > 0:
