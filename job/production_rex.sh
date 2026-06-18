@@ -1,14 +1,13 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
-#SBATCH --job-name=neoqcd-pt-debug
+#SBATCH --job-name=neoqcd-pt-production
 #SBATCH -e reports/errors_%x_%j
 #SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
-#SBATCH --qos=boost_qos_dbg
-#SBATCH --time=00:30:00
+#SBATCH --time=24:00:00
 #SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
@@ -63,7 +62,7 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-debug_pt_obc_T${T}_L${L}_r8_bs${BS}}"
+RUN_NAME="${RUN_NAME:-production_pt_obc_T${T}_L${L}_r8_bs${BS}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(

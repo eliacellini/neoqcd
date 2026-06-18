@@ -224,4 +224,6 @@ __marimo__/
 # Project outputs
 results/
 job/reports/
+reports/*
+!reports/.gitkeep
 plot/*.pdf

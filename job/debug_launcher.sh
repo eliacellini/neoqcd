@@ -1,20 +1,20 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
 #SBATCH --job-name=neoqcd-launch-debug
-#SBATCH -e job/reports/errors_%x_%j
-#SBATCH -o job/reports/output_%x_%j
+#SBATCH -e reports/errors_%x_%j
+#SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:10:00
-#SBATCH --chdir=/leonardo_work/INF26_sft/ecellini/neoqcd
+#SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
 
 NPROC=1
-PROJECT_DIR="${PROJECT_DIR:-/leonardo_work/INF26_sft/ecellini/neoqcd}"
+PROJECT_DIR="${PROJECT_DIR:-/leonardo_scratch/large/userexternal/ecellini/neoqcd}"
 
 module load profile/deeplrn
 module load cineca-ai/

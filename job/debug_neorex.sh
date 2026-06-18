@@ -9,7 +9,7 @@
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
-#SBATCH --chdir=/leonardo_work/INF26_sft/ecellini/neoqcd
+#SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ NPROC=4
 # -----------------------------
 # Project / environment
 # -----------------------------
-PROJECT_DIR="${PROJECT_DIR:-/leonardo_work/INF26_sft/ecellini/neoqcd}"
+PROJECT_DIR="${PROJECT_DIR:-/leonardo_scratch/large/userexternal/ecellini/neoqcd}"
 
 module load profile/deeplrn
 module load cineca-ai/

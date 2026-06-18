@@ -1,14 +1,13 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
-#SBATCH --job-name=neoqcd-pt-debug
+#SBATCH --job-name=neoqcd-orex-production
 #SBATCH -e reports/errors_%x_%j
 #SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
-#SBATCH --qos=boost_qos_dbg
-#SBATCH --time=00:30:00
+#SBATCH --time=24:00:00
 #SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
@@ -47,14 +46,21 @@ BC_MAX=1.0
 BS=16
 
 DEFECT_SIZE=2
-TIME_SLICE=4
-SPACE_SLICE=3
+TIME_SLICE=0
+SPACE_SLICE=0
 
 THERMAL_STEPS=20
 STEPS=20
 SWEEP=1
 SWAP_EVERY=1
 SWAP_PARITY=alternating
+OREX_SCHEDULE=even_odd
+
+# -----------------------------
+# O-REX config
+# -----------------------------
+OREX_PROTOCOL_STEPS=4
+OREX_MCMC_STEPS_PER_STEP=1
 
 # -----------------------------
 # Logging
@@ -63,7 +69,7 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-debug_pt_obc_T${T}_L${L}_r8_bs${BS}}"
+RUN_NAME="${RUN_NAME:-production_orex_obc_T${T}_L${L}_r8_bs${BS}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(
@@ -77,7 +83,7 @@ CMD=(
   --rdzv_backend=c10d
   --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   main/main_pt_obc.py
-  --algorithm pt
+  --algorithm orex
   --D "$D"
   --T "$T"
   --L "$L"
@@ -94,6 +100,9 @@ CMD=(
   --sweep "$SWEEP"
   --swap-every "$SWAP_EVERY"
   --swap-parity "$SWAP_PARITY"
+  --orex-schedule "$OREX_SCHEDULE"
+  --orex-protocol-steps "$OREX_PROTOCOL_STEPS"
+  --orex-mcmc-steps-per-step "$OREX_MCMC_STEPS_PER_STEP"
   --wandb
   --wandb-project "$WANDB_PROJECT"
   --wandb-entity "$WANDB_ENTITY"
