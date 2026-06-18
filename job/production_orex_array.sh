@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
-#SBATCH --job-name=neoqcd-neorex-debug
-#SBATCH -e reports/errors_%x_%j
-#SBATCH -o reports/output_%x_%j
+#SBATCH --job-name=neoqcd-orex-array
+#SBATCH -e reports/errors_%x_%A_%a
+#SBATCH -o reports/output_%x_%A_%a
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
-#SBATCH --qos=boost_qos_dbg
-#SBATCH --time=00:30:00
+#SBATCH --time=24:00:00
+#SBATCH --array=0-3
 #SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
@@ -47,34 +47,23 @@ BC_MAX=1.0
 BS=128
 
 DEFECT_SIZE=2
-TIME_SLICE=4
-SPACE_SLICE=3
+TIME_SLICE=0
+SPACE_SLICE=0
 
 THERMAL_STEPS=20
 STEPS=20
-SWEEP=1
+SWEEP=5
 SWAP_EVERY=1
 SWAP_PARITY=alternating
 OREX_SCHEDULE=even_odd
+CFG_CACHE_TAG=production
 
 # -----------------------------
-# NEO-REX config
+# O-REX array config
 # -----------------------------
-NEOREX_PROTOCOL_STEPS=8
-NEOREX_HEATBATH_STEPS_PER_STEP=1
-NEOREX_WORK_MODE=logdet
-NEOREX_FLOW_LR=1e-3
-NEOREX_GRAD_CLIP_NORM=0.0
-NEOREX_LOAD_FLOW="${NEOREX_LOAD_FLOW:-}"
-NEOREX_SAVE_FLOW="${NEOREX_SAVE_FLOW:-}"
-NEOREX_FLOW_CHECKPOINT_DIR="${NEOREX_FLOW_CHECKPOINT_DIR:-data/neorex_flows}"
-NEOREX_FLOW_CHECKPOINT_NAME="${NEOREX_FLOW_CHECKPOINT_NAME:-global.pt}"
-TRAIN_STEPS=20
-
-HYPER_SMEARING_MODE=per_link
-HYPER_TIME_EMBEDDING_DIM=8
-HYPER_HIDDEN_DIM=16
-HYPER_RHO_INIT=1e-3
+OREX_PROTOCOL_STEPS_LIST=(0 2 4 6)
+OREX_PROTOCOL_STEPS="${OREX_PROTOCOL_STEPS_LIST[$SLURM_ARRAY_TASK_ID]}"
+OREX_MCMC_STEPS_PER_STEP=1
 
 # -----------------------------
 # Logging
@@ -83,8 +72,8 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-debug_neorex_obc_T${T}_L${L}_r8_bs${BS}}"
-OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
+RUN_NAME="${RUN_NAME:-prod_orex_obc_T${T}_L${L}_d${DEFECT_SIZE}_ts${TIME_SLICE}_ss${SPACE_SLICE}_bs${BS}_sw${SWEEP}_nsteps${OREX_PROTOCOL_STEPS}}"
+OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 
 CMD=(
   python
@@ -93,11 +82,11 @@ CMD=(
   --nnodes="$SLURM_NNODES"
   --node_rank="$SLURM_NODEID"
   --nproc_per_node="$NPROC"
-  --rdzv_id="$SLURM_JOB_ID"
+  --rdzv_id="${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
   --rdzv_backend=c10d
   --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   main/main_pt_obc.py
-  --algorithm neorex
+  --algorithm orex
   --D "$D"
   --T "$T"
   --L "$L"
@@ -115,23 +104,8 @@ CMD=(
   --swap-every "$SWAP_EVERY"
   --swap-parity "$SWAP_PARITY"
   --orex-schedule "$OREX_SCHEDULE"
-  --neorex-protocol-steps "$NEOREX_PROTOCOL_STEPS"
-  --neorex-heatbath-steps-per-step "$NEOREX_HEATBATH_STEPS_PER_STEP"
-  --neorex-work-mode "$NEOREX_WORK_MODE"
-  --neorex-flow-lr "$NEOREX_FLOW_LR"
-  --neorex-grad-clip-norm "$NEOREX_GRAD_CLIP_NORM"
-  --neorex-flow-checkpoint-dir "$NEOREX_FLOW_CHECKPOINT_DIR"
-  --neorex-flow-checkpoint-name "$NEOREX_FLOW_CHECKPOINT_NAME"
-  --train-steps "$TRAIN_STEPS"
-  --use-hyper-smearing
-  --hyper-smearing-mode "$HYPER_SMEARING_MODE"
-  --hyper-time-embedding-dim "$HYPER_TIME_EMBEDDING_DIM"
-  --hyper-hidden-dim "$HYPER_HIDDEN_DIM"
-  --hyper-rho-init "$HYPER_RHO_INIT"
-  --hyper-rho-eps 0.0
-  --hyper-rho-max 0.0
-  --hyper-scale-by-delta
-  --hyper-no-normalize-by-nstep
+  --orex-protocol-steps "$OREX_PROTOCOL_STEPS"
+  --orex-mcmc-steps-per-step "$OREX_MCMC_STEPS_PER_STEP"
   --wandb
   --wandb-project "$WANDB_PROJECT"
   --wandb-entity "$WANDB_ENTITY"
@@ -139,17 +113,16 @@ CMD=(
   --run-name "$RUN_NAME"
   --output-dir "$OUTPUT_DIR"
   --main-dir "$PROJECT_DIR"
+  --cfg-cache-tag "$CFG_CACHE_TAG"
   --log-every "$LOG_EVERY"
   --seed "$SEED"
 )
 
-if [[ -n "$NEOREX_LOAD_FLOW" ]]; then
-  CMD+=(--neorex-load-flow "$NEOREX_LOAD_FLOW")
-fi
-if [[ -n "$NEOREX_SAVE_FLOW" ]]; then
-  CMD+=(--neorex-save-flow "$NEOREX_SAVE_FLOW")
-fi
-
+echo "Running O-REX production array task:"
+echo "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+echo "OREX_PROTOCOL_STEPS=$OREX_PROTOCOL_STEPS"
+echo "RUN_NAME=$RUN_NAME"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "Running command:"
 printf ' %q' "${CMD[@]}"
 echo

@@ -160,6 +160,7 @@ venv.bak/
 
 # Generated thermalized configurations
 data/cfgs/
+data/neorex_flows/
 
 # Spyder project settings
 .spyderproject

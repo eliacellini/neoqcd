@@ -94,6 +94,21 @@ def _cfg_cache_path(root: Path, key: dict) -> Path:
     return root / name
 
 
+def _resolve_neorex_flow_checkpoint_path(args: argparse.Namespace, spec: str):
+    spec = str(spec or "").strip()
+    if not spec:
+        return None
+    if spec.lower() == "auto":
+        root = Path(args.neorex_flow_checkpoint_dir)
+        if not root.is_absolute():
+            root = Path(args.main_dir) / root
+        return root / args.neorex_flow_checkpoint_name
+    path = Path(spec)
+    if not path.is_absolute():
+        path = Path(args.main_dir) / path
+    return path
+
+
 def _rank_cfg_path(cache_dir: Path, rank: int) -> Path:
     return cache_dir / f"rank_{rank:03d}.pt"
 
@@ -390,6 +405,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neorex-grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--neorex-max-consecutive-nan-grad-updates", type=int, default=5)
     parser.add_argument("--neorex-stochastic-first", action="store_true")
+    parser.add_argument(
+        "--neorex-load-flow",
+        type=str,
+        default="",
+        help="Load NEO-REX flow checkpoint from this path, or use 'auto' for the global default path.",
+    )
+    parser.add_argument(
+        "--neorex-save-flow",
+        type=str,
+        default="",
+        help="Also save final NEO-REX flow checkpoint to this path, or use 'auto' for the global default path.",
+    )
+    parser.add_argument("--neorex-flow-checkpoint-dir", type=str, default="data/neorex_flows")
+    parser.add_argument("--neorex-flow-checkpoint-name", type=str, default="global.pt")
     parser.add_argument("--use-hyper-smearing", dest="use_hyper_smearing", action="store_true")
     parser.add_argument("--no-hyper-smearing", dest="use_hyper_smearing", action="store_false")
     parser.add_argument("--hyper-smearing-mode", type=str, default="per_link", choices=["shared", "per_link", "class"])
@@ -694,6 +723,9 @@ def main(args: argparse.Namespace) -> None:
     if args.N != 3:
         raise ValueError("Questo main e' pensato per SU(3): usa --N 3")
 
+    neorex_flow_load_mode = "none"
+    neorex_flow_load_path = None
+
     mask = create_mask(args.D, args.T, args.L).to(device)
     defect = Defect(
         D=args.D,
@@ -789,6 +821,28 @@ def main(args: argparse.Namespace) -> None:
             world_size=world_size,
             device=device,
         )
+        load_path = _resolve_neorex_flow_checkpoint_path(args, args.neorex_load_flow)
+        if load_path is not None:
+            if rank == 0:
+                checkpoint_exists = load_path.exists()
+            else:
+                checkpoint_exists = False
+            exists_box = [bool(checkpoint_exists)]
+            dist.broadcast_object_list(exists_box, src=0)
+            checkpoint_exists = bool(exists_box[0])
+            if checkpoint_exists:
+                pt.load_flow(str(load_path))
+                neorex_flow_load_mode = "load"
+                neorex_flow_load_path = str(load_path)
+                if rank == 0:
+                    print(f"neorex_flow_checkpoint=load  path={load_path}", flush=True)
+            elif str(args.neorex_load_flow).strip().lower() == "auto":
+                neorex_flow_load_mode = "auto_missing"
+                neorex_flow_load_path = str(load_path)
+                if rank == 0:
+                    print(f"neorex_flow_checkpoint=auto_missing  path={load_path}", flush=True)
+            else:
+                raise FileNotFoundError(f"NEO-REX flow checkpoint not found: {load_path}")
         orex_mcmc = neorex_mcmc
     else:
         pt_cfg = PTConfig(
@@ -1153,6 +1207,25 @@ def main(args: argparse.Namespace) -> None:
             meta["gpu_memory"] = {
                 key.removeprefix("gpu_memory/"): float(value)
                 for key, value in final_gpu_memory.items()
+            }
+        if args.algorithm == "neorex":
+            saved_flow_paths = []
+            final_flow_path = out_dir / "neorex_flow_final.pt"
+            final_flow_path.parent.mkdir(parents=True, exist_ok=True)
+            pt.save_flow(str(final_flow_path))
+            saved_flow_paths.append(str(final_flow_path))
+
+            save_path = _resolve_neorex_flow_checkpoint_path(args, args.neorex_save_flow)
+            if save_path is not None:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                pt.save_flow(str(save_path))
+                saved_flow_paths.append(str(save_path))
+                print(f"neorex_flow_checkpoint=saved  path={save_path}", flush=True)
+
+            meta["neorex_flow_checkpoint"] = {
+                "load_mode": neorex_flow_load_mode,
+                "load_path": neorex_flow_load_path,
+                "saved_paths": saved_flow_paths,
             }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)

@@ -64,6 +64,10 @@ NEOREX_HEATBATH_STEPS_PER_STEP=1
 NEOREX_WORK_MODE=logdet
 NEOREX_FLOW_LR=1e-3
 NEOREX_GRAD_CLIP_NORM=0.0
+NEOREX_LOAD_FLOW="${NEOREX_LOAD_FLOW:-}"
+NEOREX_SAVE_FLOW="${NEOREX_SAVE_FLOW:-}"
+NEOREX_FLOW_CHECKPOINT_DIR="${NEOREX_FLOW_CHECKPOINT_DIR:-data/neorex_flows}"
+NEOREX_FLOW_CHECKPOINT_NAME="${NEOREX_FLOW_CHECKPOINT_NAME:-global.pt}"
 TRAIN_STEPS=20
 
 HYPER_SMEARING_MODE=class
@@ -115,6 +119,8 @@ CMD=(
   --neorex-work-mode "$NEOREX_WORK_MODE"
   --neorex-flow-lr "$NEOREX_FLOW_LR"
   --neorex-grad-clip-norm "$NEOREX_GRAD_CLIP_NORM"
+  --neorex-flow-checkpoint-dir "$NEOREX_FLOW_CHECKPOINT_DIR"
+  --neorex-flow-checkpoint-name "$NEOREX_FLOW_CHECKPOINT_NAME"
   --train-steps "$TRAIN_STEPS"
   --use-hyper-smearing
   --hyper-smearing-mode "$HYPER_SMEARING_MODE"
@@ -135,6 +141,13 @@ CMD=(
   --log-every "$LOG_EVERY"
   --seed "$SEED"
 )
+
+if [[ -n "$NEOREX_LOAD_FLOW" ]]; then
+  CMD+=(--neorex-load-flow "$NEOREX_LOAD_FLOW")
+fi
+if [[ -n "$NEOREX_SAVE_FLOW" ]]; then
+  CMD+=(--neorex-save-flow "$NEOREX_SAVE_FLOW")
+fi
 
 echo "Running command:"
 printf ' %q' "${CMD[@]}"

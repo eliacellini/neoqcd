@@ -46,14 +46,15 @@ BC_MAX=1.0
 BS=128
 
 DEFECT_SIZE=2
-TIME_SLICE=4
-SPACE_SLICE=3
+TIME_SLICE=0
+SPACE_SLICE=0
 
 THERMAL_STEPS=1000
 STEPS=1
 SWEEP=5
 SWAP_EVERY=1
 SWAP_PARITY=alternating
+CFG_CACHE_TAG=production
 
 # -----------------------------
 # Logging
@@ -62,7 +63,7 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-production_pt_obc_T${T}_L${L}_r8_bs${BS}}"
+RUN_NAME="${RUN_NAME:-prod_pt_obc_T${T}_L${L}_d${DEFECT_SIZE}_ts${TIME_SLICE}_ss${SPACE_SLICE}_bs${BS}_sw${SWEEP}}"
 OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
 
 CMD=(
@@ -100,6 +101,7 @@ CMD=(
   --run-name "$RUN_NAME"
   --output-dir "$OUTPUT_DIR"
   --main-dir "$PROJECT_DIR"
+  --cfg-cache-tag "$CFG_CACHE_TAG"
   --log-every "$LOG_EVERY"
   --seed "$SEED"
 )
