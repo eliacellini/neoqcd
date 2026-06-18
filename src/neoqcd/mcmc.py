@@ -300,8 +300,19 @@ class HBOR():
         new_cfgs = sun.SUN_mul(sun.SUN_mul(staples, sun.SUN_dagger(cfgs)), staples) * k0 + cfgs * ~k0
         return new_cfgs.unsqueeze(1)
 
+    def _sum_of_staples_for_update(self, cfgs, mu, defect):
+        if torch.is_grad_enabled() and cfgs.requires_grad:
+            return checkpoint.checkpoint(
+                self.sum_of_staples,
+                cfgs,
+                mu,
+                defect,
+                use_reentrant=False,
+            )
+        return self.sum_of_staples(cfgs, mu, defect)
+
     def SU3_link_update_hb(self, cfgs, mu, rand, defect):
-        staples = checkpoint.checkpoint(self.sum_of_staples, cfgs, mu, defect, use_reentrant=False)
+        staples = self._sum_of_staples_for_update(cfgs, mu, defect)
         phb_steps = 3
         new_cfgs = cfgs[:,mu]
         sel = torch.tensor([0, 1, 2], device=new_cfgs.device)
@@ -313,7 +324,7 @@ class HBOR():
         return new_cfgs.unsqueeze(1)
 
     def SU3_link_update_over(self, cfgs, mu, defect):
-        staples = checkpoint.checkpoint(self.sum_of_staples, cfgs, mu, defect, use_reentrant=False)
+        staples = self._sum_of_staples_for_update(cfgs, mu, defect)
         phb_steps = 3
         new_cfgs = cfgs[:,mu]
         sel = torch.tensor([0, 1, 2], device=new_cfgs.device)

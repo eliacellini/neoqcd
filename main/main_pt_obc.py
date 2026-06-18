@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,138 @@ class RunState:
     local_rank: int
     device: torch.device
     backend: str
+
+
+def _slug(value) -> str:
+    return str(value).replace("-", "m").replace(".", "p").replace("/", "_")
+
+
+def _cfg_cache_root(args: argparse.Namespace) -> Path:
+    root = Path(args.cfg_cache_dir)
+    if not root.is_absolute():
+        root = Path(args.main_dir) / root
+    return root
+
+
+def _cfg_cache_key(
+    args: argparse.Namespace,
+    world_size: int,
+    parameter_min: float,
+    parameter_max: float,
+    parameter_ladder: torch.Tensor,
+) -> dict:
+    return {
+        "schema": 1,
+        "D": int(args.D),
+        "T": int(args.T),
+        "L": int(args.L),
+        "N": int(args.N),
+        "beta": float(args.beta),
+        "defect_size": int(args.defect_size),
+        "time_slice": int(args.time_slice),
+        "space_slice": int(args.space_slice),
+        "batch_size": int(args.batch_size),
+        "world_size": int(world_size),
+        "parameter_name": "bc",
+        "parameter_min": float(parameter_min),
+        "parameter_max": float(parameter_max),
+        "parameter_ladder": [float(v.item()) for v in parameter_ladder.detach().cpu()],
+        "orsteps": int(args.orsteps),
+        "updates_per_layer": int(args.updates_per_layer),
+        "dtype": "torch.cdouble",
+        "tag": str(args.cfg_cache_tag or ""),
+    }
+
+
+def _cfg_cache_path(root: Path, key: dict) -> Path:
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    name = (
+        f"ptobc_D{key['D']}_T{key['T']}_L{key['L']}_N{key['N']}_"
+        f"beta{_slug(key['beta'])}_d{key['defect_size']}_"
+        f"t{key['time_slice']}_s{key['space_slice']}_"
+        f"bs{key['batch_size']}_r{key['world_size']}_"
+        f"bc{_slug(key['parameter_min'])}-{_slug(key['parameter_max'])}_"
+        f"or{key['orsteps']}_{digest}"
+    )
+    if key.get("tag"):
+        name = f"{_slug(key['tag'])}_{name}"
+    return root / name
+
+
+def _rank_cfg_path(cache_dir: Path, rank: int) -> Path:
+    return cache_dir / f"rank_{rank:03d}.pt"
+
+
+def _cache_metadata_matches(cache_dir: Path, key: dict, world_size: int, requested_steps: int) -> tuple[bool, int]:
+    meta_path = cache_dir / "meta.json"
+    done_path = cache_dir / "DONE"
+    if not meta_path.exists() or not done_path.exists():
+        return False, 0
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False, 0
+    if meta.get("key") != key:
+        return False, int(meta.get("thermal_steps", 0) or 0)
+    cached_steps = int(meta.get("thermal_steps", 0) or 0)
+    if cached_steps < int(requested_steps):
+        return False, cached_steps
+    for rank in range(int(world_size)):
+        if not _rank_cfg_path(cache_dir, rank).exists():
+            return False, cached_steps
+    return True, cached_steps
+
+
+def _load_cached_cfgs(cache_dir: Path, rank: int, device: torch.device, args: argparse.Namespace) -> torch.Tensor:
+    payload = torch.load(_rank_cfg_path(cache_dir, rank), map_location=device)
+    cfgs = payload["cfgs"] if isinstance(payload, dict) and "cfgs" in payload else payload
+    cfgs = cfgs.to(device=device)
+    expected_shape = (args.batch_size, args.D, args.T) + (args.L,) * (args.D - 1) + (args.N, args.N)
+    if tuple(cfgs.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"Cached cfgs for rank {rank} have shape {tuple(cfgs.shape)}, expected {expected_shape}"
+        )
+    return cfgs
+
+
+def _save_cached_cfgs(
+    cache_dir: Path,
+    rank: int,
+    world_size: int,
+    cfgs: torch.Tensor,
+    key: dict,
+    thermal_steps: int,
+) -> None:
+    if rank == 0:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        done_path = cache_dir / "DONE"
+        if done_path.exists():
+            done_path.unlink()
+    dist.barrier()
+
+    rank_path = _rank_cfg_path(cache_dir, rank)
+    tmp_path = rank_path.with_suffix(f".tmp.{rank}")
+    torch.save({"rank": int(rank), "cfgs": cfgs.detach().cpu()}, tmp_path)
+    os.replace(tmp_path, rank_path)
+    dist.barrier()
+
+    if rank == 0:
+        meta = {
+            "key": key,
+            "thermal_steps": int(thermal_steps),
+            "world_size": int(world_size),
+            "rank_files": [f"rank_{r:03d}.pt" for r in range(int(world_size))],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta_path = cache_dir / "meta.json"
+        tmp_meta = cache_dir / "meta.json.tmp"
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp_meta, meta_path)
+        with open(cache_dir / "DONE", "w", encoding="utf-8") as f:
+            f.write("ok\n")
+    dist.barrier()
 
 
 def _mean_sem_from_moments(sum_x: float, sum_x2: float, count: int) -> tuple[float, float]:
@@ -282,6 +415,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")
     parser.add_argument("--output-dir", type=str, default=None, help="If set, use this directory for logs")
     parser.add_argument("--run-name", type=str, default="")
+    parser.add_argument("--cfg-cache-dir", type=str, default="data/cfgs")
+    parser.add_argument("--cfg-cache-tag", type=str, default="")
+    parser.add_argument("--use-cfg-cache", dest="use_cfg_cache", action="store_true")
+    parser.add_argument("--no-cfg-cache", dest="use_cfg_cache", action="store_false")
+    parser.add_argument("--overwrite-cfg-cache", action="store_true")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging on rank 0")
     parser.add_argument("--wandb-project", type=str, default="neo-pt")
     parser.add_argument("--wandb-entity", type=str, default="lqft-snf")
@@ -309,6 +447,7 @@ def parse_args() -> argparse.Namespace:
         hyper_normalize_by_nstep=False,
         hyper_scale_by_delta=True,
         log_gpu_memory=False,
+        use_cfg_cache=True,
     )
     args = parser.parse_args()
     if args.sweep is not None:
@@ -689,28 +828,70 @@ def main(args: argparse.Namespace) -> None:
         hbor_by_idx.append(HBOR(flow_pars, beta=args.beta, defect_par=lam_f))
         action_by_idx.append(Wilson_action(flow_pars, beta=args.beta, defect_par=lam_f))
 
-    cfgs = torch.eye(args.N, dtype=torch.cdouble, device=device)
-    cfgs = cfgs.view(1, 1, 1, 1, 1, args.N, args.N).repeat(args.batch_size, args.D, args.T, args.L, args.L, args.L, 1, 1)
+    cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0
+    cache_mode = "disabled"
+    cache_steps = 0
+    cache_dir = None
+    cache_key = None
+    if cache_enabled:
+        cache_root = _cfg_cache_root(args)
+        cache_key = _cfg_cache_key(args, world_size, parameter_min, parameter_max, parameter_ladder)
+        cache_dir = _cfg_cache_path(cache_root, cache_key)
+        if rank == 0:
+            cache_hit, cache_steps = (
+                (False, 0)
+                if bool(args.overwrite_cfg_cache)
+                else _cache_metadata_matches(cache_dir, cache_key, world_size, int(args.thermal_steps))
+            )
+            cache_mode = "load" if cache_hit else "miss"
+        decision = [cache_mode, int(cache_steps), str(cache_dir)]
+        dist.broadcast_object_list(decision, src=0)
+        cache_mode, cache_steps, cache_dir_str = decision
+        cache_steps = int(cache_steps)
+        cache_dir = Path(cache_dir_str)
 
     thermalization_t0 = time.time()
-    for _ in range(args.thermal_steps):
-        cfgs = local_hbor_sweep(
-            cfgs=cfgs,
-            local_parameters=pt.local_parameters,
-            parameter_ladder=parameter_ladder,
-            hbor_by_idx=hbor_by_idx,
-            mask=mask,
-            defect_mask=defect_mask,
-        )
+    if cache_enabled and cache_mode == "load":
+        cfgs = _load_cached_cfgs(cache_dir, rank, device, args)
+        thermal_steps_executed = 0
+    else:
+        cfgs = torch.eye(args.N, dtype=torch.cdouble, device=device)
+        cfgs = cfgs.view(1, 1, 1, 1, 1, args.N, args.N).repeat(args.batch_size, args.D, args.T, args.L, args.L, args.L, 1, 1)
+        thermal_steps_executed = int(args.thermal_steps)
+        for _ in range(thermal_steps_executed):
+            cfgs = local_hbor_sweep(
+                cfgs=cfgs,
+                local_parameters=pt.local_parameters,
+                parameter_ladder=parameter_ladder,
+                hbor_by_idx=hbor_by_idx,
+                mask=mask,
+                defect_mask=defect_mask,
+            )
+        if cache_enabled:
+            _save_cached_cfgs(
+                cache_dir=cache_dir,
+                rank=rank,
+                world_size=world_size,
+                cfgs=cfgs,
+                key=cache_key,
+                thermal_steps=int(args.thermal_steps),
+            )
+            cache_mode = "saved" if cache_mode == "miss" else cache_mode
     thermalization_elapsed = time.time() - thermalization_t0
     if rank == 0:
         print(
             f"thermalization_steps={args.thermal_steps}  "
+            f"thermalization_steps_executed={thermal_steps_executed}  "
+            f"cfg_cache={cache_mode}  "
+            f"cfg_cache_steps={cache_steps}  "
             f"thermalization_elapsed_s={thermalization_elapsed:.2f}",
             flush=True,
         )
         if wandb_run is not None:
             wandb_run.summary["timing/thermalization_seconds"] = float(thermalization_elapsed)
+            wandb_run.summary["thermalization/steps_executed"] = int(thermal_steps_executed)
+            wandb_run.summary["cfg_cache/mode"] = str(cache_mode)
+            wandb_run.summary["cfg_cache/cached_thermal_steps"] = int(cache_steps)
 
     t0 = time.time()
     total_swap_accepted = 0
