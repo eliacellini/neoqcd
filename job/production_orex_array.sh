@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 #SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
@@ -72,8 +72,10 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-prod_orex_obc_T${T}_L${L}_d${DEFECT_SIZE}_ts${TIME_SLICE}_ss${SPACE_SLICE}_bs${BS}_sw${SWEEP}_nsteps${OREX_PROTOCOL_STEPS}}"
-OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+STUDY_NAME="${STUDY_NAME:-orex_nsteps_scan_T${T}L${L}_d${DEFECT_SIZE}_bs${BS}_sw${SWEEP}}"
+RUN_NAME="${RUN_NAME:-nsteps${OREX_PROTOCOL_STEPS}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${STUDY_NAME}_${RUN_NAME}}"
+OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${STUDY_NAME}/${RUN_NAME}"
 
 CMD=(
   python
@@ -109,7 +111,7 @@ CMD=(
   --wandb
   --wandb-project "$WANDB_PROJECT"
   --wandb-entity "$WANDB_ENTITY"
-  --wandb-run-name "$RUN_NAME"
+  --wandb-run-name "$WANDB_RUN_NAME"
   --run-name "$RUN_NAME"
   --output-dir "$OUTPUT_DIR"
   --main-dir "$PROJECT_DIR"
@@ -121,7 +123,9 @@ CMD=(
 echo "Running O-REX production array task:"
 echo "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
 echo "OREX_PROTOCOL_STEPS=$OREX_PROTOCOL_STEPS"
+echo "STUDY_NAME=$STUDY_NAME"
 echo "RUN_NAME=$RUN_NAME"
+echo "WANDB_RUN_NAME=$WANDB_RUN_NAME"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "Running command:"
 printf ' %q' "${CMD[@]}"
