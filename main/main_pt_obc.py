@@ -348,6 +348,8 @@ def _build_neorex_flow_pars(
         hyper_smearing_mode=args.hyper_smearing_mode,
         hyper_time_embedding_dim=args.hyper_time_embedding_dim,
         hyper_hidden_dim=args.hyper_hidden_dim,
+        hyper_depth=args.hyper_depth,
+        hyper_activation=args.hyper_activation,
         hyper_rho_init=args.hyper_rho_init,
         hyper_normalize_by_nstep=args.hyper_normalize_by_nstep,
         hyper_rho_eps=args.hyper_rho_eps,
@@ -424,6 +426,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hyper-smearing-mode", type=str, default="per_link", choices=["shared", "per_link", "class"])
     parser.add_argument("--hyper-time-embedding-dim", type=int, default=8)
     parser.add_argument("--hyper-hidden-dim", type=int, default=16)
+    parser.add_argument("--hyper-depth", type=int, default=2)
+    parser.add_argument("--hyper-activation", type=str, default="silu", choices=["silu", "gelu", "tanh", "relu"])
     parser.add_argument("--hyper-rho-init", type=float, default=1e-3)
     parser.add_argument("--hyper-rho-eps", type=float, default=0.0)
     parser.add_argument("--hyper-rho-max", type=float, default=0.0)

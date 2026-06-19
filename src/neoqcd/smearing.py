@@ -324,6 +324,22 @@ class HyperSmearing(torch.nn.Module):
         hidden_dim = int(getattr(flow_pars, "hyper_hidden_dim", 16))
         if hidden_dim <= 0:
             raise ValueError(f"hyper_hidden_dim must be >= 1, got {hidden_dim}")
+        depth = int(getattr(flow_pars, "hyper_depth", 2))
+        if depth <= 0:
+            raise ValueError(f"hyper_depth must be >= 1, got {depth}")
+        activation_name = str(getattr(flow_pars, "hyper_activation", "silu")).lower()
+        activation_factories = {
+            "silu": torch.nn.SiLU,
+            "gelu": torch.nn.GELU,
+            "tanh": torch.nn.Tanh,
+            "relu": torch.nn.ReLU,
+        }
+        if activation_name not in activation_factories:
+            raise ValueError(
+                "hyper_activation must be one of "
+                f"{sorted(activation_factories)}, got {activation_name!r}"
+            )
+        activation_factory = activation_factories[activation_name]
 
         n_freq = emb_dim // 2
         freqs = 2.0 ** torch.arange(n_freq, dtype=torch.float64)
@@ -343,11 +359,14 @@ class HyperSmearing(torch.nn.Module):
         # embedding = fourier(beta) || [beta, time]
         in_dim = self.scalar_emb_dim + 2
         out_dim = self.smearing_steps * self.coeffs_per_step
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(in_dim, hidden_dim),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden_dim, out_dim),
-        )
+        mlp_layers = []
+        current_dim = in_dim
+        for _ in range(depth):
+            mlp_layers.append(torch.nn.Linear(current_dim, hidden_dim))
+            mlp_layers.append(activation_factory())
+            current_dim = hidden_dim
+        mlp_layers.append(torch.nn.Linear(current_dim, out_dim))
+        self.mlp = torch.nn.Sequential(*mlp_layers)
         self.mlp = self.mlp.to(dtype=torch.float64, device=flow_pars.device)
 
         rho_init = float(getattr(flow_pars, "hyper_rho_init", 1e-3))

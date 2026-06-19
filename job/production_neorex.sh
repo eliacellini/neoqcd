@@ -73,6 +73,8 @@ TRAIN_STEPS=100
 HYPER_SMEARING_MODE=per_link
 HYPER_TIME_EMBEDDING_DIM=8
 HYPER_HIDDEN_DIM=16
+HYPER_DEPTH=2
+HYPER_ACTIVATION=silu
 HYPER_RHO_INIT=1e-3
 
 # -----------------------------
@@ -126,6 +128,8 @@ CMD=(
   --hyper-smearing-mode "$HYPER_SMEARING_MODE"
   --hyper-time-embedding-dim "$HYPER_TIME_EMBEDDING_DIM"
   --hyper-hidden-dim "$HYPER_HIDDEN_DIM"
+  --hyper-depth "$HYPER_DEPTH"
+  --hyper-activation "$HYPER_ACTIVATION"
   --hyper-rho-init "$HYPER_RHO_INIT"
   --hyper-rho-eps 0.0
   --hyper-rho-max 0.0

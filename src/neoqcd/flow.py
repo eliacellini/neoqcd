@@ -294,6 +294,7 @@ class FlowPars():
                  residual = True, hyper=True,
                  use_hyper_smearing=False, hyper_smearing_mode="shared",
                  hyper_time_embedding_dim=8, hyper_hidden_dim=16, hyper_rho_init=1e-3,
+                 hyper_depth=2, hyper_activation="silu",
                  hyper_normalize_by_nstep=True, hyper_rho_eps=0.0,
                  hyper_scale_by_delta=False,
                  hyper_rho_max=0.0,
@@ -334,6 +335,8 @@ class FlowPars():
         self.hyper_smearing_mode = str(hyper_smearing_mode)
         self.hyper_time_embedding_dim = int(hyper_time_embedding_dim)
         self.hyper_hidden_dim = int(hyper_hidden_dim)
+        self.hyper_depth = int(hyper_depth)
+        self.hyper_activation = str(hyper_activation)
         self.hyper_rho_init = float(hyper_rho_init)
         self.hyper_normalize_by_nstep = bool(hyper_normalize_by_nstep)
         self.hyper_rho_eps = float(hyper_rho_eps)
