@@ -4,7 +4,7 @@
 #SBATCH -e reports/errors_%x_%A_%a
 #SBATCH -o reports/output_%x_%A_%a
 #SBATCH --gpus-per-node=4
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --time=24:00:00

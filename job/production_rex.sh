@@ -4,7 +4,7 @@
 #SBATCH -e reports/errors_%x_%j
 #SBATCH -o reports/output_%x_%j
 #SBATCH --gpus-per-node=4
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --time=24:00:00
@@ -51,7 +51,7 @@ SPACE_SLICE=3
 
 THERMAL_STEPS=1000
 STEPS=1
-SWEEP=5
+SWEEP=1
 SWAP_EVERY=1
 SWAP_PARITY=alternating
 CFG_CACHE_TAG=production
