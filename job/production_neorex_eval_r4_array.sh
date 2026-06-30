@@ -1,13 +1,14 @@
 #!/bin/bash
 #SBATCH --account=INF26_sft
-#SBATCH --job-name=neoqcd-neorex-production
-#SBATCH -e reports/errors_%x_%j
-#SBATCH -o reports/output_%x_%j
+#SBATCH --job-name=neoqcd-neorex-eval-r4
+#SBATCH -e reports/errors_%x_%A_%a
+#SBATCH -o reports/output_%x_%A_%a
 #SBATCH --gpus-per-node=4
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --time=24:00:00
+#SBATCH --array=0-3
 #SBATCH --chdir=/leonardo_scratch/large/userexternal/ecellini/neoqcd
 
 set -euo pipefail
@@ -16,6 +17,7 @@ set -euo pipefail
 # Distributed launch
 # -----------------------------
 NPROC=4
+NREPLICAS=$((SLURM_NNODES * NPROC))
 
 # -----------------------------
 # Project / environment
@@ -51,24 +53,26 @@ SPACE_SLICE=3
 
 THERMAL_STEPS=20
 STEPS=100
-SWEEP=1
+SWEEP=5
 SWAP_EVERY=1
 SWAP_PARITY=alternating
 OREX_SCHEDULE=even_odd
+CFG_CACHE_TAG=production
 
 # -----------------------------
-# NEO-REX config
+# NEO-REX pretrained evaluation array
 # -----------------------------
-NEOREX_PROTOCOL_STEPS=6
+NEOREX_PROTOCOL_STEPS_LIST=(2 4 6 8)
+NEOREX_PROTOCOL_STEPS="${NEOREX_PROTOCOL_STEPS_LIST[$SLURM_ARRAY_TASK_ID]}"
 NEOREX_HEATBATH_STEPS_PER_STEP=1
 NEOREX_WORK_MODE=logdet
-NEOREX_FLOW_LR=1e-3
+NEOREX_FLOW_LR=0.0
 NEOREX_GRAD_CLIP_NORM=0.0
-NEOREX_LOAD_FLOW="${NEOREX_LOAD_FLOW:-}"
-NEOREX_SAVE_FLOW="${NEOREX_SAVE_FLOW:-}"
+TRAIN_STEPS=0
+
+NEOREX_LOAD_FLOW="${NEOREX_LOAD_FLOW:-/leonardo_scratch/large/userexternal/ecellini/neoqcd/results/pt_obc/production_neorex_obc_T8_L8_r8_bs128_47347757/neorex_flow_final.pt}"
 NEOREX_FLOW_CHECKPOINT_DIR="${NEOREX_FLOW_CHECKPOINT_DIR:-data/neorex_flows}"
 NEOREX_FLOW_CHECKPOINT_NAME="${NEOREX_FLOW_CHECKPOINT_NAME:-global.pt}"
-TRAIN_STEPS=100
 
 HYPER_SMEARING_MODE=per_link
 HYPER_TIME_EMBEDDING_DIM=8
@@ -84,8 +88,11 @@ LOG_EVERY=10
 SEED=137
 WANDB_PROJECT=neo-pt
 WANDB_ENTITY=lqft-snf
-RUN_NAME="${RUN_NAME:-production_neorex_obc_T${T}_L${L}_r8_d${DEFECT_SIZE}_bs${BS}_sw${SWEEP}_nsteps${NEOREX_PROTOCOL_STEPS}_hb${NEOREX_HEATBATH_STEPS_PER_STEP}_h${HYPER_HIDDEN_DIM}_depth${HYPER_DEPTH}}"
-OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${RUN_NAME}_${SLURM_JOB_ID}"
+PRETRAINED_TAG="${PRETRAINED_TAG:-train_nsteps6_h32_depth3_sw1_job47347757}"
+STUDY_NAME="${STUDY_NAME:-neorex_pretrained_eval_T${T}L${L}_d${DEFECT_SIZE}_bs${BS}_sw${SWEEP}_r${NREPLICAS}_${PRETRAINED_TAG}}"
+RUN_NAME="${RUN_NAME:-nsteps${NEOREX_PROTOCOL_STEPS}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${STUDY_NAME}_${RUN_NAME}}"
+OUTPUT_DIR="${PROJECT_DIR}/results/pt_obc/${STUDY_NAME}/${RUN_NAME}"
 
 CMD=(
   python
@@ -94,7 +101,7 @@ CMD=(
   --nnodes="$SLURM_NNODES"
   --node_rank="$SLURM_NODEID"
   --nproc_per_node="$NPROC"
-  --rdzv_id="$SLURM_JOB_ID"
+  --rdzv_id="${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
   --rdzv_backend=c10d
   --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   main/main_pt_obc.py
@@ -123,6 +130,8 @@ CMD=(
   --neorex-grad-clip-norm "$NEOREX_GRAD_CLIP_NORM"
   --neorex-flow-checkpoint-dir "$NEOREX_FLOW_CHECKPOINT_DIR"
   --neorex-flow-checkpoint-name "$NEOREX_FLOW_CHECKPOINT_NAME"
+  --neorex-load-flow "$NEOREX_LOAD_FLOW"
+  --neorex-eval-flow
   --train-steps "$TRAIN_STEPS"
   --use-hyper-smearing
   --hyper-smearing-mode "$HYPER_SMEARING_MODE"
@@ -138,21 +147,24 @@ CMD=(
   --wandb
   --wandb-project "$WANDB_PROJECT"
   --wandb-entity "$WANDB_ENTITY"
-  --wandb-run-name "$RUN_NAME"
+  --wandb-run-name "$WANDB_RUN_NAME"
   --run-name "$RUN_NAME"
   --output-dir "$OUTPUT_DIR"
   --main-dir "$PROJECT_DIR"
+  --cfg-cache-tag "$CFG_CACHE_TAG"
   --log-every "$LOG_EVERY"
   --seed "$SEED"
 )
 
-if [[ -n "$NEOREX_LOAD_FLOW" ]]; then
-  CMD+=(--neorex-load-flow "$NEOREX_LOAD_FLOW")
-fi
-if [[ -n "$NEOREX_SAVE_FLOW" ]]; then
-  CMD+=(--neorex-save-flow "$NEOREX_SAVE_FLOW")
-fi
-
+echo "Running NEO-REX pretrained evaluation array task:"
+echo "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+echo "NREPLICAS=$NREPLICAS"
+echo "NEOREX_PROTOCOL_STEPS=$NEOREX_PROTOCOL_STEPS"
+echo "NEOREX_LOAD_FLOW=$NEOREX_LOAD_FLOW"
+echo "STUDY_NAME=$STUDY_NAME"
+echo "RUN_NAME=$RUN_NAME"
+echo "WANDB_RUN_NAME=$WANDB_RUN_NAME"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "Running command:"
 printf ' %q' "${CMD[@]}"
 echo

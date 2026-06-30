@@ -109,6 +109,44 @@ def _resolve_neorex_flow_checkpoint_path(args: argparse.Namespace, spec: str):
     return path
 
 
+def _neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> dict:
+    return {
+        "algorithm": "neorex",
+        "saved_path": str(saved_path),
+        "neorex_protocol_steps": int(args.neorex_protocol_steps),
+        "neorex_heatbath_steps_per_step": int(args.neorex_heatbath_steps_per_step),
+        "neorex_work_mode": str(args.neorex_work_mode),
+        "train_steps": int(args.train_steps),
+        "neorex_eval_flow": bool(args.neorex_eval_flow),
+        "hyper_smearing_mode": str(args.hyper_smearing_mode),
+        "hyper_time_embedding_dim": int(args.hyper_time_embedding_dim),
+        "hyper_hidden_dim": int(args.hyper_hidden_dim),
+        "hyper_depth": int(args.hyper_depth),
+        "hyper_activation": str(args.hyper_activation),
+        "hyper_rho_init": float(args.hyper_rho_init),
+        "hyper_scale_by_delta": bool(args.hyper_scale_by_delta),
+        "hyper_normalize_by_nstep": bool(args.hyper_normalize_by_nstep),
+        "D": int(args.D),
+        "T": int(args.T),
+        "L": int(args.L),
+        "N": int(args.N),
+        "defect_size": int(args.defect_size),
+        "time_slice": int(args.time_slice),
+        "space_slice": int(args.space_slice),
+        "batch_size": int(args.batch_size),
+        "bc_min": float(args.bc_min),
+        "bc_max": float(args.bc_max),
+    }
+
+
+def _write_neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> str:
+    path = Path(saved_path)
+    meta_path = Path(f"{path}.meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(_neorex_flow_metadata(args, str(path)), f, indent=2)
+    return str(meta_path)
+
+
 def _rank_cfg_path(cache_dir: Path, rank: int) -> Path:
     return cache_dir / f"rank_{rank:03d}.pt"
 
@@ -407,6 +445,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neorex-grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--neorex-max-consecutive-nan-grad-updates", type=int, default=5)
     parser.add_argument("--neorex-stochastic-first", action="store_true")
+    parser.add_argument(
+        "--neorex-eval-flow",
+        action="store_true",
+        help="For NEO-REX, load/use the flow in evaluation mode and skip optimizer updates.",
+    )
     parser.add_argument(
         "--neorex-load-flow",
         type=str,
@@ -985,7 +1028,10 @@ def main(args: argparse.Namespace) -> None:
                 orex_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
                 cfgs, stats = pt.step(cfgs, orex_mcmc)
             elif args.algorithm == "neorex":
-                train_flow = (args.train_steps <= 0) or ((step + 1) <= args.train_steps)
+                train_flow = (
+                    (not bool(args.neorex_eval_flow))
+                    and ((args.train_steps <= 0) or ((step + 1) <= args.train_steps))
+                )
                 cfgs, stats = pt.neorex_step(cfgs, train_flow=train_flow)
             else:
                 local_actions = compute_action_table(
@@ -1214,22 +1260,26 @@ def main(args: argparse.Namespace) -> None:
             }
         if args.algorithm == "neorex":
             saved_flow_paths = []
-            final_flow_path = out_dir / "neorex_flow_final.pt"
+            saved_flow_metadata_paths = []
+            final_flow_path = out_dir / f"neorex_flow_final_nsteps{int(args.neorex_protocol_steps)}.pt"
             final_flow_path.parent.mkdir(parents=True, exist_ok=True)
             pt.save_flow(str(final_flow_path))
             saved_flow_paths.append(str(final_flow_path))
+            saved_flow_metadata_paths.append(_write_neorex_flow_metadata(args, str(final_flow_path)))
 
             save_path = _resolve_neorex_flow_checkpoint_path(args, args.neorex_save_flow)
             if save_path is not None:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 pt.save_flow(str(save_path))
                 saved_flow_paths.append(str(save_path))
+                saved_flow_metadata_paths.append(_write_neorex_flow_metadata(args, str(save_path)))
                 print(f"neorex_flow_checkpoint=saved  path={save_path}", flush=True)
 
             meta["neorex_flow_checkpoint"] = {
                 "load_mode": neorex_flow_load_mode,
                 "load_path": neorex_flow_load_path,
                 "saved_paths": saved_flow_paths,
+                "metadata_paths": saved_flow_metadata_paths,
             }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
