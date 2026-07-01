@@ -24,7 +24,7 @@ from neoqcd.distributedPT import (
 )
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR
-from neoqcd.smearing import DefectCouplingLayer
+from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
 from neoqcd.theory import Wilson_action
 from neoqcd.utils import Defect, create_around_defect_mask, create_mask
 
@@ -328,6 +328,37 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         return x_out, logdet
 
 
+class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
+    """
+    Defect-local residual normalizing-flow block.
+
+    ResidualNormalizingFlows already returns a real tangent-space logdet, so no
+    extra factor of two is applied here.
+    """
+
+    def __init__(self, flow_pars: FlowPars):
+        torch.nn.Module.__init__(self)
+        self.flow_pars = flow_pars
+        self.layer = ResidualNormalizingFlows(flow_pars, time=1.0)
+
+    def forward(self, x: torch.Tensor, bc: torch.Tensor, delta_bc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bs = int(x.shape[0])
+        bc = self._normalize_parameter(bc, bs, x.device)
+        delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
+        work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+
+        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=2)
+        small_cfgs, _, logdet = self.layer(
+            small_cfgs,
+            self.flow_pars.small_mask[-1],
+            dmasking=True,
+            dmask=self.flow_pars.smeared_defect_mask[-1],
+            beta=bc,
+            delta_beta=delta_bc,
+        )
+        return self._embed_small_cfgs(small_cfgs, x, buffer=2), logdet.to(dtype=work_dtype)
+
+
 def _build_neorex_flow_pars(
     args: argparse.Namespace,
     device: torch.device,
@@ -393,6 +424,10 @@ def _build_neorex_flow_pars(
         hyper_rho_eps=args.hyper_rho_eps,
         hyper_scale_by_delta=args.hyper_scale_by_delta,
         hyper_rho_max=args.hyper_rho_max,
+        residual_include_imag=args.residual_include_imag,
+        residual_quadratic=args.residual_quadratic,
+        residual_coeff_init=args.residual_coeff_init,
+        residual_coeff_max=args.residual_coeff_max,
         defect=defect,
         smeared_defect_mask=[smeared_defect_mask],
         small_mask=[small_mask],
@@ -478,6 +513,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hyper-no-normalize-by-nstep", dest="hyper_normalize_by_nstep", action="store_false")
     parser.add_argument("--hyper-scale-by-delta", dest="hyper_scale_by_delta", action="store_true")
     parser.add_argument("--hyper-no-scale-by-delta", dest="hyper_scale_by_delta", action="store_false")
+    parser.add_argument("--residual-include-imag", dest="residual_include_imag", action="store_true")
+    parser.add_argument("--residual-no-include-imag", dest="residual_include_imag", action="store_false")
+    parser.add_argument("--residual-quadratic", dest="residual_quadratic", action="store_true")
+    parser.add_argument("--residual-no-quadratic", dest="residual_quadratic", action="store_false")
+    parser.add_argument("--residual-coeff-init", type=float, default=1e-3)
+    parser.add_argument("--residual-coeff-max", type=float, default=0.0)
 
     # Run control
     parser.add_argument("--thermal-steps", type=int, default=10)
@@ -516,12 +557,14 @@ def parse_args() -> argparse.Namespace:
     # Accepted for command-template compatibility; not used in this standard PT main.
     parser.add_argument("--update", type=str, default="heatbath")
     parser.add_argument("--train-steps", type=int, default=0)
-    parser.add_argument("--nf-layer-type", type=str, default="")
+    parser.add_argument("--nf-layer-type", type=str, default="", choices=["", "smearing", "residual"])
     parser.add_argument("--nf-layers-per-step", type=int, default=0)
     parser.set_defaults(
         use_hyper_smearing=True,
         hyper_normalize_by_nstep=False,
         hyper_scale_by_delta=True,
+        residual_include_imag=True,
+        residual_quadratic=True,
         log_gpu_memory=False,
         use_cfg_cache=True,
     )
@@ -826,7 +869,11 @@ def main(args: argparse.Namespace) -> None:
             raise ValueError("--neorex-heatbath-steps-per-step must be >= 0")
 
         neorex_flow_pars = _build_neorex_flow_pars(args, device, mask, defect)
-        nf_layer = DefectSNFProtocolLayer(neorex_flow_pars)
+        nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
+        if nf_layer_kind == "residual":
+            nf_layer = ResidualDefectSNFProtocolLayer(neorex_flow_pars)
+        else:
+            nf_layer = DefectSNFProtocolLayer(neorex_flow_pars)
         neorex_mcmc = DefectMCMCAdapter(
             flow_pars=flow_pars,
             beta=args.beta,

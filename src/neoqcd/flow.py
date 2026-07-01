@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import pickle
 from neoqcd.mcmc import NEMCMC_update
-from neoqcd.smearing import CouplingLayer, DefectCouplingLayer
+from neoqcd.smearing import CouplingLayer, DefectCouplingLayer, ResidualCouplingLayer
 from neoqcd.utils import grab, set_defect_rho_from_fits
 from neoqcd.nn import KISS_HTConv1D, HyperTimeConv1D, time_embedding,HTCNN
 
@@ -22,12 +22,17 @@ class Flow(torch.nn.Module):
 
         layers=[]
         step = 0
+        snf_layer_type = str(getattr(flow_pars, "nf_layer_type", "smearing")).lower()
         for protocol_par in flow_pars.protocol:
             #add smearing layer
             if (flow_type == 'snf'):
                 rho_step = self.initialize_rho(step, flow_pars).to(flow_pars.device)
 
-                if flow_pars.rho_shape_type == 3:
+                if snf_layer_type == "residual":
+                    if flow_pars.rho_shape_type == 3:
+                        raise ValueError("nf_layer_type='residual' is a standard SNF layer; do not use defect coupling")
+                    smr_step = ResidualCouplingLayer(flow_pars, rho_step, (step+1)/flow_pars.nstep)
+                elif flow_pars.rho_shape_type == 3:
                     smr_step = DefectCouplingLayer(flow_pars, rho_step, (step+1)/flow_pars.nstep)
                 else:
                     smr_step = CouplingLayer(flow_pars, rho_step, (step+1)/flow_pars.nstep)
@@ -298,6 +303,9 @@ class FlowPars():
                  hyper_normalize_by_nstep=True, hyper_rho_eps=0.0,
                  hyper_scale_by_delta=False,
                  hyper_rho_max=0.0,
+                 nf_layer_type="smearing",
+                 residual_include_imag=True, residual_quadratic=True,
+                 residual_coeff_init=1e-3, residual_coeff_max=0.0,
                  defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -342,6 +350,11 @@ class FlowPars():
         self.hyper_rho_eps = float(hyper_rho_eps)
         self.hyper_scale_by_delta = bool(hyper_scale_by_delta)
         self.hyper_rho_max = float(hyper_rho_max)
+        self.nf_layer_type = str(nf_layer_type)
+        self.residual_include_imag = bool(residual_include_imag)
+        self.residual_quadratic = bool(residual_quadratic)
+        self.residual_coeff_init = float(residual_coeff_init)
+        self.residual_coeff_max = float(residual_coeff_max)
         if self.use_nn and not self.use_hyper_smearing:
             embedding = time_embedding(F, 1.0, device=device)
             layer =  KISS_HTConv1D if use_kiss else HyperTimeConv1D

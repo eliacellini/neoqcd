@@ -514,6 +514,349 @@ class HyperSmearing(torch.nn.Module):
         return rho
 
 
+def _su3_generators(dtype=torch.cdouble, device=None):
+    real_dtype = torch.float64 if dtype in {torch.cdouble, torch.complex128} else torch.float32
+    zero = torch.tensor(0.0, dtype=real_dtype, device=device)
+    one = torch.tensor(1.0, dtype=real_dtype, device=device)
+    i = torch.tensor(1.0j, dtype=dtype, device=device)
+
+    gens = []
+    for _ in range(8):
+        gens.append(torch.zeros((3, 3), dtype=dtype, device=device))
+
+    gens[0][0, 1] = one
+    gens[0][1, 0] = one
+
+    gens[1][0, 1] = -i
+    gens[1][1, 0] = i
+
+    gens[2][0, 0] = one
+    gens[2][1, 1] = -one
+
+    gens[3][0, 2] = one
+    gens[3][2, 0] = one
+
+    gens[4][0, 2] = -i
+    gens[4][2, 0] = i
+
+    gens[5][1, 2] = one
+    gens[5][2, 1] = one
+
+    gens[6][1, 2] = -i
+    gens[6][2, 1] = i
+
+    inv_sqrt3 = torch.tensor(1.0 / np.sqrt(3.0), dtype=real_dtype, device=device)
+    gens[7][0, 0] = inv_sqrt3
+    gens[7][1, 1] = inv_sqrt3
+    gens[7][2, 2] = -2.0 * inv_sqrt3
+
+    return 0.5 * torch.stack(gens, dim=0)
+
+
+def _project_hermitian_traceless(H, N):
+    H = 0.5 * (H + sun.SUN_dagger(H))
+    tr = sun.SUN_trace(H).unsqueeze(-1).unsqueeze(-1) / float(N)
+    eye = sun.SUN_identity(H.shape[:-1], dtype=H.dtype, device=H.device)
+    return H - tr * eye
+
+
+def _as_batched_parameter(value, batch_size, dtype, device, default=0.0):
+    if value is None:
+        out = torch.full((batch_size,), float(default), dtype=dtype, device=device)
+    else:
+        out = torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+        if out.numel() == 0:
+            out = torch.full((batch_size,), float(default), dtype=dtype, device=device)
+        elif out.numel() == 1 and batch_size != 1:
+            out = out.expand(batch_size)
+        elif out.numel() != batch_size:
+            raise ValueError(f"parameter has shape ({out.numel()},), expected 1 or {batch_size}")
+    return out
+
+
+class ResidualNormalizingFlows(torch.nn.Module):
+    """
+    Gradient-based residual SU(3) coupling flow.
+
+    The implemented local potential is polynomial in the real/imaginary traces
+    of oriented plaquettes containing the active link:
+
+        phi = lin_i z_i + 1/2 H_ij z_i z_j
+
+    The forward map uses the explicit gradient of this potential and an exact
+    local tangent-space Jacobian. Hypernetwork coefficients depend globally on
+    beta, while delta_beta multiplies the exponential generator.
+    """
+
+    def __init__(self, flow_pars, time=1.0):
+        super().__init__()
+        self.N = int(flow_pars.N)
+        if self.N != 3:
+            raise ValueError("ResidualNormalizingFlows currently supports SU(3) only")
+        self.D = int(flow_pars.D)
+        self.device = flow_pars.device
+        self.time = float(time)
+        self.steps = int(getattr(flow_pars, "smearing_steps_per_layer", 1))
+        self.include_imag = bool(getattr(flow_pars, "residual_include_imag", True))
+        self.use_quadratic = bool(getattr(flow_pars, "residual_quadratic", True))
+        self.coeff_max = float(getattr(flow_pars, "residual_coeff_max", 0.0))
+
+        self.n_oriented_plaquettes = 2 * (self.D - 1)
+        self.n_features = self.n_oriented_plaquettes * (2 if self.include_imag else 1)
+        self.coeffs_per_step = self.n_features
+        if self.use_quadratic:
+            self.coeffs_per_step += self.n_features * self.n_features
+
+        emb_dim = int(getattr(flow_pars, "hyper_time_embedding_dim", 8))
+        if emb_dim <= 0 or emb_dim % 2 != 0:
+            raise ValueError(f"hyper_time_embedding_dim must be a positive even integer, got {emb_dim}")
+        hidden_dim = int(getattr(flow_pars, "hyper_hidden_dim", 16))
+        depth = int(getattr(flow_pars, "hyper_depth", 2))
+        activation_name = str(getattr(flow_pars, "hyper_activation", "silu")).lower()
+        activation_factories = {
+            "silu": torch.nn.SiLU,
+            "gelu": torch.nn.GELU,
+            "tanh": torch.nn.Tanh,
+            "relu": torch.nn.ReLU,
+        }
+        if activation_name not in activation_factories:
+            raise ValueError(
+                "hyper_activation must be one of "
+                f"{sorted(activation_factories)}, got {activation_name!r}"
+            )
+
+        freqs = 2.0 ** torch.arange(emb_dim // 2, dtype=torch.float64)
+        self.register_buffer("freqs", freqs)
+        self.register_buffer("generators", _su3_generators(dtype=torch.cdouble, device=flow_pars.device))
+
+        in_dim = emb_dim + 1  # Fourier(beta) || beta
+        out_dim = self.steps * self.coeffs_per_step
+        layers = []
+        current_dim = in_dim
+        for _ in range(depth):
+            layers.append(torch.nn.Linear(current_dim, hidden_dim))
+            layers.append(activation_factories[activation_name]())
+            current_dim = hidden_dim
+        layers.append(torch.nn.Linear(current_dim, out_dim))
+        self.mlp = torch.nn.Sequential(*layers).to(dtype=torch.float64, device=flow_pars.device)
+
+        coeff_init = float(getattr(flow_pars, "residual_coeff_init", getattr(flow_pars, "hyper_rho_init", 1e-3)))
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
+            self.mlp[-1].bias[: self.steps * self.n_features].fill_(coeff_init)
+
+    def _fourier(self, beta):
+        arg = beta.unsqueeze(-1) * self.freqs.unsqueeze(0)
+        return torch.cat((torch.sin(arg), torch.cos(arg)), dim=-1)
+
+    def _coefficients(self, beta, delta_beta, batch_size, dtype, device):
+        beta_v = _as_batched_parameter(beta, batch_size, torch.float64, self.freqs.device, self.time)
+        delta_v = _as_batched_parameter(delta_beta, batch_size, torch.float64, self.freqs.device, 0.0)
+        emb = torch.cat(
+            (
+                self._fourier(beta_v),
+                beta_v.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        raw = self.mlp(emb).view(batch_size, self.steps, self.coeffs_per_step)
+        if self.coeff_max > 0.0:
+            raw = self.coeff_max * torch.tanh(raw / self.coeff_max)
+
+        lin = raw[..., : self.n_features].to(device=device, dtype=dtype)
+        if self.use_quadratic:
+            quad = raw[..., self.n_features :].view(
+                batch_size, self.steps, self.n_features, self.n_features
+            )
+            quad = 0.5 * (quad + quad.transpose(-1, -2))
+            quad = quad.to(device=device, dtype=dtype)
+        else:
+            quad = torch.zeros(
+                (batch_size, self.steps, self.n_features, self.n_features),
+                dtype=dtype,
+                device=device,
+            )
+        delta_v = delta_v.to(device=device, dtype=dtype)
+        return lin, quad, delta_v
+
+    def _oriented_staples(self, cfgs, mu):
+        staples = []
+        for nu in range(self.D):
+            if nu == mu:
+                continue
+            staples.append(sun.pstaple(cfgs, mu, nu, self.D))
+            staples.append(sun.nstaple(cfgs, mu, nu, self.D))
+        return torch.stack(staples, dim=1)
+
+    def _features(self, staples, U):
+        loops = sun.SUN_mul(staples, U.unsqueeze(1))
+        tr = sun.SUN_trace(loops) / float(self.N)
+        if self.include_imag:
+            return torch.cat((tr.real, tr.imag), dim=1)
+        return tr.real
+
+    def _feature_weights(self, features, lin, quad):
+        lin_view = lin.view(lin.shape + (1,) * (features.dim() - 2))
+        return lin_view + torch.einsum(
+            "bij,bj...->bi...",
+            quad,
+            features,
+        )
+
+    def _complex_coefficients_from_weights(self, weights, delta_beta):
+        npl = self.n_oriented_plaquettes
+        delta_view = delta_beta.view((delta_beta.shape[0],) + (1,) * (weights.dim() - 1))
+        if self.include_imag:
+            wr = weights[:, :npl]
+            wi = weights[:, npl:]
+            return delta_view * (wr - 1.j * wi) / float(self.N)
+        return delta_view * weights / float(self.N)
+
+    def _staple_sum(self, staples, weights, delta_beta):
+        alpha = self._complex_coefficients_from_weights(weights, delta_beta)
+        return torch.sum(alpha.unsqueeze(-1).unsqueeze(-1) * sun.SUN_dagger(staples), dim=1)
+
+    def _delta_features(self, staples, delta_U):
+        delta_loops = sun.SUN_mul(staples, delta_U.unsqueeze(1))
+        delta_tr = sun.SUN_trace(delta_loops) / float(self.N)
+        if self.include_imag:
+            return torch.cat((delta_tr.real, delta_tr.imag), dim=1)
+        return delta_tr.real
+
+    def _project_delta_omega(self, delta_omega):
+        antiherm = sun.SUN_dagger(delta_omega) - delta_omega
+        eye = sun.SUN_identity(antiherm.shape[:-1], dtype=antiherm.dtype, device=antiherm.device)
+        return (
+            0.5j * antiherm
+            - 0.5j
+            / float(self.N)
+            * sun.SUN_trace(antiherm).unsqueeze(-1).unsqueeze(-1)
+            * eye
+        )
+
+    def _tangent_coordinates(self, delta_U, U_out):
+        left = sun.SUN_mul(delta_U, sun.SUN_dagger(U_out))
+        herm = _project_hermitian_traceless(-1.j * left, self.N)
+        gens = self.generators.to(dtype=U_out.dtype, device=U_out.device)
+        return 2.0 * torch.einsum("...ij,aji->...a", herm, gens).real
+
+    def _local_tangent_jacobian(self, staples, U, C, dexpQdQ, expQ, U_out, quad, delta_beta):
+        gens = self.generators.to(dtype=U.dtype, device=U.device)
+        view = (1,) * (U.dim() - 2) + (self.N, self.N)
+        cols = []
+        Udag = sun.SUN_dagger(U)
+        omega = sun.SUN_mul(C, Udag)
+        del omega
+        for b in range(gens.shape[0]):
+            Tb = gens[b].view(view)
+            delta_U = 1.j * sun.SUN_mul(Tb, U)
+            delta_features = self._delta_features(staples, delta_U)
+            delta_weights = torch.einsum("bij,bj...->bi...", quad, delta_features)
+            delta_C = self._staple_sum(staples, delta_weights, delta_beta)
+            delta_Udag = -1.j * sun.SUN_mul(Udag, Tb)
+            delta_omega = sun.SUN_mul(delta_C, Udag) + sun.SUN_mul(C, delta_Udag)
+            delta_Q = self._project_delta_omega(delta_omega)
+            delta_expQ = torch.einsum("...mn,...imnj->...ij", delta_Q, dexpQdQ)
+            delta_U_out = sun.SUN_mul(delta_expQ, U) + sun.SUN_mul(expQ, delta_U)
+            cols.append(self._tangent_coordinates(delta_U_out, U_out))
+        return torch.stack(cols, dim=-1)
+
+    def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0):
+        bs = int(cfgs.shape[0])
+        real_dtype = cfgs.real.dtype
+        lin_all, quad_all, delta_v = self._coefficients(beta, delta_beta, bs, real_dtype, cfgs.device)
+        lin = lin_all[:, int(step)]
+        quad = quad_all[:, int(step)]
+
+        U = cfgs[:, mu]
+        if bool(torch.all(delta_v == 0.0).item()):
+            ident = torch.eye(8, dtype=real_dtype, device=cfgs.device)
+            jac = ident.view((1,) * (U.dim() - 2) + (8, 8)).expand(U.shape[:-2] + (8, 8))
+            detjac = torch.ones(U.shape[:-2], dtype=real_dtype, device=cfgs.device)
+            return U.clone(), detjac, jac
+
+        staples = self._oriented_staples(cfgs, mu)
+        features = self._features(staples, U)
+        weights = self._feature_weights(features, lin, quad)
+        C = self._staple_sum(staples, weights, delta_v)
+
+        eye = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
+        omega = generate_omega(C, U)
+        Q = generate_Q(omega, self.N)
+        Q2 = sun.SUN_mul(Q, Q)
+        oidid = otimes(eye, eye)
+        oidQ = otimes(eye, Q) + otimes(Q, eye)
+        f0, f1, f2, B1, B2, _ = generate_coefficients(Q, Q2, eye, oidid, oidQ, self.device, backward=False)
+        expQ = generate_expQ(Q, Q2, eye, f0, f1, f2)
+        dexpQdQ = generate_dexpQ_dQ(Q, Q2, B1, B2, f1, f2, eye, oidid, oidQ)
+        U_out = sun.SUN_mul(expQ, U)
+
+        jac = self._local_tangent_jacobian(staples, U, C, dexpQdQ, expQ, U_out, quad, delta_v)
+        detjac = torch.linalg.det(jac).abs()
+        return U_out, detjac, jac
+
+    def forward(self, cfgs, mask, dmasking=False, dmask=None, beta=None, delta_beta=None):
+        real_dtype = cfgs.real.dtype
+        ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
+        dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
+        dims = tuple(np.arange(1, self.D + 2))
+
+        for sm in range(self.steps):
+            for mu in range(self.D):
+                for eo in range(2):
+                    if dmasking:
+                        current_mask = mask[eo + mu * 2, :] * dmask
+                    else:
+                        current_mask = mask[eo + mu * 2, :]
+
+                    U_new, jac, _ = self.residual_update_mu(
+                        cfgs,
+                        mu,
+                        beta=beta,
+                        delta_beta=delta_beta,
+                        step=sm,
+                    )
+                    cfgs_new = cfgs.clone()
+                    cfgs_new[:, mu] = U_new
+                    cfgs = current_mask * cfgs_new + (1 - current_mask) * cfgs
+
+                    active = current_mask.squeeze(-1).squeeze(-1)
+                    masked_jac = active * jac.unsqueeze(1) + (1 - active) * ones
+                    dlogJ = dlogJ + torch.sum(
+                        torch.log(torch.clamp(masked_jac, min=1e-12)),
+                        dims,
+                    )
+        return cfgs, 0, dlogJ
+
+
+class ResidualCouplingLayer(torch.nn.Module):
+    """
+    Standard full-lattice SNF coupling layer backed by ResidualNormalizingFlows.
+
+    Flow stores logJ with the old smearing convention and later multiplies it by
+    two. ResidualNormalizingFlows returns the real tangent-space logdet directly,
+    so this adapter returns half of it.
+    """
+
+    def __init__(self, flow_pars, rho_layer, time):
+        super().__init__()
+        if int(getattr(flow_pars, "rho_shape_type", 0)) == 3:
+            raise ValueError("ResidualCouplingLayer is standard/full-lattice; use no defect rho_shape_type")
+        self.register_buffer("rho_layer", rho_layer.detach().clone())
+        self.residual_flow = ResidualNormalizingFlows(flow_pars, time)
+
+    def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
+        del rho_layer, is_training
+        cfgs, dQ, dlogJ = self.residual_flow(
+            cfgs,
+            flow_pars.mask,
+            beta=beta,
+            delta_beta=delta_beta,
+        )
+        return cfgs, dQ, 0.5 * dlogJ
+
+
 class CouplingLayer(torch.nn.Module):
     def __init__(self, flow_pars, rho_layer, time):
         super().__init__()
