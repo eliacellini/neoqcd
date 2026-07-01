@@ -627,7 +627,8 @@ class ResidualNormalizingFlows(torch.nn.Module):
 
         freqs = 2.0 ** torch.arange(emb_dim // 2, dtype=torch.float64)
         self.register_buffer("freqs", freqs)
-        self.register_buffer("generators", _su3_generators(dtype=torch.cdouble, device=flow_pars.device))
+        # Keep this constant out of buffers: NCCL DDP cannot broadcast ComplexDouble buffers.
+        self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
 
         in_dim = emb_dim + 1  # Fourier(beta) || beta
         out_dim = self.steps * self.coeffs_per_step

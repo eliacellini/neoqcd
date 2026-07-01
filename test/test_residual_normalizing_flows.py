@@ -69,6 +69,12 @@ def build_layer(batch_size=1, coeff_init=1e-3, quadratic=True, include_imag=True
 
 
 class ResidualNormalizingFlowsTest(unittest.TestCase):
+    def test_residual_has_no_complex_buffers_for_nccl_ddp(self):
+        layer, _ = build_layer(batch_size=1)
+        complex_buffers = [name for name, buf in layer.named_buffers() if torch.is_complex(buf)]
+
+        self.assertEqual(complex_buffers, [])
+
     def test_closed_form_exponential_lands_in_su3(self):
         layer, _ = build_layer(batch_size=1)
         gens = layer.generators
