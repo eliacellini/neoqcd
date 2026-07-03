@@ -4,7 +4,7 @@
 #SBATCH -e reports/errors_%x_%A_%a
 #SBATCH -o reports/output_%x_%A_%a
 #SBATCH --gpus-per-node=4
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH -p boost_usr_prod
 #SBATCH --time=24:00:00
@@ -46,7 +46,7 @@ BC_MIN=0.0
 BC_MAX=1.0
 BS=128
 
-DEFECT_SIZE=2
+DEFECT_SIZE=3
 TIME_SLICE=4
 SPACE_SLICE=3
 
