@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import numpy as np
 
 from neoqcd.distributedPT import (
     NEOREX,
@@ -529,6 +530,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orsteps", type=int, default=4)
     parser.add_argument("--updates-per-layer", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--save-link-work-values",
+        action="store_true",
+        help="For O-REX/NEO-REX, save every proposed swap work by ladder link to link_work_values.npz.",
+    )
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")
     parser.add_argument("--output-dir", type=str, default=None, help="If set, use this directory for logs")
     parser.add_argument("--run-name", type=str, default="")
@@ -783,8 +789,13 @@ def main(args: argparse.Namespace) -> None:
                     "flow_skipped_nan_grad_updates",
                     "flow_consecutive_nan_grad_updates",
                     "train_flow",
+                    "link_accepted_json",
+                    "link_proposed_json",
                     "link_acceptance_json",
+                    "link_acceptance_cumulative_json",
                     "link_work_mean_json",
+                    "link_work_sem_json",
+                    "link_work_count_json",
                     "link_flow_loss_json",
                     "parameter_local_min",
                     "parameter_local_max",
@@ -853,6 +864,7 @@ def main(args: argparse.Namespace) -> None:
             orex_protocol_steps=args.orex_protocol_steps,
             orex_mcmc_steps_per_step=args.orex_mcmc_steps_per_step,
             orex_schedule=args.orex_schedule,
+            save_work_values=bool(args.save_link_work_values),
         )
         pt = OutOfEquilibriumParallelTempering(pt_cfg, rank, world_size, device)
         orex_mcmc = DefectMCMCAdapter(
@@ -903,6 +915,7 @@ def main(args: argparse.Namespace) -> None:
             orex_protocol_steps=args.neorex_protocol_steps,
             orex_mcmc_steps_per_step=args.neorex_heatbath_steps_per_step,
             orex_schedule=args.orex_schedule,
+            save_work_values=bool(args.save_link_work_values),
             flow_lr=args.neorex_flow_lr,
             flow_train=True,
             grad_clip_norm=args.neorex_grad_clip_norm,
@@ -1055,7 +1068,9 @@ def main(args: argparse.Namespace) -> None:
     total_link_accepted = [0] * n_links
     total_link_proposed = [0] * n_links
     total_link_work_sum = [0.0] * n_links
+    total_link_work_sum_sq = [0.0] * n_links
     total_link_work_count = [0] * n_links
+    saved_link_work_values = [[] for _ in range(n_links)]
     last_log_elapsed = 0.0
     for step in range(args.steps):
         for _ in range(args.sweeps_per_step):
@@ -1103,13 +1118,22 @@ def main(args: argparse.Namespace) -> None:
                     total_work_sum_sq += float(stats.get("work_sum_sq", 0.0))
                     total_work_count += int(stats.get("work_count", 0))
                     link_work_mean_step = _normalize_metric_list(stats.get("link_work_mean"), n_links, float("nan"))
+                    link_work_sum_sq_step = _normalize_metric_list(stats.get("link_work_sum_sq"), n_links, 0.0)
                     link_work_count_step = _normalize_metric_list(stats.get("link_work_count"), n_links, 0)
                     for k in range(n_links):
                         cnt = int(link_work_count_step[k])
                         val = float(link_work_mean_step[k]) if k < len(link_work_mean_step) else float("nan")
                         if cnt > 0 and math.isfinite(val):
                             total_link_work_sum[k] += val * cnt
+                            total_link_work_sum_sq[k] += float(link_work_sum_sq_step[k])
                             total_link_work_count[k] += cnt
+                    if bool(args.save_link_work_values):
+                        for k, values in enumerate(stats.get("link_work_values", [])):
+                            if k >= n_links:
+                                break
+                            arr = np.asarray(values, dtype=np.float64)
+                            if arr.size:
+                                saved_link_work_values[k].append(arr.reshape(-1, args.batch_size))
                 if args.algorithm == "neorex":
                     flow_loss = float(stats.get("flow_loss", float("nan")))
                     flow_loss_count = int(stats.get("flow_loss_count", 0))
@@ -1127,10 +1151,26 @@ def main(args: argparse.Namespace) -> None:
             else float("nan")
             for k in range(n_links)
         ]
+        link_acceptance_cumulative = [
+            (float(total_link_accepted[k]) / float(total_link_proposed[k]))
+            if int(total_link_proposed[k]) > 0
+            else float("nan")
+            for k in range(n_links)
+        ]
         link_work_mean_step = _normalize_metric_list(
             stats.get("link_work_mean"),
             n_links,
             float("nan"),
+        )
+        link_work_sem_step = _normalize_metric_list(
+            stats.get("link_work_sem"),
+            n_links,
+            float("nan"),
+        )
+        link_work_count_step = _normalize_metric_list(
+            stats.get("link_work_count"),
+            n_links,
+            0,
         )
         link_flow_loss_step = _normalize_metric_list(
             stats.get("flow_loss_link_mean"),
@@ -1174,11 +1214,11 @@ def main(args: argparse.Namespace) -> None:
             for k in range(n_links):
                 wb[f"swap/link_{k}_acceptance_step"] = float(link_acceptance_step[k])
                 wb[f"swap/link_{k}_acceptance_cumulative"] = (
-                    float(total_link_accepted[k]) / float(total_link_proposed[k])
-                    if total_link_proposed[k] > 0
-                    else float("nan")
+                    float(link_acceptance_cumulative[k])
                 )
                 wb[f"work/link_{k}_mean_step"] = float(link_work_mean_step[k])
+                wb[f"work/link_{k}_sem_step"] = float(link_work_sem_step[k])
+                wb[f"work/link_{k}_count_step"] = int(link_work_count_step[k])
                 wb[f"work/link_{k}_mean_cumulative"] = (
                     float(total_link_work_sum[k]) / float(total_link_work_count[k])
                     if total_link_work_count[k] > 0
@@ -1253,8 +1293,13 @@ def main(args: argparse.Namespace) -> None:
                         int(step_flow_skipped_updates),
                         int(step_flow_consecutive_nan),
                         int(train_flow),
+                        json.dumps([int(v) for v in link_accepted_step]),
+                        json.dumps([int(v) for v in link_proposed_step]),
                         json.dumps([float(v) for v in link_acceptance_step]),
+                        json.dumps([float(v) for v in link_acceptance_cumulative]),
                         json.dumps([float(v) for v in link_work_mean_step]),
+                        json.dumps([float(v) for v in link_work_sem_step]),
+                        json.dumps([int(v) for v in link_work_count_step]),
                         json.dumps([float(v) for v in link_flow_loss_step]),
                         float(lmin),
                         float(lmax),
@@ -1286,6 +1331,19 @@ def main(args: argparse.Namespace) -> None:
             f"swap_attempts={total_swap_attempts}",
             flush=True,
         )
+        final_link_acceptance = [
+            (float(total_link_accepted[k]) / float(total_link_proposed[k]))
+            if int(total_link_proposed[k]) > 0
+            else float("nan")
+            for k in range(n_links)
+        ]
+        print(
+            "final_link_swap_acceptance_json="
+            f"{json.dumps([float(v) for v in final_link_acceptance])}  "
+            f"link_accepted_json={json.dumps([int(v) for v in total_link_accepted])}  "
+            f"link_proposed_json={json.dumps([int(v) for v in total_link_proposed])}",
+            flush=True,
+        )
         print(
             f"timing_thermalization_s={thermalization_elapsed:.2f}  "
             f"timing_measurement_s={measurement_elapsed:.2f}  "
@@ -1298,6 +1356,26 @@ def main(args: argparse.Namespace) -> None:
             "thermalization_seconds": float(thermalization_elapsed),
             "measurement_seconds": float(measurement_elapsed),
             "total_seconds": float(total_elapsed),
+        }
+        meta["swap"] = {
+            "acceptance_mean": float(mean_swap_acc),
+            "total_accepted": int(total_swap_accepted),
+            "total_proposed": int(total_swap_proposed),
+            "swap_attempts": int(total_swap_attempts),
+            "parameter_name": str(pt.parameter_name),
+            "link_parameter_left": [
+                float(v) for v in parameter_ladder[:-1].detach().cpu().tolist()
+            ],
+            "link_parameter_right": [
+                float(v) for v in parameter_ladder[1:].detach().cpu().tolist()
+            ],
+            "link_delta_parameter": [
+                float(v)
+                for v in (parameter_ladder[1:] - parameter_ladder[:-1]).detach().cpu().tolist()
+            ],
+            "link_acceptance": [float(v) for v in final_link_acceptance],
+            "link_accepted": [int(v) for v in total_link_accepted],
+            "link_proposed": [int(v) for v in total_link_proposed],
         }
         final_gpu_memory = _rank0_cuda_memory_metrics(device, bool(args.log_gpu_memory))
         if final_gpu_memory:
@@ -1328,20 +1406,71 @@ def main(args: argparse.Namespace) -> None:
                 "saved_paths": saved_flow_paths,
                 "metadata_paths": saved_flow_metadata_paths,
             }
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
         if args.algorithm in {"orex", "neorex"}:
             run_work_mean, run_work_sem = _mean_sem_from_moments(
                 total_work_sum,
                 total_work_sum_sq,
                 total_work_count,
             )
+            final_link_work_mean = []
+            final_link_work_sem = []
+            for k in range(n_links):
+                mean, sem = _mean_sem_from_moments(
+                    total_link_work_sum[k],
+                    total_link_work_sum_sq[k],
+                    total_link_work_count[k],
+                )
+                final_link_work_mean.append(float(mean))
+                final_link_work_sem.append(float(sem))
             print(
                 f"final_work_mean={run_work_mean:.6e}  "
                 f"final_work_sem={run_work_sem:.3e}  "
                 f"work_count={total_work_count}",
                 flush=True,
             )
+            print(
+                "final_link_work_mean_json="
+                f"{json.dumps([float(v) for v in final_link_work_mean])}  "
+                f"final_link_work_sem_json={json.dumps([float(v) for v in final_link_work_sem])}  "
+                f"link_work_count_json={json.dumps([int(v) for v in total_link_work_count])}",
+                flush=True,
+            )
+            meta["work"] = {
+                "mean": float(run_work_mean),
+                "sem": float(run_work_sem),
+                "count": int(total_work_count),
+                "link_mean": [float(v) for v in final_link_work_mean],
+                "link_sem": [float(v) for v in final_link_work_sem],
+                "link_count": [int(v) for v in total_link_work_count],
+            }
+            if bool(args.save_link_work_values):
+                link_work_path = out_dir / "link_work_values.npz"
+                parameter_left = parameter_ladder[:-1].detach().cpu().numpy().astype(np.float64)
+                parameter_right = parameter_ladder[1:].detach().cpu().numpy().astype(np.float64)
+                payload = {
+                    "link_index": np.arange(n_links, dtype=np.int64),
+                    "parameter_name": np.asarray(str(pt.parameter_name)),
+                    "parameter_left": parameter_left,
+                    "parameter_right": parameter_right,
+                    "parameter_delta": parameter_right - parameter_left,
+                    "swap_parameter_left": parameter_left,
+                    "swap_parameter_right": parameter_right,
+                    "swap_delta_parameter": parameter_right - parameter_left,
+                    "link_acceptance": np.asarray(final_link_acceptance, dtype=np.float64),
+                    "link_accepted": np.asarray(total_link_accepted, dtype=np.int64),
+                    "link_proposed": np.asarray(total_link_proposed, dtype=np.int64),
+                    "link_work_mean": np.asarray(final_link_work_mean, dtype=np.float64),
+                    "link_work_sem": np.asarray(final_link_work_sem, dtype=np.float64),
+                    "link_work_count": np.asarray(total_link_work_count, dtype=np.int64),
+                }
+                for k in range(n_links):
+                    if saved_link_work_values[k]:
+                        payload[f"link_{k}"] = np.concatenate(saved_link_work_values[k], axis=0)
+                    else:
+                        payload[f"link_{k}"] = np.empty((0, args.batch_size), dtype=np.float64)
+                np.savez_compressed(link_work_path, **payload)
+                meta["work"]["link_work_values_path"] = str(link_work_path)
+                print(f"link_work_values_path={link_work_path}", flush=True)
         if args.algorithm == "neorex":
             run_flow_loss = (
                 total_flow_loss_sum / total_flow_loss_count
@@ -1355,9 +1484,21 @@ def main(args: argparse.Namespace) -> None:
                 f"flow_skipped_nan_grad_updates={total_flow_skipped_updates}",
                 flush=True,
             )
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
         if wandb_run is not None:
             wandb_run.summary["timing/measurement_seconds"] = float(measurement_elapsed)
             wandb_run.summary["timing/total_seconds"] = float(total_elapsed)
+            wandb_run.summary["swap/link_acceptance"] = [
+                float(v) for v in final_link_acceptance
+            ]
+            if args.algorithm in {"orex", "neorex"}:
+                wandb_run.summary["work/link_mean"] = [
+                    float(v) for v in final_link_work_mean
+                ]
+                wandb_run.summary["work/link_sem"] = [
+                    float(v) for v in final_link_work_sem
+                ]
             for key, value in final_gpu_memory.items():
                 wandb_run.summary[key] = float(value)
             wandb_run.finish()

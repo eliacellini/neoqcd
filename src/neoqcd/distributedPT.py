@@ -521,6 +521,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             "_link_work_sum": [0.0] * max(0, self.world_size - 1),
             "_link_work_sum_sq": [0.0] * max(0, self.world_size - 1),
             "_link_work_count": [0] * max(0, self.world_size - 1),
+            "_link_work_values": [[] for _ in range(max(0, self.world_size - 1))],
         }
 
     def _merge_stats(self, left: dict, right: dict) -> dict:
@@ -535,6 +536,8 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         right_wsum_sq = right.get("_link_work_sum_sq", [0.0] * n_links)
         left_wcount = left.get("_link_work_count", [0] * n_links)
         right_wcount = right.get("_link_work_count", [0] * n_links)
+        left_wvalues = left.get("_link_work_values", [[] for _ in range(n_links)])
+        right_wvalues = right.get("_link_work_values", [[] for _ in range(n_links)])
         return {
             "n_accepted": int(left.get("n_accepted", 0)) + int(right.get("n_accepted", 0)),
             "n_proposed": int(left.get("n_proposed", 0)) + int(right.get("n_proposed", 0)),
@@ -560,6 +563,10 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             ],
             "_link_work_count": [
                 int(left_wcount[k]) + int(right_wcount[k])
+                for k in range(n_links)
+            ],
+            "_link_work_values": [
+                list(left_wvalues[k]) + list(right_wvalues[k])
                 for k in range(n_links)
             ],
         }
@@ -599,7 +606,12 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             "link_proposed": link_prop,
             "link_work_mean": link_wmean,
             "link_work_sem": link_wsem,
+            "link_work_sum": link_wsum,
+            "link_work_sum_sq": link_wsum_sq,
             "link_work_count": link_wcount,
+            "link_work_values": self._finalize_link_work_values(
+                stats.get("_link_work_values", [[] for _ in range(n_links)])
+            ),
         }
 
     def _finalize_work_values(self, work_values) -> np.ndarray:
@@ -613,6 +625,26 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         if not arrays:
             return np.empty(0, dtype=np.float64)
         return np.concatenate(arrays).astype(np.float64, copy=False)
+
+    def _finalize_link_work_values(self, link_work_values) -> list[np.ndarray]:
+        n_links = max(0, self.world_size - 1)
+        if not getattr(self.config, "save_work_values", False):
+            return [np.empty((0, self.B), dtype=np.float64) for _ in range(n_links)]
+        out = []
+        for values in link_work_values:
+            arrays = []
+            for value in values:
+                arr = np.asarray(value, dtype=np.float64)
+                if not arr.size:
+                    continue
+                arrays.append(arr.reshape(1, -1))
+            if arrays:
+                out.append(np.concatenate(arrays, axis=0).astype(np.float64, copy=False))
+            else:
+                out.append(np.empty((0, self.B), dtype=np.float64))
+        while len(out) < n_links:
+            out.append(np.empty((0, self.B), dtype=np.float64))
+        return out[:n_links]
 
     def _sample_mask_view(self, mask: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         return mask.to(device=x.device, dtype=torch.bool).view(
@@ -723,6 +755,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         link_work_sum = [0.0] * max(0, self.world_size - 1)
         link_work_sum_sq = [0.0] * max(0, self.world_size - 1)
         link_work_count = [0] * max(0, self.world_size - 1)
+        link_work_values = [[] for _ in range(max(0, self.world_size - 1))]
 
         if self.rank == 0:
             work_matrix = torch.stack(gather_list, dim=1)
@@ -759,6 +792,8 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
                     link_work_count[int(link_idx)] += int(finite_work.numel())
                     if getattr(self.config, "save_work_values", False):
                         work_values.append(finite_work.detach().cpu().numpy().copy())
+                if getattr(self.config, "save_work_values", False):
+                    link_work_values[int(link_idx)].append(pair_work.detach().cpu().numpy().copy())
 
             accept_scatter = list(accept_matrix.T.contiguous())
         else:
@@ -778,6 +813,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             "_link_work_sum": link_work_sum,
             "_link_work_sum_sq": link_work_sum_sq,
             "_link_work_count": link_work_count,
+            "_link_work_values": link_work_values,
         }
         return accept_uint8.to(dtype=torch.bool), stats
 
