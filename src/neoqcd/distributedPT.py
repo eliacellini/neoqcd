@@ -301,10 +301,10 @@ class ParallelTempering:
                 lam_i = self.parameter_matrix[b_idx, node_i]
                 lam_j = self.parameter_matrix[b_idx, node_j]
 
-                s_ii = action_cube[b_idx, node_i, node_i]
-                s_ij = action_cube[b_idx, node_i, node_j]
-                s_ji = action_cube[b_idx, node_j, node_i]
-                s_jj = action_cube[b_idx, node_j, node_j]
+                s_ii = action_cube[b_idx, node_i, k]
+                s_ij = action_cube[b_idx, node_i, k + 1]
+                s_ji = action_cube[b_idx, node_j, k]
+                s_jj = action_cube[b_idx, node_j, k + 1]
 
                 # Exact Metropolis swap test:
                 # ΔS = S(x_i, λ_j) + S(x_j, λ_i) - S(x_i, λ_i) - S(x_j, λ_j)
