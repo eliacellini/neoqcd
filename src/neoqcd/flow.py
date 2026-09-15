@@ -302,9 +302,10 @@ class FlowPars():
                  hyper_depth=2, hyper_activation="silu",
                  hyper_normalize_by_nstep=True, hyper_rho_eps=0.0,
                  hyper_scale_by_delta=False,
-                 hyper_rho_max=0.0,
-                 nf_layer_type="smearing",
-                 residual_include_imag=True, residual_quadratic=True,
+                  hyper_rho_max=0.0,
+                  nf_layer_type="smearing",
+                  residual_parameterization="hyper",
+                  residual_include_imag=True, residual_quadratic=True,
                  residual_coeff_init=1e-3, residual_coeff_max=0.0,
                  defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None):
         if device is None:
@@ -351,6 +352,12 @@ class FlowPars():
         self.hyper_scale_by_delta = bool(hyper_scale_by_delta)
         self.hyper_rho_max = float(hyper_rho_max)
         self.nf_layer_type = str(nf_layer_type)
+        self.residual_parameterization = str(residual_parameterization).lower()
+        if self.residual_parameterization not in {"hyper", "static"}:
+            raise ValueError(
+                "residual_parameterization must be 'hyper' or 'static', "
+                f"got {self.residual_parameterization!r}"
+            )
         self.residual_include_imag = bool(residual_include_imag)
         self.residual_quadratic = bool(residual_quadratic)
         self.residual_coeff_init = float(residual_coeff_init)

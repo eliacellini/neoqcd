@@ -284,7 +284,7 @@ class HBOR():
         
         Xmat, acc = self.heatbath(staples, rand[:,0:6,mu,:], 2.0)
 
-        new_cfgs = Xmat * acc + cfgs * ~acc
+        new_cfgs = Xmat * acc + cfgs[:, mu] * ~acc
         return new_cfgs.unsqueeze(1)
 
     def SU2_link_update_over(self, cfgs, mu, defect):
@@ -297,7 +297,7 @@ class HBOR():
         k0 = k0.unsqueeze(-1).unsqueeze(-1)
 
         staples = sun.SUN_dagger(staples / k.unsqueeze(-1).unsqueeze(-1))
-        new_cfgs = sun.SUN_mul(sun.SUN_mul(staples, sun.SUN_dagger(cfgs)), staples) * k0 + cfgs * ~k0
+        new_cfgs = sun.SUN_mul(sun.SUN_mul(staples, sun.SUN_dagger(cfgs[:, mu])), staples) * k0 + cfgs[:, mu] * ~k0
         return new_cfgs.unsqueeze(1)
 
     def _sum_of_staples_for_update(self, cfgs, mu, defect):

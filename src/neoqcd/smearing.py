@@ -285,6 +285,9 @@ class _ConstantSpline:
         return self.value
 
 
+HYPER_CLASS_INACTIVE_RHO = 1e-4
+
+
 class HyperSmearing(torch.nn.Module):
     """
     Time-conditioned hypernetwork for smearing coefficients rho.
@@ -511,6 +514,17 @@ class HyperSmearing(torch.nn.Module):
                     )
                 rho = rho * delta_v.view((bsz,) + (1,) * (rho.dim() - 1))
         rho = self._apply_signed_floor(rho, active_mask=active_mask)
+        if self.mode == "class":
+            # Keep the nine class coefficients trainable, while retaining the
+            # historical positive baseline on links/sites outside their union.
+            # This is applied after delta scaling, clamp and floor so it also
+            # survives delta_beta == 0 and introduces no Jacobian masking.
+            inactive_rho = torch.as_tensor(
+                HYPER_CLASS_INACTIVE_RHO,
+                dtype=rho.dtype,
+                device=rho.device,
+            )
+            rho = active_mask * rho + (1.0 - active_mask) * inactive_rho
         return rho
 
 
@@ -597,6 +611,9 @@ class ResidualNormalizingFlows(torch.nn.Module):
         self.device = flow_pars.device
         self.time = float(time)
         self.steps = int(getattr(flow_pars, "smearing_steps_per_layer", 1))
+        self.parameterization = str(getattr(flow_pars, "residual_parameterization", "hyper")).lower()
+        if self.parameterization not in {"hyper", "static"}:
+            raise ValueError(f"Unknown residual parameterization {self.parameterization!r}")
         self.include_imag = bool(getattr(flow_pars, "residual_include_imag", True))
         self.use_quadratic = bool(getattr(flow_pars, "residual_quadratic", True))
         self.coeff_max = float(getattr(flow_pars, "residual_coeff_max", 0.0))
@@ -607,51 +624,79 @@ class ResidualNormalizingFlows(torch.nn.Module):
         if self.use_quadratic:
             self.coeffs_per_step += self.n_features * self.n_features
 
-        emb_dim = int(getattr(flow_pars, "hyper_time_embedding_dim", 8))
-        if emb_dim <= 0 or emb_dim % 2 != 0:
-            raise ValueError(f"hyper_time_embedding_dim must be a positive even integer, got {emb_dim}")
-        hidden_dim = int(getattr(flow_pars, "hyper_hidden_dim", 16))
-        depth = int(getattr(flow_pars, "hyper_depth", 2))
-        activation_name = str(getattr(flow_pars, "hyper_activation", "silu")).lower()
-        activation_factories = {
-            "silu": torch.nn.SiLU,
-            "gelu": torch.nn.GELU,
-            "tanh": torch.nn.Tanh,
-            "relu": torch.nn.ReLU,
-        }
-        if activation_name not in activation_factories:
-            raise ValueError(
-                "hyper_activation must be one of "
-                f"{sorted(activation_factories)}, got {activation_name!r}"
-            )
-
-        freqs = 2.0 ** torch.arange(emb_dim // 2, dtype=torch.float64)
-        self.register_buffer("freqs", freqs)
         # Keep this constant out of buffers: NCCL DDP cannot broadcast ComplexDouble buffers.
         self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
-
-        in_dim = emb_dim + 1  # Fourier(beta) || beta
-        out_dim = self.steps * self.coeffs_per_step
-        layers = []
-        current_dim = in_dim
-        for _ in range(depth):
-            layers.append(torch.nn.Linear(current_dim, hidden_dim))
-            layers.append(activation_factories[activation_name]())
-            current_dim = hidden_dim
-        layers.append(torch.nn.Linear(current_dim, out_dim))
-        self.mlp = torch.nn.Sequential(*layers).to(dtype=torch.float64, device=flow_pars.device)
-
         coeff_init = float(getattr(flow_pars, "residual_coeff_init", getattr(flow_pars, "hyper_rho_init", 1e-3)))
-        with torch.no_grad():
-            self.mlp[-1].weight.zero_()
-            self.mlp[-1].bias.zero_()
-            self.mlp[-1].bias[: self.steps * self.n_features].fill_(coeff_init)
+        if self.parameterization == "static":
+            self.static_linear = torch.nn.Parameter(
+                torch.full((self.steps, self.n_features), coeff_init, dtype=torch.float64, device=flow_pars.device)
+            )
+            if self.use_quadratic:
+                self.static_quadratic = torch.nn.Parameter(
+                    torch.zeros(
+                        (self.steps, self.n_features, self.n_features),
+                        dtype=torch.float64,
+                        device=flow_pars.device,
+                    )
+                )
+        else:
+            emb_dim = int(getattr(flow_pars, "hyper_time_embedding_dim", 8))
+            if emb_dim <= 0 or emb_dim % 2 != 0:
+                raise ValueError(f"hyper_time_embedding_dim must be a positive even integer, got {emb_dim}")
+            hidden_dim = int(getattr(flow_pars, "hyper_hidden_dim", 16))
+            depth = int(getattr(flow_pars, "hyper_depth", 2))
+            activation_name = str(getattr(flow_pars, "hyper_activation", "silu")).lower()
+            activation_factories = {
+                "silu": torch.nn.SiLU,
+                "gelu": torch.nn.GELU,
+                "tanh": torch.nn.Tanh,
+                "relu": torch.nn.ReLU,
+            }
+            if activation_name not in activation_factories:
+                raise ValueError(
+                    "hyper_activation must be one of "
+                    f"{sorted(activation_factories)}, got {activation_name!r}"
+                )
+
+            freqs = 2.0 ** torch.arange(emb_dim // 2, dtype=torch.float64)
+            self.register_buffer("freqs", freqs)
+            in_dim = emb_dim + 1  # Fourier(beta) || beta
+            out_dim = self.steps * self.coeffs_per_step
+            layers = []
+            current_dim = in_dim
+            for _ in range(depth):
+                layers.append(torch.nn.Linear(current_dim, hidden_dim))
+                layers.append(activation_factories[activation_name]())
+                current_dim = hidden_dim
+            layers.append(torch.nn.Linear(current_dim, out_dim))
+            self.mlp = torch.nn.Sequential(*layers).to(dtype=torch.float64, device=flow_pars.device)
+            with torch.no_grad():
+                self.mlp[-1].weight.zero_()
+                self.mlp[-1].bias.zero_()
+                self.mlp[-1].bias[: self.steps * self.n_features].fill_(coeff_init)
 
     def _fourier(self, beta):
         arg = beta.unsqueeze(-1) * self.freqs.unsqueeze(0)
         return torch.cat((torch.sin(arg), torch.cos(arg)), dim=-1)
 
     def _coefficients(self, beta, delta_beta, batch_size, dtype, device):
+        if self.parameterization == "static":
+            delta_v = _as_batched_parameter(delta_beta, batch_size, torch.float64, device, 0.0)
+            lin = self.static_linear.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+            if self.coeff_max > 0.0:
+                lin = self.coeff_max * torch.tanh(lin / self.coeff_max)
+            if self.use_quadratic:
+                quad = self.static_quadratic.to(device=device, dtype=dtype)
+                quad = 0.5 * (quad + quad.transpose(-1, -2))
+                quad = quad.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            else:
+                quad = torch.zeros(
+                    (batch_size, self.steps, self.n_features, self.n_features),
+                    dtype=dtype,
+                    device=device,
+                )
+            return lin, quad, delta_v
+
         beta_v = _as_batched_parameter(beta, batch_size, torch.float64, self.freqs.device, self.time)
         delta_v = _as_batched_parameter(delta_beta, batch_size, torch.float64, self.freqs.device, 0.0)
         emb = torch.cat(
@@ -995,7 +1040,17 @@ class Smearing(torch.nn.Module):
 
     def stout_smearing(self, cfgs, mu, rho):
         #C = stout_staples(cfgs, mu, D, rho)
-        C = checkpoint.checkpoint(self.compute_staples, cfgs, mu, rho, use_reentrant=False, preserve_rng_state=False)
+        if torch.is_grad_enabled():
+            C = checkpoint.checkpoint(
+                self.compute_staples,
+                cfgs,
+                mu,
+                rho,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            C = self.compute_staples(cfgs, mu, rho)
     
         U = cfgs[:,mu]
         id = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
@@ -1026,12 +1081,42 @@ class Smearing(torch.nn.Module):
             if nu != mu:
                 #isotropic rho
                 if self.rho_shape_type == 0:
-                    prho_mul = rho #just a number
-                    nrho_mul = rho #just a number
+                    if int(rho.numel()) == int(cfgs.shape[0]) and int(cfgs.shape[0]) > 1:
+                        rho_batch = rho.reshape(int(cfgs.shape[0]))
+                        rho_view = rho_batch.reshape((int(cfgs.shape[0]),) + (1,) * (staple.dim() - 1))
+                    elif int(rho.numel()) == 1:
+                        rho_view = rho.reshape((1,) * staple.dim())
+                    else:
+                        raise ValueError(
+                            "Unsupported isotropic rho shape: expected one scalar or one value per "
+                            f"sample, got shape {tuple(rho.shape)} for batch={int(cfgs.shape[0])}"
+                        )
+                    prho_mul = rho_view
+                    nrho_mul = rho_view
                 #anisotropic rho
                 elif self.rho_shape_type == 1:
-                    prho_mul = rho[2 * sun.plaq_index(self.D, mu, nu)] #just a number
-                    nrho_mul = rho[2 * sun.plaq_index(self.D, mu, nu) + 1] #just a number
+                    n_plaq = self.D * (self.D - 1) // 2
+                    # The existing D=4 plaq_index convention addresses the
+                    # six (positive/negative) link-parity channels as one
+                    # flat axis, not 2*n_plaq channels.
+                    n_slots = max(2 * (self.D - 1), n_plaq)
+                    pidx = 2 * sun.plaq_index(self.D, mu, nu)
+                    nidx = pidx + 1
+                    batch_size = int(cfgs.shape[0])
+                    if int(rho.numel()) == batch_size * n_slots and batch_size > 1:
+                        rho_links = rho.reshape(batch_size, n_slots)
+                        prho_mul = rho_links[:, pidx].reshape((batch_size,) + (1,) * (staple.dim() - 1))
+                        nrho_mul = rho_links[:, nidx].reshape((batch_size,) + (1,) * (staple.dim() - 1))
+                    elif int(rho.numel()) == n_slots:
+                        rho_links = rho.reshape(n_slots)
+                        prho_mul = rho_links[pidx].reshape((1,) * staple.dim())
+                        nrho_mul = rho_links[nidx].reshape((1,) * staple.dim())
+                    else:
+                        raise ValueError(
+                            "Unsupported anisotropic rho shape: expected "
+                            f"{n_slots} static or {batch_size * n_slots} batched values, "
+                            f"got shape {tuple(rho.shape)}"
+                        )
                 #general rho
                 elif self.rho_shape_type == 2 or self.rho_shape_type == 3:
                     pidx = 2 * sun.plaq_index(self.D, mu, nu)
