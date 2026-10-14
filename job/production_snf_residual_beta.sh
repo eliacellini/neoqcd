@@ -52,6 +52,11 @@ TRAIN_STEPS=100
 EVAL_SAMPLES=128
 FLOW_LR=1e-3
 GRAD_CLIP_NORM=0.0
+INT_MEAS="${INT_MEAS:-1}"
+CONTINUE_PRIOR="${CONTINUE_PRIOR:-1}"
+TRAINING_MODE="${TRAINING_MODE:-blockwise}"
+GRAD_ACC="${GRAD_ACC:-1}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 
 HYPER_TIME_EMBEDDING_DIM=8
 HYPER_HIDDEN_DIM=32
@@ -139,6 +144,10 @@ run_phase() {
     --output-dir "$output_dir"
     --main-dir "$PROJECT_DIR"
     --log-every "$LOG_EVERY"
+    --int-meas "$INT_MEAS"
+    --training-mode "$TRAINING_MODE"
+    --grad-acc "$GRAD_ACC"
+    --checkpoint-every "$CHECKPOINT_EVERY"
     --seed "$phase_seed"
     --overwrite
   )
@@ -146,6 +155,9 @@ run_phase() {
     CMD+=(--train-steps "$TRAIN_STEPS")
   else
     CMD+=(--eval-samples "$EVAL_SAMPLES" --checkpoint "$TRAIN_DIR/snf_checkpoint.pt")
+    if [[ "$CONTINUE_PRIOR" == 1 ]]; then
+      CMD+=(--load-prior)
+    fi
   fi
 
   echo "Running $phase command:"

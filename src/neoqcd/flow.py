@@ -4,12 +4,29 @@ import pickle
 from neoqcd.mcmc import NEMCMC_update
 from neoqcd.smearing import CouplingLayer, DefectCouplingLayer, ResidualCouplingLayer
 from neoqcd.utils import grab, set_defect_rho_from_fits
-from neoqcd.nn import KISS_HTConv1D, HyperTimeConv1D, time_embedding,HTCNN
+from neoqcd.nn import KISS_HTConv1D, HyperTimeConv1D, HyperTimeScalar, time_embedding,HTCNN
 
 class Flow(torch.nn.Module):
     def __init__(self, flow_pars, flow_type='nemcmc', protocol_type='beta', beta=6.0, defect_mask=None, rhofit_file=None, scale_fac=0.0001):
         super().__init__()
         self.defect_mask = defect_mask
+        self.N = int(flow_pars.N)
+        self.nstep = int(flow_pars.nstep)
+        if flow_pars.use_rho_functional and flow_type != "snf":
+            raise ValueError("use_rho_functional is available only for SNF flows")
+        if flow_pars.use_rho_functional and str(getattr(flow_pars, "nf_layer_type", "smearing")).lower() == "residual":
+            raise ValueError("use_rho_functional requires the classic smearing layer")
+        self.rho_functional = None
+        if flow_pars.use_rho_functional:
+            embedding = time_embedding(flow_pars.F, T=2.0, device=flow_pars.device)
+            self.rho_functional = HyperTimeScalar(
+                embedding,
+                flow_pars.rho_shape,
+                flow_pars.nstep,
+                flow_pars.scale_fac,
+                hidden_dim=flow_pars.hidden_time_mlp,
+                device=flow_pars.device,
+            )
 
         if flow_pars.set_rho == 1:
             rhofitpars = self.init_rhofitpars(flow_pars.rho_shape_type, beta, flow_pars.defect.dsize, rhofit_file)
@@ -54,18 +71,39 @@ class Flow(torch.nn.Module):
     def __call__(self, x, s0, flow_pars, int_meas=1):
         x, Q, logJ, int_obs = self.forward(x, s0, flow_pars, int_meas=int_meas)
         st = self.layers[-1].action(x, self.defect_mask)
-        w = st - s0 - Q - 2.0*logJ
-        return x, w, st, Q, 2.0*logJ, int_obs
+        w = st - s0 - Q - logJ
+        return x, w, st, Q, logJ, int_obs
+
+    def _full_logdet(self, layer, logdet):
+        # Legacy SU(2) stout determinants cover complex matrix entries twice; tangent-space
+        # residual determinants are already full Haar logdets for either group.
+        if self.N == 2 and not isinstance(layer, ResidualCouplingLayer):
+            return 2.0 * logdet
+        return logdet
 
     def _layer_rho(self, flow_pars, step):
+        if self.rho_functional is not None:
+            return self.rho(step)
         if flow_pars.fit_train == 1:
             return self.set_rho_fits(flow_pars, step)
         return None
 
-    def _forward_layer(self, layer, x, flow_pars, step):
+    def rho(self, step):
+        if self.rho_functional is None:
+            return None
+        return self.rho_functional((int(step) + 1) / self.nstep)
+
+    def _forward_layer(self, layer, x, flow_pars, step, plaquettes=None):
         rho_layer = self._layer_rho(flow_pars, step)
         if isinstance(layer, NEMCMC_update):
-            return layer.forward(x, flow_pars, rho_layer)
+            x, dQ, dlogJ, plaquettes, pl = layer.forward(
+                x,
+                flow_pars,
+                rho_layer,
+                plaquettes=plaquettes,
+                return_plaquettes=True,
+            )
+            return x, dQ, dlogJ, plaquettes, pl
 
         nstep = int(flow_pars.nstep)
         if nstep <= 0:
@@ -81,40 +119,49 @@ class Flow(torch.nn.Module):
             else:
                 delta_step = float(flow_pars.protocol[idx] - flow_pars.protocol[idx - 1])
 
-        return layer.forward(
+        x, dQ, dlogJ = layer.forward(
             x,
             flow_pars,
             rho_layer,
             beta=beta_step,
             delta_beta=delta_step,
         )
+        return x, dQ, dlogJ, None, None
 
     def forward(self, x, s0, flow_pars, int_meas=1):
+        if int_meas < 1 or flow_pars.nstep % int_meas:
+            raise ValueError("int_meas must be a positive divisor of the number of flow steps")
         batch_size = x.shape[0]
         device = x.device
         dtype = s0.dtype if torch.is_tensor(s0) else (x.real.dtype if torch.is_complex(x) else x.dtype)
 
         Q = torch.zeros(batch_size, device=device, dtype=dtype)
         logJ = torch.zeros(batch_size, device=device, dtype=dtype)
-        int_obs = torch.zeros((batch_size, int_meas, 5), device=device, dtype=dtype)
+        int_obs = torch.zeros((batch_size, int_meas, 7), device=device, dtype=dtype)
 
         stochastic_step = 0
         m = 0
         nstep_per_meas = max(1, flow_pars.nstep // int_meas)
+        plaquettes = None
 
         for layer in self.layers:
-            x, dQ, dlogJ = self._forward_layer(layer, x, flow_pars, stochastic_step)
+            x, dQ, dlogJ, plaquettes, pl = self._forward_layer(
+                layer, x, flow_pars, stochastic_step, plaquettes
+            )
             Q += dQ
+            dlogJ = self._full_logdet(layer, dlogJ)
             logJ += dlogJ
             # index stochastic_step runs on stochastic updates
             if isinstance(layer, NEMCMC_update):
                 if (stochastic_step + 1) % nstep_per_meas == 0 and m < int_meas:
-                    st = layer.action(x, self.defect_mask)
-                    int_obs[:, m, 0] = st - s0 - Q - 2.0 * logJ #work
+                    st = layer.action.from_plaquettes(plaquettes, self.defect_mask)
+                    int_obs[:, m, 0] = st - s0 - Q - logJ #work
                     int_obs[:, m, 1] = Q #heat
-                    int_obs[:, m, 2] = 2.0 * logJ #jacobian
+                    int_obs[:, m, 2] = logJ #jacobian
                     int_obs[:, m, 3] = st #action
                     int_obs[:, m, 4] = float(flow_pars.protocol[stochastic_step]) #coupling
+                    int_obs[:, m, 5] = pl
+                    int_obs[:, m, 6] = pl.square()
                     m += 1
                 stochastic_step += 1
 
@@ -126,9 +173,9 @@ class Flow(torch.nn.Module):
             raise IndexError(f"Target block {tb} is out of range for {len(self.layers)} layers")
         with torch.no_grad():
             x, Q, logJ = self.forward_up_to_layer(x, flow_pars, 2 * tb)
-        x, dQ, dlogJ = self._forward_layer(self.layers[2 * tb], x, flow_pars, tb) #forward only on the smearing layer of the target block!
+        x, dQ, dlogJ, _, _ = self._forward_layer(self.layers[2 * tb], x, flow_pars, tb) #forward only on the smearing layer of the target block!
         Q += dQ  #unused for now
-        logJ += dlogJ
+        logJ += self._full_logdet(self.layers[2 * tb], dlogJ)
 
         action_layer = None
         for layer in self.layers[2 * tb:]:
@@ -139,8 +186,8 @@ class Flow(torch.nn.Module):
             raise RuntimeError("No stochastic update layer found to evaluate the action")
 
         st = action_layer.action(x, self.defect_mask)
-        w = st - s0 - Q - 2.0*logJ
-        return x, w, st, Q, 2.0*logJ
+        w = st - s0 - Q - logJ
+        return x, w, st, Q, logJ
 
     #regular forward up to tl-th layer
     def forward_up_to_layer(self, x, flow_pars, tl):
@@ -148,10 +195,13 @@ class Flow(torch.nn.Module):
         Q = torch.zeros(x.shape[0], device=x.device, dtype=dtype)
         logJ = torch.zeros(x.shape[0], device=x.device, dtype=dtype)
         stochastic_step = 0
+        plaquettes = None
         for layer in self.layers[0:tl]:
-            x, dQ, dlogJ = self._forward_layer(layer, x, flow_pars, stochastic_step)
+            x, dQ, dlogJ, plaquettes, _ = self._forward_layer(
+                layer, x, flow_pars, stochastic_step, plaquettes
+            )
             Q += dQ
-            logJ += dlogJ
+            logJ += self._full_logdet(layer, dlogJ)
             if isinstance(layer, NEMCMC_update):
                 stochastic_step += 1
         return x, Q, logJ
@@ -183,6 +233,8 @@ class Flow(torch.nn.Module):
             return set_defect_rho_from_fits(x, nstep, self.rhofitpars, flow_pars.rho_shape, flow_pars.small_defect_mask[-1], flow_pars.D)
 
     def initialize_rho(self, step, flow_pars):
+        if flow_pars.use_rho_functional:
+            return torch.zeros(flow_pars.rho_shape, dtype=torch.float64, device=flow_pars.device)
         #setting smearing parameter from file
         if flow_pars.set_rho == 0:
             return torch.zeros(flow_pars.rho_shape)
@@ -241,7 +293,9 @@ class Flow(torch.nn.Module):
         b = 0
         for layer in self.layers:
             if (b%2 == 0):#selecting only smearing
-                if hasattr(layer, "smearing") and getattr(layer.smearing, "use_hyper_smearing", False):
+                if self.rho_functional is not None:
+                    rr_layer = self.rho(b // 2).detach()
+                elif hasattr(layer, "smearing") and getattr(layer.smearing, "use_hyper_smearing", False):
                     rr_layer = layer.smearing.hyper_smearing().detach()
                 else:
                     rr_layer = layer.rho_layer
@@ -307,7 +361,9 @@ class FlowPars():
                   residual_parameterization="hyper",
                   residual_include_imag=True, residual_quadratic=True,
                  residual_coeff_init=1e-3, residual_coeff_max=0.0,
-                 defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None):
+                 defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None,
+                 residual_n_pt=0, residual_mask_mod=2, explicit_backward=False,
+                 use_rho_functional=False, hidden_time_mlp=16):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -362,6 +418,14 @@ class FlowPars():
         self.residual_quadratic = bool(residual_quadratic)
         self.residual_coeff_init = float(residual_coeff_init)
         self.residual_coeff_max = float(residual_coeff_max)
+        self.residual_n_pt = residual_n_pt
+        self.residual_mask_mod = residual_mask_mod
+        self.explicit_backward = bool(explicit_backward)
+        self.use_rho_functional = bool(use_rho_functional)
+        self.F = int(F)
+        self.hidden_time_mlp = int(hidden_time_mlp)
+        if self.use_rho_functional and self.nstep < 1:
+            raise ValueError("use_rho_functional requires at least one flow step")
         if self.use_nn and not self.use_hyper_smearing:
             embedding = time_embedding(F, 1.0, device=device)
             layer =  KISS_HTConv1D if use_kiss else HyperTimeConv1D
@@ -373,16 +437,19 @@ class FlowPars():
         #shape of smearing parameter
         #isotropic
         if rho_shape_type == 0:
-            self.rho_shape = (smearing_steps_per_layer, 2*D, 1, 1, 1, 1, 1)
+            self.rho_shape = (smearing_steps_per_layer, 2*D) + (1,) * (D + 1)
         #anisotropic
         elif rho_shape_type == 1:
-            self.rho_shape = (smearing_steps_per_layer, 2*D, D*(D-1)//2, 1, 1, 1, 1)
+            nslots = max(2 * (D - 1), D * (D - 1) // 2)
+            self.rho_shape = (smearing_steps_per_layer, 2*D, nslots) + (1,) * D
         #general
         elif rho_shape_type == 2:
-            self.rho_shape = (smearing_steps_per_layer, 2*D, D*(D-1)//2, T, L, L, L)
+            nslots = 2 * (D - 1)
+            self.rho_shape = (smearing_steps_per_layer, 2*D, nslots, T) + (L,) * (D - 1)
         #defect
         elif rho_shape_type == 3:
-            self.rho_shape = (smearing_steps_per_layer, 2*D, D*(D-1)//2, 4, defect.dsize+4, defect.dsize+4, defect.dsize+4)
+            nslots = 2 * (D - 1)
+            self.rho_shape = (smearing_steps_per_layer, 2*D, nslots, 4) + (defect.dsize + 4,) * (D - 1)
 
         #configuration and Jacobian shapes
         if rho_shape_type == 3:

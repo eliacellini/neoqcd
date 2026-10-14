@@ -7,10 +7,22 @@ from neoqcd.theory import (
     local_nf_action_change as theory_local_nf_action_change,
 )
 from typing import Optional
+from neoqcd.utils import Defect, DefectBox
 
 
 def _su2_sign(view_ndim, device, dtype):
     return torch.tensor([1, -1], device=device, dtype=dtype).view([1] * view_ndim + [2])
+
+
+def _su2_haar_from_uniform(rand):
+    eps = torch.finfo(rand.dtype).tiny
+    u0, u1 = rand[:, 0].clamp_min(eps), rand[:, 1]
+    u2, u3 = rand[:, 2].clamp_min(eps), rand[:, 3]
+    r0, r1 = torch.sqrt(-2.0 * torch.log(u0)), torch.sqrt(-2.0 * torch.log(u2))
+    g = torch.stack((r0 * torch.cos(2.0 * torch.pi * u1), r0 * torch.sin(2.0 * torch.pi * u1),
+                     r1 * torch.cos(2.0 * torch.pi * u3), r1 * torch.sin(2.0 * torch.pi * u3)), dim=-1)
+    g = g / torch.linalg.vector_norm(g, dim=-1, keepdim=True)
+    return torch.complex(g[..., 0], g[..., 1]), torch.complex(g[..., 2], g[..., 3])
 
 
 class NEMCMC_update(torch.nn.Module):
@@ -46,28 +58,89 @@ class NEMCMC_update(torch.nn.Module):
         self.action.defect_par = p0
         self.update.set_defect_parameter(p0)
 
-    def forward(self, cfgs, flow_pars, rho_root=None):
-        s_old = self.action(cfgs, self.defect_mask)
+    def forward(self, cfgs, flow_pars, rho_root=None, plaquettes=None, return_plaquettes=False):
+        if plaquettes is None:
+            plaquettes = sun.plaquette_fields(cfgs, self.D)
+        s_old = self.action.from_plaquettes(plaquettes, self.defect_mask)
 
         for u in range(self.nupdates):
             cfgs = self.update(cfgs, flow_pars.mask, self.defect_mask)
             if self.hierarchical_levels > 0:
                 cfgs = self.hierarchical(cfgs, 0, flow_pars)
         
-        s_new = self.action(cfgs, self.defect_mask)
+        new_plaquettes = sun.plaquette_fields(cfgs, self.D)
+        s_new = self.action.from_plaquettes(new_plaquettes, self.defect_mask)
+        if return_plaquettes:
+            return cfgs, s_new - s_old, 0, new_plaquettes, sun.mean_plaquette(new_plaquettes, self.action.N)
         return cfgs, s_new - s_old, 0
 
     def hierarchical(self, cfgs, level, flow_pars):
-        for hu in range(self.hierarchical_nupdates[level]):
-            small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=self.hierarchical_rectangles[level])
-            small_cfgs = self.update(small_cfgs, flow_pars.smeared_defect_mask[level]*flow_pars.small_mask[level], flow_pars.small_defect_mask[level])
-            cfgs = flow_pars.defect.embedding(small_cfgs, cfgs, buffer=self.hierarchical_rectangles[level])
-        if level < self.hierarchical_levels - 1:
-            cfgs = self.hierarchical(cfgs, level + 1, flow_pars)
-        else:
-            return cfgs
+        buffers = [int(v) for v in self.hierarchical_rectangles]
+        if level != 0:
+            raise ValueError("hierarchical updates must start at level 0")
+        if len(buffers) < self.hierarchical_levels:
+            raise ValueError("one hierarchical rectangle is required per level")
+        if len(self.hierarchical_nupdates) < self.hierarchical_levels:
+            raise ValueError("one hierarchical update count is required per level")
+        buffers = buffers[:self.hierarchical_levels]
+        if any(buffer <= 0 for buffer in buffers):
+            raise ValueError("hierarchical rectangle buffers must be positive")
+        if flow_pars.defect is None:
+            raise ValueError("hierarchical updates require flow_pars.defect geometry")
 
-        return cfgs
+        levels = sorted(
+            zip(buffers, self.hierarchical_nupdates[:self.hierarchical_levels]),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        boxes = self._hierarchical_boxes_for(flow_pars, tuple(buffer for buffer, _ in levels))
+        largest = boxes[0]
+
+        # Work on one cut of the largest box. Each level updates every link whose
+        # staples stay inside its box, then copies only those links into its parent.
+        patch = largest.cut(cfgs)
+        for (_, nupdates), box in zip(levels, boxes):
+            for _ in range(nupdates):
+                if box is largest:
+                    patch = self.update(patch, box.links, box.defect_mask)
+                else:
+                    local = box.cut(patch)
+                    local = self.update(local, box.links, box.defect_mask)
+                    patch = box.embed(local, patch)
+        return largest.embed(patch, cfgs)
+
+    def _hierarchical_boxes_for(self, flow_pars, buffers):
+        defect = flow_pars.defect
+        mask = flow_pars.mask
+        defect_mask = self.defect_mask
+        geometry = (
+            int(defect.D), int(defect.T), int(defect.L), int(defect.dsize),
+            int(defect.time_slice), int(defect.space_slice),
+        )
+        signature = (
+            geometry,
+            tuple(buffers),
+            mask._version,
+            None if defect_mask is None else defect_mask._version,
+        )
+        entry = getattr(flow_pars, "_hierarchical_boxes_cache", None)
+        if (entry is not None and entry[0] == signature and entry[1] is defect
+                and entry[2] is mask and entry[3] is defect_mask):
+            return entry[4]
+
+        largest = DefectBox(defect, mask, defect_mask, buffers[0])
+        boxes = [largest]
+        boxes.extend(
+            DefectBox(defect, mask, defect_mask, buffer, outer=largest)
+            for buffer in buffers[1:]
+        )
+        try:
+            flow_pars._hierarchical_boxes_cache = (
+                signature, defect, mask, defect_mask, boxes
+            )
+        except (AttributeError, TypeError):
+            pass
+        return boxes
 
 
 class HBOR():
@@ -76,17 +149,18 @@ class HBOR():
         self.D = flow_pars.D
         self.orsteps = flow_pars.orsteps
         self.device = flow_pars.device
+        self._masked_links_cache = sun.masked_links_cache_for(flow_pars)
 
         self.beta = beta
 
         if self.N==2:
-            self.hb_update=self.SU2_link_update_hb
+            self.hb_update=self._su2_selected_hb
             self.haar_hb_update=self.SU2_link_haar_hb
-            self.over_update=self.SU2_link_update_over
+            self.over_update=self._su2_selected_over
         elif self.N==3:
-            self.hb_update=self.SU3_link_update_hb
+            self.hb_update=self._su3_selected_hb
             self.haar_hb_update=self.SU3_link_haar_hb
-            self.over_update=self.SU3_link_update_over
+            self.over_update=self._su3_selected_over
 
         self.set_defect_parameter(defect_par)
 
@@ -120,35 +194,30 @@ class HBOR():
             #extracting random numbers
             rand = torch.rand(rn_shape, device=cfgs.device, dtype=cfgs.real.dtype)
 
-        #heatbath
+        links = mask if isinstance(mask, sun.MaskedLinks) else self._links_for_mask(mask)
+        flat = sun.flat_links(cfgs, self.D)
+
+        # Heat bath: gather only selected links and the links needed by their staples.
         for mu in range(self.D):
             for eo in range(2):
-                current_mask = mask[eo+mu*2,:].to(dtype=torch.bool)
-                cfgs_new = self.hb_update(cfgs, mu, rand, defect)
-                cfgs = torch.where(current_mask, cfgs_new, cfgs)
+                m = eo + mu * 2
+                rand_m = rand[:, :, mu].flatten(2).index_select(2, links.sites[m])
+                flat = flat.index_copy(1, links.links[m], self.hb_update(flat, links, m, rand_m, defect, cfgs))
 
         #overrelaxation
         for o in range(self.orsteps):
             for mu in range(self.D):
                 for eo in range(2):
-                    current_mask = mask[eo+mu*2,:].to(dtype=torch.bool)
-                    cfgs_new = self.over_update(cfgs, mu, defect)
-                    cfgs = torch.where(current_mask, cfgs_new, cfgs)
-        return cfgs
+                    m = eo + mu * 2
+                    flat = flat.index_copy(1, links.links[m], self.over_update(flat, links, m, defect, cfgs))
+        cfgs = flat.reshape(cfgs.shape)
+        return sun.SU3_unitarize(cfgs) if self.N == 3 else cfgs
+
+    def _links_for_mask(self, mask):
+        return self._masked_links_cache.get(mask, self.D)
 
     def haar(self, cfgs):
-        rn_shape = list(cfgs.shape[:-2])
-        rn_shape.insert(1, 18)
-        rn_shape = tuple(rn_shape)
-        #extracting random numbers
-        rand = torch.rand(rn_shape, device=cfgs.device, dtype=cfgs.real.dtype)
-
-        for rr in range(rn_shape[1]//6):
-            rand[:,rr*6] = 1.0 - 2.0 * rand[:,rr*6]
-            rand[:,rr*6+4] = 1.0 - 2.0 * rand[:,rr*6+4]
-            rand[:,rr*6+5] = 2.0 * torch.pi * rand[:,rr*6+5]
-
-        return self.haar_hb_update(cfgs, rand)
+        return sun.SUN_haar(cfgs.shape[:-1], device=cfgs.device, dtype=cfgs.dtype)
     
     def _batch_kappa(self, cfgs, defect):
         defect = defect.to(device=cfgs.device, dtype=cfgs.real.dtype)
@@ -214,6 +283,77 @@ class HBOR():
 
         return staple
 
+    def _gathered_staples(self, cfgs, flat, links, m, defect):
+        mu = m // 2
+        batch = int(cfgs.shape[0])
+        n = int(links.sites[m].numel())
+        staples = torch.zeros((batch, n, self.N, self.N), dtype=cfgs.dtype, device=cfgs.device)
+        use_defect = defect is not None and self._defect_parameter_uses_defect()
+        if use_defect:
+            kappa = self._batch_kappa(cfgs, defect)
+            if kappa.dim() == self.D + 1:
+                kappa = kappa.reshape(1, -1)
+            else:
+                kappa = kappa.flatten(1)
+
+            def kappa_at(position):
+                values = kappa.index_select(-1, position)
+                return values.expand(batch, -1) if values.shape[0] == 1 and batch != 1 else values
+
+            kappa_mu = kappa_at(links.links[m])
+
+        for j, indices in enumerate(links.staple_links[m]):
+            upper, lower = sun.staples_at(flat, indices)
+            if use_defect:
+                upper_weight = kappa_mu * kappa_at(indices[0]) * kappa_at(indices[1]) * kappa_at(indices[2])
+                lower_weight = kappa_mu * kappa_at(indices[3]) * kappa_at(indices[4]) * kappa_at(indices[5])
+                upper = upper * upper_weight.unsqueeze(-1).unsqueeze(-1)
+                lower = lower * lower_weight.unsqueeze(-1).unsqueeze(-1)
+            staples = staples + upper + lower
+        return staples
+
+    def _su2_selected_hb(self, flat, links, m, rand, defect, cfgs):
+        staple = self._gathered_staples(cfgs, flat, links, m, defect)
+        old = flat.index_select(1, links.links[m])
+        proposal, acc = self.heatbath(staple, rand[:, :6], self.N / 2.0)
+        return torch.where(acc, proposal, old)
+
+    def _su2_selected_over(self, flat, links, m, defect, cfgs):
+        staple = self._gathered_staples(cfgs, flat, links, m, defect)
+        old = flat.index_select(1, links.links[m])
+        k = torch.sqrt(sun.SUN_determinant(staple).abs())
+        good = k > 0
+        safe = torch.where(good, k, torch.ones_like(k))
+        V = sun.SUN_dagger(staple / safe.unsqueeze(-1).unsqueeze(-1))
+        proposal = sun.SUN_mul(sun.SUN_mul(V, sun.SUN_dagger(old)), V)
+        return torch.where(good.unsqueeze(-1).unsqueeze(-1), proposal, old)
+
+    def _su3_selected_hb(self, flat, links, m, rand, defect, cfgs):
+        staple = self._gathered_staples(cfgs, flat, links, m, defect)
+        new = flat.index_select(1, links.links[m])
+        colors = torch.arange(3, device=cfgs.device)
+        for phb in range(3):
+            Rk = SU3_compute_RK(new, staple, colors, phb)
+            subgroup, acc = self.heatbath(Rk, rand[:, 6 * phb:6 * (phb + 1)], self.N / 2.0)
+            proposal = SU2_left_multiply_SU3(new, subgroup, phb)
+            new = torch.where(acc, proposal, new)
+        return new
+
+    def _su3_selected_over(self, flat, links, m, defect, cfgs):
+        staple = self._gathered_staples(cfgs, flat, links, m, defect)
+        new = flat.index_select(1, links.links[m])
+        colors = torch.arange(3, device=cfgs.device)
+        for phb in range(3):
+            Rk = SU3_compute_RK(new, staple, colors, phb)
+            k = torch.sqrt(sun.SUN_determinant(Rk).abs())
+            good = k > 0
+            safe = torch.where(good, k, torch.ones_like(k))
+            V = sun.SUN_dagger(Rk / safe.unsqueeze(-1).unsqueeze(-1))
+            subgroup = sun.SUN_mul(V, V)
+            proposal = SU2_left_multiply_SU3(new, subgroup, phb)
+            new = torch.where(good.unsqueeze(-1).unsqueeze(-1), proposal, new)
+        return new
+
     def SU2toSU3(self, Ak, phb):
         idx0 = torch.arange(phb, device=Ak.device)
         idx1 = torch.arange(phb, 2, device=Ak.device)
@@ -226,58 +366,34 @@ class HBOR():
 
     def heatbath_standard(self, staples, rand, factor):
         k = torch.sqrt(sun.SUN_determinant(staples).abs())
-        xi = factor / (self._beta_for_staples(k) * k)
+        k0 = k > 0
+        safe_k = torch.where(k0, k, torch.ones_like(k))
+        xi = (self.N / 2.0) / (self._beta_for_staples(safe_k) * safe_k)
 
         #WARNING: if rand[:,0] and one of the two other rand are simultaneously 0 a NaN occurs in the gradient of mod. Probably very unlikely
-        lam2 = (- 0.5 * xi * (torch.log(1.0 - rand[:,0,:]) + torch.cos(2.0 * torch.pi *(1.0 - rand[:,1,:]))**2 * torch.log(1.0 - rand[:,2,:])))
-        acc = (1.0 - lam2 >= rand[:,3,:]**2)
+        lam2 = (- 0.5 * xi * (torch.log(1.0 - rand[:, 0]) + torch.cos(2.0 * torch.pi * (1.0 - rand[:, 1]))**2 * torch.log(1.0 - rand[:, 2])))
+        acc = (1.0 - lam2 >= rand[:, 3]**2)
         x0 = (1.0 - 2.0 * lam2) * acc
 
         #x0=x0.detach() # This detach prevents (unlikely) NaN in the gradient of the square root mod
-        stheta = torch.sqrt(1.0 -  (1.0 - 2.0 * rand[:,4,:])**2)
+        stheta = torch.sqrt(1.0 -  (1.0 - 2.0 * rand[:, 4])**2)
         mod = torch.sqrt(1.0 - x0**2)
 
-        A = torch.complex(x0, mod * (1.0 - 2.0 * rand[:,4,:])).unsqueeze(-1)
-        B = (stheta*mod*torch.complex(torch.cos(2.0 * torch.pi * rand[:,5,:]), torch.sin(2.0 * torch.pi * rand[:,5,:]))).unsqueeze(-1)
-        Xa = torch.ones(k.shape + (1,), dtype=A.dtype, device=A.device) * A
-        Xb = torch.ones(k.shape + (1,), dtype=B.dtype, device=B.device) * B
-        X = torch.cat((Xa,Xb),-1)
-
-        v1 = torch.conj((X * _su2_sign(len(X.shape) - 1, X.device, X.real.dtype)).roll(1,-1))
-        Xmat = torch.cat((X.unsqueeze(-2),v1.unsqueeze(-2)),-2)
-        acc = acc.unsqueeze(-1).unsqueeze(-1)
-
-        return sun.SUN_mul(Xmat, sun.SUN_dagger(staples / k.unsqueeze(-1).unsqueeze(-1))), acc
+        A = torch.complex(x0, mod * (1.0 - 2.0 * rand[:, 4])).unsqueeze(-1)
+        B = (stheta*mod*torch.complex(torch.cos(2.0 * torch.pi * rand[:, 5]), torch.sin(2.0 * torch.pi * rand[:, 5]))).unsqueeze(-1)
+        haar_a, haar_b = _su2_haar_from_uniform(rand)
+        A = torch.where(k0, A.squeeze(-1), haar_a).unsqueeze(-1)
+        B = torch.where(k0, B.squeeze(-1), haar_b).unsqueeze(-1)
+        X = torch.cat((A, B), -1)
+        v1 = torch.conj((X * _su2_sign(len(X.shape) - 1, X.device, X.real.dtype)).roll(1, -1))
+        Xmat = torch.cat((X.unsqueeze(-2), v1.unsqueeze(-2)), -2)
+        proposal = sun.SUN_mul(Xmat, sun.SUN_dagger(staples / safe_k.unsqueeze(-1).unsqueeze(-1)))
+        proposal = torch.where(k0.unsqueeze(-1).unsqueeze(-1), proposal, Xmat)
+        acc = (acc | ~k0).unsqueeze(-1).unsqueeze(-1)
+        return proposal, acc
 
     def heatbath_defect(self, staples, rand, factor):
-        k = torch.sqrt(sun.SUN_determinant(staples).abs())
-        #this guarantees that links whose sum of staples has zero determinant do not generate nans. To do the heatbath a random SU(2) matrix is generated instead.
-        k0 = k > 0.0
-        k = k * k0 + torch.ones_like(k) * ~k0
-        xi = factor / (self._beta_for_staples(k) * k)
-
-        #WARNING: if rand[:,0] and one of the two other rand are simultaneously 0 a NaN occurs in the gradient of mod. Probably very unlikely
-        #the second addend generates a random SU(2) matrix for staples that have zero determinant
-        lam2 = (- 0.5 * xi * (torch.log(1.0 - rand[:,0,:]) + torch.cos(2.0 * torch.pi *(1.0 - rand[:,1,:]))**2 * torch.log(1.0 - rand[:,2,:]))) #* k0 #+ rand[:,0,:]**2 * ~k0
-        acc = (1.0 - lam2 >= rand[:,3,:]**2)
-        x0 = ((1.0 - 2.0 * lam2) * k0) * acc + (1.0 - 2.0 * rand[:,0,:]) * ~k0
-
-        #x0=x0.detach() # This detach prevents (unlikely) NaN in the gradient of the square root mod
-        stheta = torch.sqrt(1.0 - (1.0 - 2.0 * rand[:,4,:])**2)
-        mod = torch.sqrt(1.0 - x0**2)
-
-        A = torch.complex(x0, mod * (1.0 - 2.0 * rand[:,4,:])).unsqueeze(-1)
-        B = (stheta*mod*torch.complex(torch.cos(2.0 * torch.pi * rand[:,5,:]), torch.sin(2.0 * torch.pi * rand[:,5,:]))).unsqueeze(-1)
-        Xa = torch.ones(k.shape + (1,), dtype=A.dtype, device=A.device) * A
-        Xb = torch.ones(k.shape + (1,), dtype=B.dtype, device=B.device) * B
-        X = torch.cat((Xa,Xb),-1)
-
-        v1 = torch.conj((X * _su2_sign(len(X.shape) - 1, X.device, X.real.dtype)).roll(1,-1))
-        Xmat = torch.cat((X.unsqueeze(-2),v1.unsqueeze(-2)),-2)
-        acc = acc.unsqueeze(-1).unsqueeze(-1)
-        k0 = k0.unsqueeze(-1).unsqueeze(-1)
-
-        return sun.SUN_mul(Xmat, sun.SUN_dagger(staples / k.unsqueeze(-1).unsqueeze(-1))) * k0 + Xmat * ~k0, acc
+        return self.heatbath_standard(staples, rand, factor)
 
     def SU2_link_update_hb(self, cfgs, mu, rand, defect):
         staples = self.sum_of_staples(cfgs, mu, defect)
@@ -393,16 +509,25 @@ def SU2_element(mat, i, j):
     return torch.index_select(torch.index_select(mat,-2,i),-1,j).squeeze(-1).squeeze(-1)
 
 def SU3_compute_RK(new_cfgs, staples, sel, phb):
-    sel2 = sel[sel != phb]
-    Rk = sun.SUN_mul(new_cfgs, staples)# SUN_dagger(staples))
+    i, j = (color for color in range(3) if color != phb)
 
-    #generate SU(2) subgroup matrix from Rk
-    a = 0.5*(SU2_element(Rk,sel2[0],sel2[0]) + torch.conj(SU2_element(Rk,sel2[1],sel2[1]))).unsqueeze(-1)
-    b = 0.5*(SU2_element(Rk,sel2[0],sel2[1]) - torch.conj(SU2_element(Rk,sel2[1],sel2[0]))).unsqueeze(-1)
-    v0 = torch.cat((a,b),-1)
-    v1 = torch.conj((v0 * _su2_sign(len(v0.shape) - 1, v0.device, v0.real.dtype)).roll(1,-1))
-    Rk = torch.cat((v0.unsqueeze(-2),v1.unsqueeze(-2)),-2)
-    return Rk
+    def element(row, col):
+        return (new_cfgs[..., row, :] * staples[..., :, col]).sum(-1)
+
+    # Only four entries of new @ staple are needed for the SU(2) subgroup matrix.
+    a = 0.5 * (element(i, i) + element(j, j).conj())
+    b = 0.5 * (element(i, j) - element(j, i).conj())
+    first = torch.stack((a, b), dim=-1)
+    second = torch.stack((-b.conj(), a.conj()), dim=-1)
+    return torch.stack((first, second), dim=-2)
+
+
+def SU2_left_multiply_SU3(links, subgroup, phb):
+    """Apply an SU(2) subgroup update to just the two affected SU(3) rows."""
+    pair = torch.tensor([i for i in range(3) if i != phb], device=links.device)
+    rows = links.index_select(-2, pair)
+    updated_rows = torch.matmul(subgroup, rows)
+    return links.index_copy(-2, pair, updated_rows)
 
 
 class DefectMCMCAdapter:

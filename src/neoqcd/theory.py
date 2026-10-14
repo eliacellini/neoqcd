@@ -2,6 +2,15 @@ import torch
 import neoqcd.sun_utils as sun
 
 
+def plaquette_weight(kappa: torch.Tensor, mu: int, nu: int, D: int) -> torch.Tensor:
+    return (
+        kappa[mu]
+        * torch.roll(kappa[nu], 1, dims=-D + mu)
+        * torch.roll(kappa[mu], 1, dims=-D + nu)
+        * kappa[nu]
+    )
+
+
 def _as_parameter_vector(parameter, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     p = torch.as_tensor(parameter, device=device, dtype=dtype)
     if p.dim() == 0:
@@ -139,7 +148,7 @@ def S_halo(
                     * torch.roll(kappa, 1, dims=(-int(D) + nu))[:, mu]
                     * kappa[:, nu]
                 )
-                term = (6.0 - weight * retr / float(N)) * mask.to(dtype=work_dtype)
+                term = (1.0 - weight * retr / float(N)) * mask.to(dtype=work_dtype)
                 out = out + float(beta) * term.sum(dim=tuple(range(1, int(D) + 1)))
                 continue
 
@@ -162,7 +171,7 @@ def S_halo(
                 * kappa[(slice(None), nu) + bbox]
             )
             local_mask = mask[bbox].to(dtype=work_dtype)
-            term = (6.0 - weight * retr / float(N)) * local_mask
+            term = (1.0 - weight * retr / float(N)) * local_mask
             out = out + float(beta) * term.sum(dim=tuple(range(1, int(D) + 1)))
     return out
 
@@ -242,22 +251,26 @@ class Wilson_action:
 
         self.beta = beta
         self.defect_par = defect_par
+        self.n_planes = self.D * (self.D - 1) // 2
+
+    def _uses_defect(self):
+        if torch.is_tensor(self.defect_par):
+            return bool((self.defect_par < 1.0).any().item())
+        return bool(self.defect_par < 1.0)
 
     def __call__(self, cfgs, defect):
-        retr = torch.zeros(cfgs[:,0].shape[:-2], dtype=cfgs.real.dtype, device=cfgs.device)
+        return self.from_plaquettes(sun.plaquette_fields(cfgs, self.D), defect)
 
-        if (self.defect_par < 1.0):
-            kappa = defect[0,:] + defect[1,:] * self.defect_par
-
-        for nu in range(1, self.D):
-            for mu in range(0, nu):
-                plaq = sun.SUN_mul(sun.pstaple(cfgs, mu, nu, self.D), cfgs[:,mu])
-                
-                if (self.defect_par < 1.0):
-                    kappamunu = kappa[mu] * torch.roll(kappa, 1, dims=(-self.D + mu))[nu] * torch.roll(kappa, 1, dims=(-self.D + nu))[mu] * kappa[nu]
-                    retr += kappamunu * sun.SUN_trace(plaq).real
-                else:
-                    retr += sun.SUN_trace(plaq).real
-
-        dims = range(1, self.D + 1)
-        return self.beta*torch.sum(6.0 - retr/self.N, tuple(dims))
+    def from_plaquettes(self, plaquettes, defect):
+        retr = plaquettes[0].new_zeros(plaquettes[0].shape)
+        has_defect = self._uses_defect()
+        kappa = defect[0] + defect[1] * self.defect_par if has_defect else None
+        for (mu, nu), plaq_retr in zip(
+            ((mu, nu) for nu in range(1, self.D) for mu in range(nu)), plaquettes
+        ):
+            if has_defect:
+                retr = retr + plaquette_weight(kappa, mu, nu, self.D) * plaq_retr
+            else:
+                retr = retr + plaq_retr
+        dims = tuple(range(1, self.D + 1))
+        return self.beta * torch.sum(float(self.n_planes) - retr / float(self.N), dims)

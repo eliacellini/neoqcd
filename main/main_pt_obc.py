@@ -26,6 +26,7 @@ from neoqcd.distributedPT import (
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
+from neoqcd.smearing_jacobian import LOGDET_VERSION
 from neoqcd.theory import Wilson_action
 from neoqcd.utils import Defect, create_around_defect_mask, create_mask
 
@@ -111,8 +112,12 @@ def _resolve_neorex_flow_checkpoint_path(args: argparse.Namespace, spec: str):
 
 
 def _neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> dict:
+    nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
     return {
         "algorithm": "neorex",
+        "nf_layer_type": nf_layer_kind,
+        "smearing_jacobian_version": LOGDET_VERSION if nf_layer_kind == "smearing" else None,
+        "explicit_backward": bool(args.explicit_backward),
         "saved_path": str(saved_path),
         "neorex_protocol_steps": int(args.neorex_protocol_steps),
         "neorex_heatbath_steps_per_step": int(args.neorex_heatbath_steps_per_step),
@@ -140,11 +145,30 @@ def _neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> dict:
     }
 
 
-def _write_neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> str:
+def _write_neorex_flow_metadata(args: argparse.Namespace, saved_path: str, rank: int) -> str:
     path = Path(saved_path)
     meta_path = Path(f"{path}.meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(_neorex_flow_metadata(args, str(path)), f, indent=2)
+    error = [None]
+    if rank == 0:
+        temporary_path = None
+        try:
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=f".{meta_path.name}.", suffix=".tmp", dir=meta_path.parent
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(_neorex_flow_metadata(args, str(path)), f, indent=2)
+            os.replace(temporary_path, meta_path)
+        except Exception as exc:
+            error[0] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+    dist.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise RuntimeError(f"failed to write NEO-REX flow metadata: {error[0]}")
     return str(meta_path)
 
 
@@ -252,6 +276,44 @@ def _rank0_cuda_memory_metrics(device: torch.device, enabled: bool) -> dict[str,
     }
 
 
+def _checkpoint_tensor_semantics(value: torch.Tensor) -> dict:
+    tensor = torch.as_tensor(value).detach().to(device="cpu").contiguous()
+    digest = hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
+    return {
+        "shape": [int(size) for size in tensor.shape],
+        "dtype": str(tensor.dtype),
+        "sha256": digest,
+    }
+
+
+def _checkpoint_mlp_semantics(module: torch.nn.Sequential) -> list[dict]:
+    layout = []
+    for layer in module:
+        entry = {"type": type(layer).__name__, "config": layer.extra_repr()}
+        if isinstance(layer, torch.nn.Linear):
+            entry.update(in_features=int(layer.in_features), out_features=int(layer.out_features))
+        layout.append(entry)
+    return layout
+
+
+def _checkpoint_patch_semantics(flow_pars: FlowPars) -> dict:
+    defect = flow_pars.defect
+    return {
+        "geometry": {
+            "D": int(flow_pars.D),
+            "N": int(flow_pars.N),
+            "T": int(flow_pars.T),
+            "L": int(flow_pars.L),
+            "defect_size": int(defect.dsize),
+            "crop_buffer": 2,
+        },
+        "small_mask": _checkpoint_tensor_semantics(flow_pars.small_mask[-1]),
+        "smeared_defect_mask": _checkpoint_tensor_semantics(
+            flow_pars.smeared_defect_mask[-1]
+        ),
+    }
+
+
 class DefectSNFProtocolLayer(torch.nn.Module):
     """
     Deterministic defect-coupling NF block compatible with NEOREXProtocolWrapper.
@@ -260,8 +322,39 @@ class DefectSNFProtocolLayer(torch.nn.Module):
     def __init__(self, flow_pars: FlowPars):
         super().__init__()
         self.flow_pars = flow_pars
+        self.smearing_jacobian_version = LOGDET_VERSION
         rho0 = torch.zeros(flow_pars.rho_shape, device=flow_pars.device, dtype=torch.float64)
         self.layer = DefectCouplingLayer(flow_pars, rho0, time=1.0)
+
+    @property
+    def checkpoint_semantics(self):
+        smearing = self.layer.smearing
+        if not smearing.use_hyper_smearing:
+            return None
+        hyper = smearing.hyper_smearing
+        semantics = {
+            "schema": 1,
+            "family": "classic_hyper_smearing",
+            **_checkpoint_patch_semantics(self.flow_pars),
+            "mode": hyper.mode,
+            "time": float(hyper.time),
+            "time_embedding_dim": int(hyper.scalar_emb_dim),
+            "embedding_frequencies": _checkpoint_tensor_semantics(hyper.freqs),
+            "rho_shape_without_batch": [int(v) for v in hyper.rho_shape[1:]],
+            "smearing_steps": int(hyper.smearing_steps),
+            "mlp": _checkpoint_mlp_semantics(hyper.mlp),
+            "normalize_by_nstep": bool(hyper.normalize_by_nstep),
+            "normalization_divisor": int(hyper.nstep) if hyper.normalize_by_nstep else None,
+            "rho_eps": float(hyper.rho_eps),
+            "rho_max": float(hyper.rho_max),
+            "scale_by_delta": bool(hyper.scale_by_delta),
+            "class_masks": (
+                _checkpoint_tensor_semantics(hyper.class_masks)
+                if hasattr(hyper, "class_masks")
+                else None
+            ),
+        }
+        return semantics
 
     def _normalize_parameter(self, parameter: torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:
         p = torch.as_tensor(parameter, dtype=torch.float64, device=device)
@@ -325,7 +418,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         finally:
             self.layer.smearing.jac_shape = old_jac_shape
         x_out = self._embed_small_cfgs(x_small, x, buffer=2)
-        logdet = (2.0 * dlogj).to(dtype=work_dtype)
+        logdet = dlogj.to(dtype=work_dtype)
         return x_out, logdet
 
 
@@ -340,7 +433,34 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
     def __init__(self, flow_pars: FlowPars):
         torch.nn.Module.__init__(self)
         self.flow_pars = flow_pars
+        self.smearing_jacobian_version = None
         self.layer = ResidualNormalizingFlows(flow_pars, time=1.0)
+
+    @property
+    def checkpoint_semantics(self):
+        residual = self.layer
+        semantics = {
+            "schema": 1,
+            "family": "residual_defect_flow",
+            **_checkpoint_patch_semantics(self.flow_pars),
+            "time": float(residual.time),
+            "steps": int(residual.steps),
+            "parameterization": residual.parameterization,
+            "include_imag": bool(residual.include_imag),
+            "quadratic": bool(residual.use_quadratic),
+            "coeff_max": float(residual.coeff_max),
+            "n_pt": int(residual.n_pt),
+            "mask_mod": int(residual.mask_mod),
+            "n_features": int(residual.n_features),
+            "coeffs_per_step": int(residual.coeffs_per_step),
+        }
+        if residual.parameterization == "hyper":
+            semantics.update(
+                time_embedding_dim=2 * int(residual.freqs.numel()),
+                embedding_frequencies=_checkpoint_tensor_semantics(residual.freqs),
+                mlp=_checkpoint_mlp_semantics(residual.mlp),
+            )
+        return semantics
 
     def forward(self, x: torch.Tensor, bc: torch.Tensor, delta_bc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bs = int(x.shape[0])
@@ -425,6 +545,7 @@ def _build_neorex_flow_pars(
         hyper_rho_eps=args.hyper_rho_eps,
         hyper_scale_by_delta=args.hyper_scale_by_delta,
         hyper_rho_max=args.hyper_rho_max,
+        explicit_backward=args.explicit_backward,
         residual_include_imag=args.residual_include_imag,
         residual_quadratic=args.residual_quadratic,
         residual_coeff_init=args.residual_coeff_init,
@@ -565,6 +686,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", type=int, default=0)
     parser.add_argument("--nf-layer-type", type=str, default="", choices=["", "smearing", "residual"])
     parser.add_argument("--nf-layers-per-step", type=int, default=0)
+    parser.add_argument("--explicit-backward", action="store_true")
     parser.set_defaults(
         use_hyper_smearing=True,
         hyper_normalize_by_nstep=False,
@@ -1316,6 +1438,25 @@ def main(args: argparse.Namespace) -> None:
                     ]
                 )
 
+    saved_flow_paths = []
+    saved_flow_metadata_paths = []
+    if args.algorithm == "neorex":
+        final_flow_path = out_dir / f"neorex_flow_final_nsteps{int(args.neorex_protocol_steps)}.pt"
+        pt.save_flow(str(final_flow_path))
+        saved_flow_paths.append(str(final_flow_path))
+        metadata_path = _write_neorex_flow_metadata(args, str(final_flow_path), rank)
+        if rank == 0:
+            saved_flow_metadata_paths.append(metadata_path)
+
+        save_path = _resolve_neorex_flow_checkpoint_path(args, args.neorex_save_flow)
+        if save_path is not None:
+            pt.save_flow(str(save_path))
+            saved_flow_paths.append(str(save_path))
+            metadata_path = _write_neorex_flow_metadata(args, str(save_path), rank)
+            if rank == 0:
+                saved_flow_metadata_paths.append(metadata_path)
+                print(f"neorex_flow_checkpoint=saved  path={save_path}", flush=True)
+
     if rank == 0:
         measurement_elapsed = time.time() - t0
         total_elapsed = thermalization_elapsed + measurement_elapsed
@@ -1384,22 +1525,6 @@ def main(args: argparse.Namespace) -> None:
                 for key, value in final_gpu_memory.items()
             }
         if args.algorithm == "neorex":
-            saved_flow_paths = []
-            saved_flow_metadata_paths = []
-            final_flow_path = out_dir / f"neorex_flow_final_nsteps{int(args.neorex_protocol_steps)}.pt"
-            final_flow_path.parent.mkdir(parents=True, exist_ok=True)
-            pt.save_flow(str(final_flow_path))
-            saved_flow_paths.append(str(final_flow_path))
-            saved_flow_metadata_paths.append(_write_neorex_flow_metadata(args, str(final_flow_path)))
-
-            save_path = _resolve_neorex_flow_checkpoint_path(args, args.neorex_save_flow)
-            if save_path is not None:
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                pt.save_flow(str(save_path))
-                saved_flow_paths.append(str(save_path))
-                saved_flow_metadata_paths.append(_write_neorex_flow_metadata(args, str(save_path)))
-                print(f"neorex_flow_checkpoint=saved  path={save_path}", flush=True)
-
             meta["neorex_flow_checkpoint"] = {
                 "load_mode": neorex_flow_load_mode,
                 "load_path": neorex_flow_load_path,

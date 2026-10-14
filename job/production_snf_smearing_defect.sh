@@ -56,6 +56,14 @@ TRAIN_STEPS=100
 EVAL_SAMPLES=128
 FLOW_LR=1e-3
 GRAD_CLIP_NORM=0.0
+INT_MEAS="${INT_MEAS:-1}"
+CONTINUE_PRIOR="${CONTINUE_PRIOR:-1}"
+TRAINING_MODE="${TRAINING_MODE:-blockwise}"
+GRAD_ACC="${GRAD_ACC:-1}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
+HIERARCHICAL_LEVELS="${HIERARCHICAL_LEVELS:-0}"
+HIERARCHICAL_UPDATES="${HIERARCHICAL_UPDATES:-}"
+HIERARCHICAL_BUFFERS="${HIERARCHICAL_BUFFERS:-}"
 
 HYPER_SMEARING_MODE=per_link
 HYPER_TIME_EMBEDDING_DIM=8
@@ -147,13 +155,38 @@ run_phase() {
     --output-dir "$output_dir"
     --main-dir "$PROJECT_DIR"
     --log-every "$LOG_EVERY"
+    --int-meas "$INT_MEAS"
+    --training-mode "$TRAINING_MODE"
+    --grad-acc "$GRAD_ACC"
+    --checkpoint-every "$CHECKPOINT_EVERY"
     --seed "$phase_seed"
     --overwrite
   )
+  if (( HIERARCHICAL_LEVELS > 0 )); then
+    HIERARCHICAL_UPDATE_LIST=()
+    HIERARCHICAL_BUFFER_LIST=()
+    if [[ -n "$HIERARCHICAL_UPDATES" ]]; then
+      read -r -a HIERARCHICAL_UPDATE_LIST <<< "$HIERARCHICAL_UPDATES"
+    fi
+    if [[ -n "$HIERARCHICAL_BUFFERS" ]]; then
+      read -r -a HIERARCHICAL_BUFFER_LIST <<< "$HIERARCHICAL_BUFFERS"
+    fi
+    if ((${#HIERARCHICAL_UPDATE_LIST[@]} != HIERARCHICAL_LEVELS)); then
+      echo "HIERARCHICAL_UPDATES must have one value per level" >&2
+      return 2
+    fi
+    CMD+=(--hierarchical-levels "$HIERARCHICAL_LEVELS" --hierarchical-updates "${HIERARCHICAL_UPDATE_LIST[@]}")
+    if ((${#HIERARCHICAL_BUFFER_LIST[@]} > 0)); then
+      CMD+=(--hierarchical-buffers "${HIERARCHICAL_BUFFER_LIST[@]}")
+    fi
+  fi
   if [[ "$phase" == train ]]; then
     CMD+=(--train-steps "$TRAIN_STEPS")
   else
     CMD+=(--eval-samples "$EVAL_SAMPLES" --checkpoint "$TRAIN_DIR/snf_checkpoint.pt")
+    if [[ "$CONTINUE_PRIOR" == 1 ]]; then
+      CMD+=(--load-prior)
+    fi
   fi
 
   echo "Running $phase command:"

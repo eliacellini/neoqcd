@@ -53,6 +53,11 @@ PRIOR_MCMC_STEPS=1
 UPDATES_PER_LAYER=1
 ORSTEPS=4
 EVAL_SAMPLES=128
+INT_MEAS="${INT_MEAS:-1}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
+HIERARCHICAL_LEVELS="${HIERARCHICAL_LEVELS:-0}"
+HIERARCHICAL_UPDATES="${HIERARCHICAL_UPDATES:-}"
+HIERARCHICAL_BUFFERS="${HIERARCHICAL_BUFFERS:-}"
 
 # -----------------------------
 # Logging / output
@@ -100,6 +105,8 @@ CMD=(
   --updates-per-layer "$UPDATES_PER_LAYER"
   --orsteps "$ORSTEPS"
   --eval-samples "$EVAL_SAMPLES"
+  --int-meas "$INT_MEAS"
+  --checkpoint-every "$CHECKPOINT_EVERY"
   --cfg-cache "$CFG_CACHE_MODE"
   --cfg-cache-dir "$CFG_CACHE_DIR"
   --cfg-cache-tag "$CFG_CACHE_TAG"
@@ -114,6 +121,25 @@ CMD=(
   --seed "$SEED"
   --overwrite
 )
+
+if (( HIERARCHICAL_LEVELS > 0 )); then
+  HIERARCHICAL_UPDATE_LIST=()
+  HIERARCHICAL_BUFFER_LIST=()
+  if [[ -n "$HIERARCHICAL_UPDATES" ]]; then
+    read -r -a HIERARCHICAL_UPDATE_LIST <<< "$HIERARCHICAL_UPDATES"
+  fi
+  if [[ -n "$HIERARCHICAL_BUFFERS" ]]; then
+    read -r -a HIERARCHICAL_BUFFER_LIST <<< "$HIERARCHICAL_BUFFERS"
+  fi
+  if ((${#HIERARCHICAL_UPDATE_LIST[@]} != HIERARCHICAL_LEVELS)); then
+    echo "HIERARCHICAL_UPDATES must have one value per level" >&2
+    exit 2
+  fi
+  CMD+=(--hierarchical-levels "$HIERARCHICAL_LEVELS" --hierarchical-updates "${HIERARCHICAL_UPDATE_LIST[@]}")
+  if ((${#HIERARCHICAL_BUFFER_LIST[@]} > 0)); then
+    CMD+=(--hierarchical-buffers "${HIERARCHICAL_BUFFER_LIST[@]}")
+  fi
+fi
 
 echo "Running evaluate command:"
 printf ' %q' "${CMD[@]}"

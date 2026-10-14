@@ -93,6 +93,28 @@ class time_embedding(nn.Module):
         K = torch.cat((self.one, cos_part, sin_part), dim=0)
         return K  # shape: (F,)
 
+
+class HyperTimeScalar(nn.Module):
+    """Global rho(t) functional with period-2 Fourier time features."""
+
+    def __init__(self, embedding, rho_shape, nstep, init_scale, hidden_dim=16, device=None):
+        super().__init__()
+        self.embedding = embedding
+        self.rho_shape = tuple(rho_shape)
+        self.nstep = int(nstep)
+        self.fc1 = nn.Linear(embedding.F, int(hidden_dim))
+        self.fc2 = nn.Linear(int(hidden_dim), int(np.prod(self.rho_shape)))
+        self.time_mlp = nn.Sequential(self.fc1, nn.SiLU(), self.fc2)
+        self.to(device=device, dtype=torch.float64)
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.fc1.bias)
+            nn.init.uniform_(self.fc2.weight, -float(init_scale), float(init_scale))
+            nn.init.uniform_(self.fc2.bias, -float(init_scale), float(init_scale))
+
+    def forward(self, t):
+        return (self.time_mlp(self.embedding(t)) / self.nstep).reshape(self.rho_shape)
+
 class HyperTimeConv1D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,embedding, rho_init = 1e-5,hidden_dim=16,device=None):
         super().__init__()

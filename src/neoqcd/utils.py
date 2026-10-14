@@ -1,8 +1,12 @@
 import torch
 import numpy as np
 import time
+import os
+import tempfile
+import warnings
 from neoqcd.obs import Obs
 import neoqcd.sun_utils as sun
+from neoqcd.smearing_jacobian import LOGDET_VERSION
 #from scipy.special import logsumexp
 from scipy.optimize import fsolve
 
@@ -18,32 +22,86 @@ def grab(var):
     else:
         return var
 
-def save(model, optimizers, path):
-    opts_sd = []
-    for opt in optimizers:
-        opts_sd.append(opt.state_dict())
+def _uses_exact_classic_smearing(model):
+    return any(
+        type(module).__name__ == "Smearing" and getattr(module, "N", None) == 3
+        for module in model.modules()
+    )
 
-    torch.save({'model_state_dict': model.state_dict(), 'optimizers_state_dict': opts_sd}, path)
 
-def load_weights(model, path, device=None):
+def _validate_smearing_checkpoint(model, checkpoint, allow_legacy_smearing=False):
+    if not _uses_exact_classic_smearing(model):
+        return
+    version = checkpoint.get("smearing_jacobian_version")
+    if version == LOGDET_VERSION:
+        return
+    if allow_legacy_smearing:
+        warnings.warn(
+            "Loading classic SU(3) smearing weights without the current full Haar-logdet version; "
+            "the stored optimizer state may have been trained with a different determinant loss.",
+            RuntimeWarning,
+        )
+        return
+    raise ValueError(
+        "This model uses classic SU(3) smearing with the full Haar logdet, but the checkpoint "
+        f"has smearing_jacobian_version={version!r}. Pass allow_legacy_smearing=True only after "
+        "intentionally accepting the old determinant convention."
+    )
+
+
+def save(model, optimizers, path, schedulers=None):
+    checkpoint = {
+        "checkpoint_format_version": 2,
+        "model_state_dict": model.state_dict(),
+        "optimizers_state_dict": [opt.state_dict() for opt in optimizers],
+        "schedulers_state_dict": (
+            None if schedulers is None else [scheduler.state_dict() for scheduler in schedulers]
+        ),
+    }
+    if _uses_exact_classic_smearing(model):
+        checkpoint["smearing_jacobian_version"] = LOGDET_VERSION
+
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary_path = tempfile.mkstemp(prefix=".checkpoint-", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def load_weights(model, path, device=None, allow_legacy_smearing=False):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(device)
     checkpoint = torch.load(path, map_location=device)
+    _validate_smearing_checkpoint(model, checkpoint, allow_legacy_smearing)
     model.load_state_dict(checkpoint['model_state_dict'])
 
-def load_optimizer(model, optimizers, path, device=None):
+
+def load_optimizer(model, optimizers, path, device=None, schedulers=None,
+                   allow_legacy_smearing=False):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(device)
     checkpoint = torch.load(path, map_location=device)
+    _validate_smearing_checkpoint(model, checkpoint, allow_legacy_smearing)
     opts_sd = checkpoint['optimizers_state_dict']
-    i = 0
-    for opt in optimizers:
-        opt.load_state_dict(opts_sd[i])
-        i += 1
+    if len(opts_sd) != len(optimizers):
+        raise ValueError(f"checkpoint has {len(opts_sd)} optimizers, got {len(optimizers)}")
+    for opt, state in zip(optimizers, opts_sd):
+        opt.load_state_dict(state)
+    if schedulers is not None:
+        schedulers_sd = checkpoint.get("schedulers_state_dict")
+        if schedulers_sd is None or len(schedulers_sd) != len(schedulers):
+            raise ValueError("checkpoint scheduler state does not match the supplied schedulers")
+        for scheduler, state in zip(schedulers, schedulers_sd):
+            scheduler.load_state_dict(state)
 
 def write(history,root):
     ess_file = root + '_ESS.dat'
@@ -52,15 +110,15 @@ def write(history,root):
 
     with open(ess_file, 'a') as f:
         for item in history['ESS']:
-            f.write("%f\n" % item)
+            f.write("%.17g\n" % float(item))
 
     with open(loss_var_file, 'a') as f:
         for item in history['var_loss']:
-            f.write("%f\n" % item)
+            f.write("%.17g\n" % float(item))
 
     with open(loss_file, 'a') as f:
         for item in history['loss']:
-            f.write("%f\n" % item)
+            f.write("%.17g\n" % float(item))
 
 def print_metrics(history_file,history, era, epoch, avg_last_N_epochs, t0):
     with open(history_file, 'a') as f:
@@ -204,28 +262,128 @@ class Defect():
         return kappa_mask
 
     def cut_defect(self, phi, field='cfgs', buffer=2):
-    
         t = self.time_slice
         s = self.space_slice
-        #CHANGE 
+        spatial = tuple(
+            slice(s - buffer, s + self.dsize + buffer)
+            for _ in range(self.D - 1)
+        )
         if field == 'cfgs':
-            dphi = phi[:, :, (t-buffer):(t+buffer), (s-buffer):(self.dsize+s+buffer), (s-buffer):(self.dsize+s+buffer), (s-buffer):(self.dsize+s+buffer)]
+            dphi = phi[(slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial + (slice(None), slice(None))]
         elif field == 'mask':
-            dphi = phi[:, :, :, (t-buffer):(t+buffer), (s-buffer):(self.dsize+s+buffer), (s-buffer):(self.dsize+s+buffer), (s-buffer):(self.dsize+s+buffer)]
-
+            dphi = phi[(slice(None), slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial]
+        else:
+            raise ValueError("field must be 'cfgs' or 'mask'")
         return dphi
 
+    def site_indices(self, buffer, device=None):
+        """Map sites of a cut box back to flattened sites of the full lattice."""
+        volume = self.T * self.L ** (self.D - 1)
+        ids = torch.arange(volume, device=device).reshape(
+            (1, 1, self.T) + (self.L,) * (self.D - 1)
+        )
+        t, s = self.time_slice, self.space_slice
+        slices = (slice(None), slice(None), slice(t - buffer, t + buffer)) + tuple(
+            slice(s - buffer, s + self.dsize + buffer) for _ in range(self.D - 1)
+        )
+        return ids[slices][0, 0]
+
+    def box_interior_mask(self, buffer, device=None):
+        """Select links whose complete staple remains inside this nonperiodic box."""
+        volume = self.T * self.L ** (self.D - 1)
+        lattice = torch.arange(volume, device=device).reshape(
+            (self.T,) + (self.L,) * (self.D - 1)
+        )
+        box = self.site_indices(buffer, device=device)
+
+        def exact_shift(amount, direction):
+            return torch.roll(box, amount, dims=direction) == torch.roll(
+                lattice, amount, dims=direction
+            ).flatten()[box]
+
+        directions = []
+        for mu in range(self.D):
+            inside = exact_shift(1, mu)
+            for nu in range(self.D):
+                if nu != mu:
+                    inside = inside & exact_shift(1, nu) & exact_shift(-1, nu)
+            directions.append(inside)
+        return torch.stack(directions)[None, ..., None, None]
+
     def embedding(self, small_cfgs, cfgs, buffer=2):
-    
         t = self.time_slice
         s = self.space_slice
+        out = cfgs.clone()
+        center_spatial = tuple(slice(s - 1, s + self.dsize + 1) for _ in range(self.D - 1))
+        local_center = tuple(slice(buffer - 1, buffer + self.dsize + 1) for _ in range(self.D - 1))
+        out[(slice(None), 0, t) + center_spatial] = small_cfgs[(slice(None), 0, buffer) + local_center]
+        target = tuple(slice(s, s + self.dsize + 1) for _ in range(self.D - 1))
+        local = tuple(slice(buffer, buffer + self.dsize + 1) for _ in range(self.D - 1))
+        for d in range(1, self.D):
+            out[(slice(None), d, t) + target] = small_cfgs[(slice(None), d, buffer) + local]
+            out[(slice(None), d, t - 1) + target] = small_cfgs[(slice(None), d, buffer - 1) + local]
+        return out
 
-        cfgs[:, 0, t, (s-1):(self.dsize+s+1), (s-1):(self.dsize+s+1), (s-1):(self.dsize+s+1)] = small_cfgs[:, 0, buffer, (buffer-1):(self.dsize+buffer+1), (buffer-1):(self.dsize+buffer+1), (buffer-1):(self.dsize+buffer+1)]
-        for d in range(1,self.D):
-            cfgs[:, d, t, s:(self.dsize+s+1), s:(self.dsize+s+1), s:(self.dsize+s+1)] = small_cfgs[:, d, buffer, buffer:(self.dsize+buffer+1), buffer:(self.dsize+buffer+1), buffer:(self.dsize+buffer+1)]
-            cfgs[:, d, t-1, s:(self.dsize+s+1), s:(self.dsize+s+1), s:(self.dsize+s+1)] = small_cfgs[:, d, buffer-1, buffer:(self.dsize+buffer+1), buffer:(self.dsize+buffer+1), buffer:(self.dsize+buffer+1)]
-    
-        return cfgs
+
+class DefectBox:
+    """A nested MCMC box; only links with every staple wholly inside are updated."""
+
+    def __init__(self, defect, mask, defect_mask, buffer, outer=None):
+        self.defect = defect
+        self.buffer = int(buffer)
+        self.D = defect.D
+        self.outer = outer
+        interior = defect.box_interior_mask(buffer, device=mask.device)
+        self.mask = defect.cut_defect(mask, field='mask', buffer=buffer) & interior
+        self.links = sun.MaskedLinks(self.mask, self.D)
+        self.defect_mask = (
+            None if defect_mask is None
+            else defect.cut_defect(defect_mask, buffer=buffer)
+        )
+
+        sites = defect.site_indices(buffer, device=mask.device).flatten()
+        volume = defect.T * defect.L ** (self.D - 1)
+        box_volume = int(sites.numel())
+        box_links = torch.cat(self.links.links)
+        lattice_links = (box_links // box_volume) * volume + sites[box_links % box_volume]
+        if outer is None:
+            self.box_links = box_links
+            self.lattice_links = lattice_links
+            self.target_links = lattice_links
+            return
+
+        if outer.buffer <= self.buffer:
+            raise ValueError(
+                f"the box with buffer {self.buffer} is not inside buffer {outer.buffer}"
+            )
+        outer_sites = defect.site_indices(outer.buffer, device=mask.device).flatten()
+        if not bool(torch.isin(lattice_links, outer.lattice_links).all()):
+            raise ValueError(
+                f"the box with buffer {self.buffer} is not inside buffer {outer.buffer}"
+            )
+        outer_positions = torch.full((volume,), -1, dtype=torch.long, device=mask.device)
+        outer_positions[outer_sites] = torch.arange(outer_sites.numel(), device=mask.device)
+        positions = outer_positions[sites[box_links % box_volume]]
+        if bool((positions < 0).any()):
+            raise ValueError(
+                f"the box with buffer {self.buffer} is not inside buffer {outer.buffer}"
+            )
+        self.box_links = box_links
+        self.lattice_links = lattice_links
+        self.target_links = (box_links // box_volume) * outer_sites.numel() + positions
+
+    def cut(self, cfgs):
+        if self.outer is None:
+            return self.defect.cut_defect(cfgs, buffer=self.buffer)
+        shift = self.outer.buffer - self.buffer
+        return cfgs[(slice(None), slice(None)) + (slice(shift, -shift),) * self.D +
+                    (slice(None), slice(None))]
+
+    def embed(self, small_cfgs, cfgs):
+        updated = sun.flat_links(small_cfgs, self.D).index_select(1, self.box_links)
+        return sun.flat_links(cfgs, self.D).index_copy(
+            1, self.target_links, updated
+        ).reshape(cfgs.shape)
 
 def create_around_defect_mask(D, dsize, buffer=2):
 

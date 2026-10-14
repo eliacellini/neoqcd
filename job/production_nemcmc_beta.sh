@@ -49,6 +49,8 @@ PRIOR_MCMC_STEPS=1
 UPDATES_PER_LAYER=1
 ORSTEPS=4
 EVAL_SAMPLES=128
+INT_MEAS="${INT_MEAS:-1}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 
 # -----------------------------
 # Logging / output
@@ -92,6 +94,8 @@ CMD=(
   --updates-per-layer "$UPDATES_PER_LAYER"
   --orsteps "$ORSTEPS"
   --eval-samples "$EVAL_SAMPLES"
+  --int-meas "$INT_MEAS"
+  --checkpoint-every "$CHECKPOINT_EVERY"
   --cfg-cache "$CFG_CACHE_MODE"
   --cfg-cache-dir "$CFG_CACHE_DIR"
   --cfg-cache-tag "$CFG_CACHE_TAG"

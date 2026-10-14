@@ -2,11 +2,57 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import numpy as np
+import os
+import tempfile
 from torch.nn.parallel import DistributedDataParallel as DDP
 from dataclasses import dataclass
 from typing import Optional, Sequence, Any
 from contextlib import nullcontext
  
+
+def _neorex_checkpoint_state(
+    payload, expected_smearing_version=..., expected_semantics=...
+):
+    """Unwrap a NEO-REX checkpoint and enforce map-changing semantics."""
+    if isinstance(payload, dict) and payload.get("checkpoint_format") == "neoqcd_neorex_flow":
+        if payload.get("format_version") not in (1, 2):
+            raise ValueError("unsupported NEO-REX flow checkpoint format version")
+        found = payload.get("smearing_jacobian_version")
+        if expected_smearing_version is not ... and found != expected_smearing_version:
+            raise ValueError(
+                "NEO-REX checkpoint smearing-Jacobian semantics do not match this flow "
+                f"(checkpoint={found!r}, flow={expected_smearing_version!r})"
+            )
+        if expected_semantics is not ...:
+            found_semantics = payload.get("semantic_config")
+            if found_semantics != expected_semantics:
+                if expected_semantics is not None and found_semantics is None:
+                    raise ValueError(
+                        "NEO-REX checkpoint lacks verifiable map semantics for this flow; "
+                        "save it again with the current version"
+                    )
+                raise ValueError(
+                    "NEO-REX checkpoint mathematical semantics do not match this flow "
+                    f"(checkpoint={found_semantics!r}, flow={expected_semantics!r})"
+                )
+        state = payload.get("state_dict")
+        if not isinstance(state, dict):
+            raise ValueError("NEO-REX flow checkpoint has no state_dict")
+        return state
+
+    if expected_smearing_version not in (..., None):
+        raise ValueError(
+            "classic smearing flow checkpoints must declare their full Haar Jacobian "
+            "semantics; this checkpoint is an unversioned state_dict"
+        )
+    if expected_semantics not in (..., None):
+        raise ValueError(
+            "NEO-REX checkpoint lacks verifiable map semantics for this flow; "
+            "save it again with the current version"
+        )
+    return payload
+
+
  ####################################################################
 ############# Vanilla Parallel Tempering (PT) ######################
  ####################################################################
@@ -1502,14 +1548,61 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         )
 
     def save_flow(self, path: str):
+        error = [None]
         if self.rank == 0:
-            torch.save(self.ddp_flow.module.state_dict(), path)
+            temporary_path = None
+            try:
+                state = self.ddp_flow.module.state_dict()
+                nf_layer = getattr(self.flow, "nf_layer", None)
+                jacobian_version = getattr(nf_layer, "smearing_jacobian_version", None)
+                if nf_layer is None or not hasattr(nf_layer, "smearing_jacobian_version"):
+                    payload = state
+                else:
+                    payload = {
+                        "checkpoint_format": "neoqcd_neorex_flow",
+                        "format_version": 2,
+                        "smearing_jacobian_version": jacobian_version,
+                        "state_dict": state,
+                    }
+                    if hasattr(nf_layer, "checkpoint_semantics"):
+                        payload["semantic_config"] = nf_layer.checkpoint_semantics
+                path = os.fspath(path)
+                directory = os.path.dirname(os.path.abspath(path))
+                os.makedirs(directory, exist_ok=True)
+                fd, temporary_path = tempfile.mkstemp(
+                    prefix=".neorex-flow-", suffix=".tmp", dir=directory
+                )
+                os.close(fd)
+                torch.save(payload, temporary_path)
+                os.replace(temporary_path, path)
+            except Exception as exc:
+                error[0] = f"{type(exc).__name__}: {exc}"
+            finally:
+                if temporary_path is not None and os.path.exists(temporary_path):
+                    try:
+                        os.unlink(temporary_path)
+                    except OSError:
+                        pass
+        dist.broadcast_object_list(error, src=0)
+        if error[0] is not None:
+            raise RuntimeError(f"failed to save NEO-REX flow checkpoint: {error[0]}")
 
     def load_flow(self, path: str):
+        error = [None]
         if self.rank == 0:
-            map_loc = {"cpu": "cpu"} if self.device.type == "cpu" else None
-            state = torch.load(path, map_location=map_loc)
-            self.ddp_flow.module.load_state_dict(state)
+            try:
+                map_loc = {"cpu": "cpu"} if self.device.type == "cpu" else None
+                payload = torch.load(path, map_location=map_loc)
+                nf_layer = getattr(self.flow, "nf_layer", None)
+                expected = getattr(nf_layer, "smearing_jacobian_version", ...)
+                expected_semantics = getattr(nf_layer, "checkpoint_semantics", ...)
+                state = _neorex_checkpoint_state(payload, expected, expected_semantics)
+                self.ddp_flow.module.load_state_dict(state)
+            except Exception as exc:
+                error[0] = f"{type(exc).__name__}: {exc}"
+        dist.broadcast_object_list(error, src=0)
+        if error[0] is not None:
+            raise RuntimeError(f"failed to load NEO-REX flow checkpoint: {error[0]}")
         for p in self.ddp_flow.parameters():
             dist.broadcast(p.data, src=0)
 

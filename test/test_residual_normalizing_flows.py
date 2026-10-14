@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import neoqcd.sun_utils as sun
 from neoqcd.flow import FlowPars
-from neoqcd.smearing import ResidualNormalizingFlows, generate_coefficients, generate_expQ, otimes
+import neoqcd.smearing as smearing_module
+from neoqcd.smearing import ResidualNormalizingFlows, Smearing, generate_coefficients, generate_expQ, otimes
 from neoqcd.utils import create_mask
 
 
@@ -69,6 +71,39 @@ def build_layer(batch_size=1, coeff_init=1e-3, quadratic=True, include_imag=True
 
 
 class ResidualNormalizingFlowsTest(unittest.TestCase):
+    def test_standard_smearing_bypasses_checkpoint_without_grad(self):
+        smearing = Smearing.__new__(Smearing)
+        torch.nn.Module.__init__(smearing)
+        staple_calls = []
+        checkpoint_calls = []
+
+        class StapleCalled(Exception):
+            pass
+
+        def compute_staples(*args):
+            staple_calls.append(args)
+            raise StapleCalled
+
+        def fake_checkpoint(function, *args, **kwargs):
+            checkpoint_calls.append(kwargs)
+            return function(*args)
+
+        smearing.compute_staples = compute_staples
+        with patch.object(smearing_module.checkpoint, "checkpoint", fake_checkpoint):
+            with torch.no_grad(), self.assertRaises(StapleCalled):
+                smearing.stout_smearing(None, 0, None)
+            self.assertEqual(len(staple_calls), 1)
+            self.assertEqual(checkpoint_calls, [])
+
+            staple_calls.clear()
+            with torch.enable_grad(), self.assertRaises(StapleCalled):
+                smearing.stout_smearing(None, 0, None)
+            self.assertEqual(len(staple_calls), 1)
+            self.assertEqual(
+                checkpoint_calls,
+                [{"use_reentrant": False, "preserve_rng_state": False}],
+            )
+
     def test_residual_has_no_complex_buffers_for_nccl_ddp(self):
         layer, _ = build_layer(batch_size=1)
         complex_buffers = [name for name, buf in layer.named_buffers() if torch.is_complex(buf)]

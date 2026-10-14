@@ -2,6 +2,8 @@ import torch
 import torch.utils.checkpoint as checkpoint
 import numpy as np
 import neoqcd.sun_utils as sun
+from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
+from neoqcd.smearing_jacobian import StepQuantities, exp_coefficients, smearing_step
 from neoqcd.nn import HTCNN
 from neoqcd.utils import set_defect_rho_from_fits
 
@@ -57,6 +59,16 @@ def compute_d2expQdQ2(id, B1, B2, Q, Q2, dB1dQ, dB2dQ, df1dQ, df2dQ, f2):
     return M
 
 def generate_coefficients(Q, Q2, id, oidid, oidQ, device, backward = False):
+    if not backward:
+        c0 = (Q * Q2.mT).sum((-2, -1)).real / 3.0
+        c1 = 0.5 * sun.SUN_trace(Q2).real
+        f, b1, b2 = exp_coefficients(c0, c1)
+        f0, f1, f2 = (f[..., i, None, None] for i in range(3))
+        B1 = sum(b1[..., i, None, None] * (id if i == 0 else Q if i == 1 else Q2) for i in range(3))
+        B2 = sum(b2[..., i, None, None] * (id if i == 0 else Q if i == 1 else Q2) for i in range(3))
+        d2expQdQ2 = torch.zeros_like(Q).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return f0, f1, f2, B1, B2, d2expQdQ2
+
     c0 = sun.SUN_determinant(Q)
     c1 = .5 * sun.SUN_trace(Q2)
     c0max = 2.0*(c1/3.0)**1.5
@@ -314,7 +326,7 @@ class HyperSmearing(torch.nn.Module):
         self.rho_shape = tuple(flow_pars.rho_shape)
         self.smearing_steps = int(flow_pars.smearing_steps_per_layer)
         self.n_m = int(2 * self.D)
-        self.n_pl = int(self.D * (self.D - 1) // 2)
+        self.n_pl = int(max(2 * (self.D - 1), self.D * (self.D - 1) // 2))
         self.normalize_by_nstep = bool(getattr(flow_pars, "hyper_normalize_by_nstep", True))
         self.rho_eps = float(getattr(flow_pars, "hyper_rho_eps", 0.0))
         self.scale_by_delta = bool(getattr(flow_pars, "hyper_scale_by_delta", False))
@@ -446,21 +458,24 @@ class HyperSmearing(torch.nn.Module):
 
     def _expand_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
         # coeffs shape: (smearing_steps, coeffs_per_step) or (batch, smearing_steps, coeffs_per_step)
+        spatial_rank = len(self.rho_shape) - 3
         if coeffs.dim() == 2:
             if self.mode == "shared":
-                return coeffs.view(self.smearing_steps, 1, 1, 1, 1, 1, 1).expand(self.rho_shape)
+                view = (self.smearing_steps,) + (1,) * (len(self.rho_shape) - 1)
+                return coeffs.view(view).expand(self.rho_shape)
             if self.mode == "per_link":
-                return coeffs.view(self.smearing_steps, self.n_m, self.n_pl, 1, 1, 1, 1).expand(self.rho_shape)
+                view = (self.smearing_steps, self.n_m, self.n_pl) + (1,) * spatial_rank
+                return coeffs.view(view).expand(self.rho_shape)
             return torch.einsum("sc,c...->s...", coeffs, self.class_masks)
 
         if coeffs.dim() == 3:
             bsz = int(coeffs.shape[0])
             if self.mode == "shared":
-                return coeffs.view(bsz, self.smearing_steps, 1, 1, 1, 1, 1, 1).expand((bsz,) + self.rho_shape)
+                view = (bsz, self.smearing_steps) + (1,) * (len(self.rho_shape) - 1)
+                return coeffs.view(view).expand((bsz,) + self.rho_shape)
             if self.mode == "per_link":
-                return coeffs.view(
-                    bsz, self.smearing_steps, self.n_m, self.n_pl, 1, 1, 1, 1
-                ).expand((bsz,) + self.rho_shape)
+                view = (bsz, self.smearing_steps, self.n_m, self.n_pl) + (1,) * spatial_rank
+                return coeffs.view(view).expand((bsz,) + self.rho_shape)
             return torch.einsum("bsc,c...->bs...", coeffs, self.class_masks)
 
         raise ValueError(f"Unsupported coeffs shape {tuple(coeffs.shape)}")
@@ -486,11 +501,9 @@ class HyperSmearing(torch.nn.Module):
         if self.mode == "class":
             active_base = (self.class_masks.sum(dim=0, keepdim=True) > 0).to(dtype=rho.dtype)
             if rho.dim() == len(self.rho_shape):
-                active_mask = active_base.expand(self.smearing_steps, -1, -1, -1, -1, -1, -1)
+                active_mask = active_base.expand_as(rho)
             else:
-                active_mask = active_base.unsqueeze(0).expand(
-                    rho.shape[0], self.smearing_steps, -1, -1, -1, -1, -1, -1
-                )
+                active_mask = active_base.unsqueeze(0).expand_as(rho)
         else:
             active_mask = None
         if self.rho_max > 0.0:
@@ -593,13 +606,15 @@ class ResidualNormalizingFlows(torch.nn.Module):
     Gradient-based residual SU(3) coupling flow.
 
     The implemented local potential is polynomial in the real/imaginary traces
-    of oriented plaquettes containing the active link:
+    of oriented loops containing the active link:
 
         phi = lin_i z_i + 1/2 H_ij z_i z_j
 
     The forward map uses the explicit gradient of this potential and an exact
     local tangent-space Jacobian. Hypernetwork coefficients depend globally on
     beta, while delta_beta multiplies the exponential generator.
+    Optional frozen-link convolutions extend the plaquette paths without
+    introducing dependence on other active links.
     """
 
     def __init__(self, flow_pars, time=1.0):
@@ -617,6 +632,19 @@ class ResidualNormalizingFlows(torch.nn.Module):
         self.include_imag = bool(getattr(flow_pars, "residual_include_imag", True))
         self.use_quadratic = bool(getattr(flow_pars, "residual_quadratic", True))
         self.coeff_max = float(getattr(flow_pars, "residual_coeff_max", 0.0))
+        n_pt_value = getattr(flow_pars, "residual_n_pt", 0)
+        mask_mod_value = getattr(flow_pars, "residual_mask_mod", 2)
+        try:
+            self.n_pt = int(n_pt_value)
+            self.mask_mod = int(mask_mod_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("residual_n_pt and residual_mask_mod must be integers") from exc
+        if self.n_pt != n_pt_value or self.mask_mod != mask_mod_value:
+            raise ValueError("residual_n_pt and residual_mask_mod must be integers")
+        if self.n_pt < 0:
+            raise ValueError("residual_n_pt must be non-negative")
+        if self.mask_mod not in (2, 4):
+            raise ValueError("residual_mask_mod must be 2 or 4")
 
         self.n_oriented_plaquettes = 2 * (self.D - 1)
         self.n_features = self.n_oriented_plaquettes * (2 if self.include_imag else 1)
@@ -627,6 +655,16 @@ class ResidualNormalizingFlows(torch.nn.Module):
         # Keep this constant out of buffers: NCCL DDP cannot broadcast ComplexDouble buffers.
         self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
         coeff_init = float(getattr(flow_pars, "residual_coeff_init", getattr(flow_pars, "hyper_rho_init", 1e-3)))
+        if self.n_pt:
+            eta_init = 0.01 / (2.0 * max(1, self.D - 1))
+            self.conv_eta = torch.nn.Parameter(
+                torch.full(
+                    (self.steps, self.n_pt, self.D, self.D - 1),
+                    eta_init,
+                    dtype=torch.float64,
+                    device=flow_pars.device,
+                )
+            )
         if self.parameterization == "static":
             self.static_linear = torch.nn.Parameter(
                 torch.full((self.steps, self.n_features), coeff_init, dtype=torch.float64, device=flow_pars.device)
@@ -808,7 +846,62 @@ class ResidualNormalizingFlows(torch.nn.Module):
             cols.append(self._tangent_coordinates(delta_U_out, U_out))
         return torch.stack(cols, dim=-1)
 
-    def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0):
+    def _runtime_mask(self, mask, cfgs):
+        lattice_shape = tuple(cfgs.shape[2:-2])
+        if len(lattice_shape) != self.D:
+            raise ValueError(
+                f"configuration lattice has {len(lattice_shape)} dimensions, expected {self.D}"
+            )
+        if self.mask_mod == 2:
+            if mask.shape[0] != 2 * self.D:
+                raise ValueError(
+                    f"residual mask has leading dimension {mask.shape[0]}, expected {2 * self.D}"
+                )
+            if self.n_pt and any(size % self.mask_mod for size in lattice_shape):
+                raise ValueError(
+                    "residual_n_pt > 0 with residual_mask_mod=2 requires even periodic lattice extents"
+                )
+            return mask
+
+        if any(size % self.mask_mod for size in lattice_shape):
+            raise ValueError(
+                "residual_mask_mod=4 requires every periodic lattice extent to be divisible by 4"
+            )
+        coords = torch.zeros(lattice_shape, dtype=torch.long, device=cfgs.device)
+        for axis, size in enumerate(lattice_shape):
+            view = [1] * self.D
+            view[axis] = size
+            coords = coords + torch.arange(size, device=cfgs.device).view(view)
+        colors = coords.remainder(self.mask_mod)
+        runtime_mask = torch.zeros(
+            (self.mask_mod * self.D, 1, self.D, *lattice_shape, 1, 1),
+            dtype=mask.dtype,
+            device=cfgs.device,
+        )
+        for mu in range(self.D):
+            for color in range(self.mask_mod):
+                runtime_mask[color + self.mask_mod * mu, 0, mu] = (colors == color).unsqueeze(-1).unsqueeze(-1)
+        return runtime_mask
+
+    def _frozen_convolution(self, values, step, point):
+        # Staple helpers run opposite to a link; their daggers are link-like.
+        eta = self.conv_eta[int(step), int(point)].to(dtype=values.real.dtype, device=values.device)
+        values_next = values.clone()
+        for mu in range(self.D):
+            update = torch.zeros_like(values[:, mu])
+            nu_index = 0
+            for nu in range(self.D):
+                if nu == mu:
+                    continue
+                update = update + eta[mu, nu_index] * (
+                    sun.SUN_dagger(sun.pstaple(values, mu, nu, self.D))
+                    + sun.SUN_dagger(sun.nstaple(values, mu, nu, self.D))
+                )
+                nu_index += 1
+            values_next[:, mu] = values[:, mu] + update
+        return values_next
+
+    def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0, current_mask=None):
         bs = int(cfgs.shape[0])
         real_dtype = cfgs.real.dtype
         lin_all, quad_all, delta_v = self._coefficients(beta, delta_beta, bs, real_dtype, cfgs.device)
@@ -822,7 +915,15 @@ class ResidualNormalizingFlows(torch.nn.Module):
             detjac = torch.ones(U.shape[:-2], dtype=real_dtype, device=cfgs.device)
             return U.clone(), detjac, jac
 
-        staples = self._oriented_staples(cfgs, mu)
+        if self.n_pt:
+            if current_mask is None:
+                raise ValueError("current_mask is required for residual_n_pt > 0")
+            values = (1.0 - current_mask) * cfgs
+            for point in range(self.n_pt):
+                values = self._frozen_convolution(values, step, point)
+            staples = self._oriented_staples(values, mu)
+        else:
+            staples = self._oriented_staples(cfgs, mu)
         features = self._features(staples, U)
         weights = self._feature_weights(features, lin, quad)
         C = self._staple_sum(staples, weights, delta_v)
@@ -843,18 +944,23 @@ class ResidualNormalizingFlows(torch.nn.Module):
         return U_out, detjac, jac
 
     def forward(self, cfgs, mask, dmasking=False, dmask=None, beta=None, delta_beta=None):
+        if dmasking and (self.n_pt or self.mask_mod != 2):
+            raise ValueError(
+                "cropped/dmasking residual layers require residual_n_pt=0 and residual_mask_mod=2"
+            )
         real_dtype = cfgs.real.dtype
+        mask = self._runtime_mask(mask, cfgs)
         ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
         dims = tuple(np.arange(1, self.D + 2))
 
         for sm in range(self.steps):
             for mu in range(self.D):
-                for eo in range(2):
+                for eo in range(self.mask_mod):
                     if dmasking:
-                        current_mask = mask[eo + mu * 2, :] * dmask
+                        current_mask = mask[eo + mu * self.mask_mod, :] * dmask
                     else:
-                        current_mask = mask[eo + mu * 2, :]
+                        current_mask = mask[eo + mu * self.mask_mod, :]
 
                     U_new, jac, _ = self.residual_update_mu(
                         cfgs,
@@ -862,6 +968,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
                         beta=beta,
                         delta_beta=delta_beta,
                         step=sm,
+                        current_mask=current_mask,
                     )
                     cfgs_new = cfgs.clone()
                     cfgs_new[:, mu] = U_new
@@ -880,9 +987,7 @@ class ResidualCouplingLayer(torch.nn.Module):
     """
     Standard full-lattice SNF coupling layer backed by ResidualNormalizingFlows.
 
-    Flow stores logJ with the old smearing convention and later multiplies it by
-    two. ResidualNormalizingFlows returns the real tangent-space logdet directly,
-    so this adapter returns half of it.
+    Both smearing implementations return the full Haar logdet.
     """
 
     def __init__(self, flow_pars, rho_layer, time):
@@ -900,15 +1005,16 @@ class ResidualCouplingLayer(torch.nn.Module):
             beta=beta,
             delta_beta=delta_beta,
         )
-        return cfgs, dQ, 0.5 * dlogJ
+        return cfgs, dQ, dlogJ
 
 
 class CouplingLayer(torch.nn.Module):
     def __init__(self, flow_pars, rho_layer, time):
         super().__init__()
         self.fit_train = flow_pars.fit_train
+        self.use_rho_functional = bool(getattr(flow_pars, "use_rho_functional", False))
         self.use_hyper_smearing = bool(getattr(flow_pars, "use_hyper_smearing", False))
-        if self.fit_train == 0 and not self.use_hyper_smearing:
+        if self.fit_train == 0 and not self.use_hyper_smearing and not self.use_rho_functional:
             self.rho_layer = torch.nn.Parameter(rho_layer)
         else:
             # Keep attribute for compatibility with diagnostics code paths.
@@ -918,7 +1024,9 @@ class CouplingLayer(torch.nn.Module):
         #self.register_buffer('time',self.smearing.t)
 
     def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
-        if self.smearing.use_hyper_smearing:
+        if self.use_rho_functional:
+            rho_r = rho_layer
+        elif self.smearing.use_hyper_smearing:
             rho_r = None
         elif self.fit_train == 0:
             rho_r = self.rho_layer
@@ -937,7 +1045,9 @@ class DefectCouplingLayer(CouplingLayer):
         super().__init__(flow_pars, rho_layer, time)
     
     def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
-        if self.smearing.use_hyper_smearing:
+        if self.use_rho_functional:
+            rho_r = rho_layer
+        elif self.smearing.use_hyper_smearing:
             rho_r = None
         elif self.fit_train == 0:
             rho_r = self.rho_layer
@@ -973,6 +1083,8 @@ class Smearing(torch.nn.Module):
         self.smearing_steps_per_layer = flow_pars.smearing_steps_per_layer   
         self.fit_train = flow_pars.fit_train
         self.use_hyper_smearing = bool(getattr(flow_pars, "use_hyper_smearing", False))
+        self.explicit_backward = bool(getattr(flow_pars, "explicit_backward", False))
+        self._smearing_links_cache = sun.masked_links_cache_for(flow_pars)
 
         if self.use_hyper_smearing:
             self.hyper_smearing = HyperSmearing(flow_pars, time)
@@ -988,7 +1100,6 @@ class Smearing(torch.nn.Module):
 
     def forward(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
         real_dtype = cfgs.real.dtype
-        ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         bs = cfgs.shape[0]
         dlogJ = torch.zeros(bs, dtype=real_dtype, device=cfgs.device)
         dims = tuple(np.arange(1,self.D+2))
@@ -1014,29 +1125,130 @@ class Smearing(torch.nn.Module):
                     f"Batched hyper-smearing rho has leading dim {n_rho}, expected {bs}"
                 )
 
+        use_selected_links = self.N == 3 and not self.use_nn
+        selected_links = (
+            self._links_for_smearing_mask(mask, dmask if dmasking else None)
+            if use_selected_links else None
+        )
+        flat = sun.flat_links(cfgs, self.D) if use_selected_links else None
+        cfg_shape = tuple(cfgs.shape)
+
         for sm in range(self.smearing_steps_per_layer):
             for mu in range(self.D):
                 for eo in range(2):
-                    #Select only the relevant links of the small lattice
-                    if dmasking:
-                        current_mask = mask[eo+mu*2,:] * dmask
-                    else:
-                        current_mask = mask[eo+mu*2,:]
+                    m = eo + mu * 2
 
                     if self.use_hyper_smearing:
                         if batched_rho:
-                            rho = rho_runtime[:, sm, eo + mu * 2, :]
+                            rho = rho_runtime[:, sm, m, :]
                         else:
-                            rho = rho_runtime[sm, eo + mu * 2, :]
+                            rho = rho_runtime[sm, m, :]
                     else:
-                        rho = torch.abs(rho_runtime[sm,eo+mu*2,:])
+                        rho = torch.abs(rho_runtime[sm, m, :])
+
+                    if use_selected_links:
+                        sites = selected_links.sites[m]
+                        if sites.numel() == 0:
+                            continue
+
+                        def selected_staples(flat_cfgs, rho_value, m=m, links=selected_links, cfg_shape=cfg_shape):
+                            return self._selected_stout_staples(
+                                flat_cfgs, cfg_shape, links, m, rho_value
+                            )
+
+                        if torch.is_grad_enabled():
+                            C = checkpoint.checkpoint(
+                                selected_staples,
+                                flat,
+                                rho,
+                                use_reentrant=False,
+                                preserve_rng_state=False,
+                            )
+                        else:
+                            C = selected_staples(flat, rho)
+                        U = flat.index_select(1, selected_links.links[m])
+                        step = ExactSmearingStep.apply if self.explicit_backward else smearing_step
+                        U_out, logdet = step(U, C)
+                        flat = flat.index_copy(1, selected_links.links[m], U_out)
+                        dlogJ = dlogJ + logdet.sum(dim=1)
+                        continue
+
+                    # SU(2) keeps the legacy full-lattice implementation; upstream's selected
+                    # exact Jacobian is specifically the SU(3) stout path.
+                    current_mask = mask[m, :] * dmask if dmasking else mask[m, :]
 
                     cfgs_new, jac = self.stout_smearing(cfgs, mu, rho)
                     cfgs = current_mask * cfgs_new + (1-current_mask) * cfgs
-                    masked_jac = current_mask.squeeze(-1).squeeze(-1) * jac + (1-current_mask.squeeze(-1).squeeze(-1)) * ones
-                    jac = torch.log(torch.clamp(masked_jac, min=1e-12))
-                    dlogJ += torch.sum(jac, dims)
+                    ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
+                    active = current_mask.squeeze(-1).squeeze(-1)
+                    if self.N == 3:
+                        dlogJ += torch.sum(active * jac.squeeze(1), dims)
+                    else:
+                        masked_jac = active * jac + (1 - active) * ones
+                        dlogJ += torch.sum(torch.log(torch.clamp(masked_jac, min=1e-12)), dims)
+        if use_selected_links:
+            cfgs = flat.reshape(cfg_shape)
         return cfgs, 0, dlogJ
+
+    def _links_for_smearing_mask(self, mask, dmask=None):
+        return self._smearing_links_cache.get(mask, self.D, dmask)
+
+    def _rho_at_sites(self, rho, channel, sites, batch_size, lattice_shape):
+        rho = rho.to(device=sites.device)
+        nsites = int(sites.numel())
+        if self.rho_shape_type == 0:
+            values = rho.reshape(-1)
+            if values.numel() == 1:
+                return values.reshape(1, 1).expand(batch_size, nsites)
+            if values.numel() == batch_size:
+                return values.reshape(batch_size, 1).expand(batch_size, nsites)
+            raise ValueError(f"Unsupported isotropic rho shape {tuple(rho.shape)} for batch={batch_size}")
+        if self.rho_shape_type == 1:
+            nslots = max(2 * (self.D - 1), self.D * (self.D - 1) // 2)
+            if rho.numel() == nslots:
+                return rho.reshape(nslots)[channel].reshape(1, 1).expand(batch_size, nsites)
+            if rho.numel() == batch_size * nslots:
+                return rho.reshape(batch_size, nslots)[:, channel].reshape(batch_size, 1).expand(batch_size, nsites)
+            raise ValueError(f"Unsupported anisotropic rho shape {tuple(rho.shape)} for batch={batch_size}")
+        if self.rho_shape_type not in (2, 3):
+            raise ValueError(f"Unknown rho_shape_type {self.rho_shape_type}")
+
+        spatial_ndim = len(lattice_shape)
+        if rho.dim() == spatial_ndim + 1:
+            if rho.shape[0] <= channel or tuple(rho.shape[1:]) != tuple(lattice_shape):
+                raise ValueError(f"General rho shape {tuple(rho.shape)} does not match lattice {lattice_shape}")
+            values = rho[channel].reshape(-1).index_select(0, sites).reshape(1, nsites)
+            return values.expand(batch_size, nsites)
+        if rho.dim() == spatial_ndim + 2:
+            if rho.shape[1] <= channel or tuple(rho.shape[2:]) != tuple(lattice_shape):
+                raise ValueError(f"Batched general rho shape {tuple(rho.shape)} does not match lattice {lattice_shape}")
+            rho_batch = rho.shape[0]
+            if rho_batch == 1 and batch_size > 1:
+                values = rho[:, channel].expand(batch_size, *lattice_shape)
+            elif rho_batch == batch_size:
+                values = rho[:, channel]
+            else:
+                raise ValueError(f"General rho batch={rho_batch}, expected 1 or {batch_size}")
+            return values.reshape(batch_size, -1).index_select(1, sites)
+        raise ValueError(f"Unsupported general rho shape {tuple(rho.shape)}")
+
+    def _selected_stout_staples(self, flat, cfg_shape, links, m, rho):
+        mu = m // 2
+        batch_size = int(cfg_shape[0])
+        lattice_shape = tuple(cfg_shape[2:-2])
+        sites = links.sites[m]
+        staples = torch.zeros(
+            (batch_size, int(sites.numel()), self.N, self.N), dtype=flat.dtype, device=flat.device
+        )
+        other_directions = [nu for nu in range(self.D) if nu != mu]
+        for indices, nu in zip(links.staple_links[m], other_directions):
+            upper, lower = sun.staples_at(flat, indices)
+            pidx = 2 * sun.plaq_index(self.D, mu, nu)
+            positive = self._rho_at_sites(rho, pidx, sites, batch_size, lattice_shape)
+            negative = self._rho_at_sites(rho, pidx + 1, sites, batch_size, lattice_shape)
+            staples = staples + positive[..., None, None] * sun.SUN_dagger(upper)
+            staples = staples + negative[..., None, None] * sun.SUN_dagger(lower)
+        return staples
 
     def stout_smearing(self, cfgs, mu, rho):
         #C = stout_staples(cfgs, mu, D, rho)
@@ -1053,6 +1265,11 @@ class Smearing(torch.nn.Module):
             C = self.compute_staples(cfgs, mu, rho)
     
         U = cfgs[:,mu]
+        if self.N == 3:
+            step = ExactSmearingStep.apply if self.explicit_backward else smearing_step
+            U_out, logdet = step(U, C)
+            return U_out.unsqueeze(1), logdet.unsqueeze(1)
+
         id = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
         N = U.shape[-1]
         omega = generate_omega(C, U)
@@ -1121,10 +1338,10 @@ class Smearing(torch.nn.Module):
                 elif self.rho_shape_type == 2 or self.rho_shape_type == 3:
                     pidx = 2 * sun.plaq_index(self.D, mu, nu)
                     nidx = pidx + 1
-                    if rho.dim() == 5:
+                    if rho.dim() == self.D + 1:
                         prho_mul = rho[pidx].unsqueeze(-1).unsqueeze(-1)
                         nrho_mul = rho[nidx].unsqueeze(-1).unsqueeze(-1)
-                    elif rho.dim() == 6:
+                    elif rho.dim() == self.D + 2:
                         prho_mul = rho[:, pidx].unsqueeze(-1).unsqueeze(-1)
                         nrho_mul = rho[:, nidx].unsqueeze(-1).unsqueeze(-1)
                     else:
@@ -1208,6 +1425,12 @@ class Smearing(torch.nn.Module):
 
 
 class SmearingStep(torch.autograd.Function):
+    """Legacy `(U, C) -> (U', full Jacobian)` interface retained for compatibility.
+
+    The stable exact logdet implementation is exported as ``ExactSmearingStep`` and is used by
+    ``Smearing.stout_smearing`` for SU(3).
+    """
+
     @staticmethod
     def forward(U, C):
         id = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
@@ -1219,7 +1442,7 @@ class SmearingStep(torch.autograd.Function):
         oidid = otimes(id, id)
         oidQ = otimes(id, Q) + otimes(Q, id)
 
-        f0, f1, f2, B1, B2, _ = generate_coefficients(Q, Q2, id, oidid, oidQ, backward=False)
+        f0, f1, f2, B1, B2, _ = generate_coefficients(Q, Q2, id, oidid, oidQ, U.device, backward=False)
         expQ = generate_expQ(Q, Q2, id, f0, f1, f2)
         dexpQdQ = generate_dexpQ_dQ(Q, Q2, B1, B2, f1, f2, id, oidid, oidQ)
 
@@ -1251,7 +1474,7 @@ class SmearingStep(torch.autograd.Function):
         oidid = otimes(id, id)
         oidQ = otimes(id, Q) + otimes(Q, id)
 
-        f0, f1, f2, B1, B2, d2expQdQ2 = generate_coefficients(Q, Q2, id, oidid, oidQ, backward=True)
+        f0, f1, f2, B1, B2, d2expQdQ2 = generate_coefficients(Q, Q2, id, oidid, oidQ, U.device, backward=True)
         expQ = generate_expQ(Q, Q2, id, f0, f1, f2)
         dexpQdQ = generate_dexpQ_dQ(Q, Q2, B1, B2, f1, f2, id, oidid, oidQ)
 
