@@ -165,6 +165,68 @@ class CNFNEOREXTest(unittest.TestCase):
             for key, value in reference.items():
                 torch.testing.assert_close(field_state[key], value, rtol=0, atol=0)
 
+    def test_defect_field_converts_to_the_neorex_smearing_layer(self):
+        spec = importlib.util.spec_from_file_location(
+            "convert_cnf_to_neorex_flow", ROOT / "main" / "convert_cnf_to_neorex_flow.py"
+        )
+        converter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(converter)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(
+                CONFIG, architecture="defect-hyper-smearing", T=4, L=6, time_slice=2, space_slice=2,
+                hidden_dim=8, depth=1, hyper_smearing_mode="per_link",
+            )
+            torch.manual_seed(11)
+            field, _, _ = build_cnf(config)
+            with torch.no_grad():
+                for parameter in field.smearing.hyper_smearing.mlp.parameters():
+                    parameter.add_(0.05 * torch.randn_like(parameter))
+            cnf_checkpoint = root / "cnf.pt"
+            save_cnf_checkpoint(cnf_checkpoint, field, config, epoch=7)
+            flags = [
+                "--cpu", "--algorithm", "neorex", "--D", "4", "--T", "4", "--L", "6", "--N", "3",
+                "--defect-size", "1", "--time-slice", "2", "--space-slice", "2",
+                "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
+                "--nf-layer-type", "smearing", "--use-hyper-smearing", "--hyper-smearing-mode", "per_link",
+                "--hyper-hidden-dim", "8", "--hyper-depth", "1",
+                "--hyper-scale-by-delta", "--hyper-no-normalize-by-nstep",
+                "--batch-size", "2", "--neorex-protocol-steps", "1",
+            ]
+            converted = converter.convert(cnf_checkpoint, root / "flow.pt", flags)
+            self.assertEqual(torch.load(converted, weights_only=True)["source_cnf_epoch"], 7)
+
+            mismatched = [*flags[:-1], "2"]
+            mismatched[mismatched.index("--hyper-hidden-dim") + 1] = "16"
+            with self.assertRaises(RuntimeError):
+                converter.convert(cnf_checkpoint, root / "bad.pt", mismatched)
+
+            argv = [
+                *flags, "--neorex-load-flow", str(converted), "--neorex-eval-flow",
+                "--thermal-steps", "0", "--steps", "1", "--orsteps", "0", "--no-cfg-cache",
+                "--output-dir", str(root / "run"), "--main-dir", str(root), "--neorex-save-flow", "auto",
+            ]
+            with mock.patch.object(sys, "argv", ["main_pt_obc", *argv]):
+                args = MAIN.parse_args()
+            init_file = root / "gloo_init"
+            init_file.touch()
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if os.uname().sysname == "Darwin" else "lo")
+            dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=0, world_size=1)
+            try:
+                MAIN.main(args)
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
+            # The evaluated (and re-saved) smearing layer carries the trained hypernetwork.
+            saved = torch.load(root / "data" / "neorex_flows" / "global.pt", map_location="cpu", weights_only=True)
+            prefix = "nf_layer.layer.smearing.hyper_smearing."
+            used = {k.removeprefix(prefix): v for k, v in saved["state_dict"].items() if k.startswith(prefix)}
+            reference = field.smearing.hyper_smearing.state_dict()
+            self.assertEqual(used.keys(), reference.keys())
+            for key, value in reference.items():
+                torch.testing.assert_close(used[key], value, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

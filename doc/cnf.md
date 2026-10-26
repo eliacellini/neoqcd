@@ -28,7 +28,9 @@ The drift uses traceless Hermitian projections of loop anti-Hermitian parts,
 gauge-invariant scalar/Gram features and SU(3) commutator channels. It is a
 minimal equivariant extension, not a complete basis of SU(3) invariants:
 symmetric `d_abc` channels and the second adjoint projection are not included.
-Haar divergence uses eight directional derivatives with the other links held
+Its time encoder sees the parameter rescaled to [0, 1] over the trained interval
+(`time_normalization: unit_interval` in new checkpoints; older ones keep the raw
+parameter). Haar divergence uses eight directional derivatives with the other links held
 fixed. On short periodic lattices, paths that reuse their target link are
 zeroed to preserve the validity of this diagonal derivative.
 
@@ -39,8 +41,17 @@ supported; `--rho-functional` selects functional smearing and
 `--hyper-smearing-mode per_link` selects anisotropic hyper-smearing.
 These fields are trained afresh: integrating them does **not** reproduce the
 old finite coupling maps or their discrete Jacobians. The legacy `use_nn`
-fixed-time 4D CNN and cropped defect networks are not exposed as CNF fields.
-Defect CNFs instead act on the full lattice, with the exact defect action.
+fixed-time 4D CNN is not exposed as a CNF field.
+
+`defect-hyper-smearing` is the infinitesimal generator of the NEO-REX defect
+coupling layer (`DefectCouplingLayer` with hyper-smearing): the same cropped
+patch (buffer 2), link selection, staples and `HyperSmearing(bc)` network, with
+rho evaluated at unit delta, i.e. per unit boundary coupling. Links outside the
+smeared patch have zero velocity. To first order in the step it equals the
+finite layer, so the trained network can be evaluated with that layer and its
+exact logdet (see below). It needs D=4, `T >= 4`, `L >= defect-size + 4` and a
+two-site buffer around the defect; `--hyper-smearing-mode` may be `shared`,
+`per_link` or `class`.
 
 ## Run
 
@@ -96,6 +107,32 @@ positive `--train-steps` is rejected because training belongs in the REX field
 runner. NEO-REX computes **full** action differences for this field rather than
 the cropped-layer halo shortcut. Portable CNF checkpoints are distinct from
 the wrapper's `--neorex-load-flow` checkpoints.
+
+### Evaluating a defect field with the smearing layer
+
+A `defect-hyper-smearing` field can instead be evaluated in NEO-REX with the
+finite smearing layer, which has an exact logdet. Copy its network into a
+NEO-REX flow checkpoint, passing the evaluation flags after `--`:
+
+```sh
+FLAGS=(--cpu --algorithm neorex --D 4 --T 4 --L 6 --N 3 --beta 6
+  --defect-size 1 --time-slice 2 --space-slice 2 --parameter-min 0 --parameter-max 1
+  --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode per_link
+  --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
+  --neorex-protocol-steps 2 --neorex-heatbath-steps-per-step 1 --batch-size 16)
+.sunenv/bin/python main/convert_cnf_to_neorex_flow.py results/cnf_defect/cnf_checkpoint.pt \
+  results/cnf_defect/neorex_flow.pt -- "${FLAGS[@]}"
+.sunenv/bin/torchrun --nnodes 1 --nproc_per_node 4 --master_addr 127.0.0.1 --master_port 29500 \
+  main/main_pt_obc.py "${FLAGS[@]}" --neorex-load-flow results/cnf_defect/neorex_flow.pt \
+  --neorex-eval-flow --output-dir results/cnf_defect/neorex
+```
+
+`--hyper-scale-by-delta --hyper-no-normalize-by-nstep` keep the trained
+convention (rho per unit BC, scaled by each protocol step). Geometry, hyper mode
+and network shape must match the field; the converter refuses a mismatch. Each
+protocol step applies rho(bc) * delta_bc with the parities updated in sequence:
+a finite discretization of the field, exact as a map, so step size affects
+efficiency but not the unbiasedness of the acceptance.
 
 ## Numerical limits and checks
 
