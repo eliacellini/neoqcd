@@ -46,7 +46,7 @@ def max_su3_error(U):
     return max(unit_err.item(), det_err.item())
 
 
-def build_layer(batch_size=1, coeff_init=1e-3, quadratic=True, include_imag=True):
+def build_layer(batch_size=1, coeff_init=1e-3, quadratic=True, include_imag=True, steps=1):
     torch.manual_seed(1234)
     D, T, L = 4, 4, 4
     mask = create_mask(D, T, L)
@@ -59,7 +59,7 @@ def build_layer(batch_size=1, coeff_init=1e-3, quadratic=True, include_imag=True
         protocol=[6.0],
         batch_size=batch_size,
         device=torch.device("cpu"),
-        smearing_steps_per_layer=1,
+        smearing_steps_per_layer=steps,
         hyper_time_embedding_dim=8,
         hyper_hidden_dim=12,
         hyper_depth=1,
@@ -109,6 +109,19 @@ class ResidualNormalizingFlowsTest(unittest.TestCase):
         complex_buffers = [name for name, buf in layer.named_buffers() if torch.is_complex(buf)]
 
         self.assertEqual(complex_buffers, [])
+
+    def test_each_substep_initializes_only_linear_coefficients(self):
+        for steps in (1, 2, 3):
+            for quadratic in (False, True):
+                with self.subTest(steps=steps, quadratic=quadratic):
+                    layer, _ = build_layer(steps=steps, quadratic=quadratic)
+                    linear, quad, _ = layer._coefficients(
+                        beta=torch.tensor([0.5], dtype=torch.double),
+                        delta_beta=torch.tensor([0.02], dtype=torch.double),
+                        batch_size=1, dtype=torch.double, device=torch.device("cpu"),
+                    )
+                    self.assertTrue(torch.equal(linear, torch.full_like(linear, 1e-3)))
+                    self.assertEqual(torch.count_nonzero(quad).item(), 0)
 
     def test_closed_form_exponential_lands_in_su3(self):
         layer, _ = build_layer(batch_size=1)

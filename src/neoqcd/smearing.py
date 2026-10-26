@@ -711,7 +711,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
             with torch.no_grad():
                 self.mlp[-1].weight.zero_()
                 self.mlp[-1].bias.zero_()
-                self.mlp[-1].bias[: self.steps * self.n_features].fill_(coeff_init)
+                self.mlp[-1].bias.view(self.steps, self.coeffs_per_step)[:, : self.n_features].fill_(coeff_init)
 
     def _fourier(self, beta):
         arg = beta.unsqueeze(-1) * self.freqs.unsqueeze(0)
