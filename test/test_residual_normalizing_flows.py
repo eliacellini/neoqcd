@@ -161,6 +161,31 @@ class ResidualNormalizingFlowsTest(unittest.TestCase):
         self.assertLess((y - x).abs().max().item(), 1e-12)
         self.assertLess(logdet.abs().max().item(), 1e-10)
 
+    def test_empty_batch_keeps_zero_parameter_gradients(self):
+        for parameterization, n_pt in (("hyper", 0), ("static", 0), ("hyper", 1), ("static", 1)):
+            with self.subTest(parameterization=parameterization, n_pt=n_pt):
+                pars = FlowPars(
+                    D=2, T=2, L=2, N=3, mask=create_mask(2, 2, 2),
+                    protocol=[1.0], batch_size=1, device="cpu",
+                    hyper_hidden_dim=4, hyper_depth=1,
+                    residual_parameterization=parameterization,
+                    residual_n_pt=n_pt,
+                )
+                layer = ResidualNormalizingFlows(pars)
+                x = torch.empty((0, 2, 2, 2, 3, 3), dtype=torch.cdouble)
+                parameter = torch.empty(0, dtype=torch.double)
+                y, _, logdet = layer(x, pars.mask, beta=parameter, delta_beta=parameter)
+
+                self.assertEqual(y.shape, x.shape)
+                self.assertEqual(logdet.shape, (0,))
+                # Inactive DDP ranks still participate through a zero loss.
+                loss = -logdet.sum() * 0.0
+                self.assertTrue(loss.requires_grad)
+                loss.backward()
+                for name, parameter in layer.named_parameters():
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.equal(parameter.grad, torch.zeros_like(parameter)), name)
+
     def test_delta_beta_sign_and_magnitude_are_sensible(self):
         layer, flow_pars = build_layer(batch_size=1, coeff_init=5e-3)
         x = random_su3(flow_pars.init_shape[:-1])

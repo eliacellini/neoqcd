@@ -952,6 +952,11 @@ class ResidualNormalizingFlows(torch.nn.Module):
         mask = self._runtime_mask(mask, cfgs)
         ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
+        if cfgs.shape[0] == 0:
+            # Inactive DDP ranks must accumulate zero gradients for every parameter.
+            for parameter in self.parameters():
+                dlogJ = dlogJ + parameter.sum() * 0.0
+            return cfgs, 0, dlogJ
         dims = tuple(np.arange(1, self.D + 2))
 
         for sm in range(self.steps):
