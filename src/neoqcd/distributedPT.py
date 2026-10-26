@@ -287,7 +287,7 @@ class ParallelTempering:
                 obs_i = observable_matrix[b_idx, node_i]
                 obs_j = observable_matrix[b_idx, node_j]
 
-                # Metropolis linear rule: ΔS = (λ_j - λ_i)(O_j - O_i)
+                # Log Metropolis ratio for S_λ = λ O: (λ_j - λ_i)(O_j - O_i).
                 delta_s = (lam_j - lam_i) * (obs_j - obs_i)
                 accept = delta_s >= torch.rand(self.B, device=self.device).log()
 
@@ -355,7 +355,7 @@ class ParallelTempering:
                 # Exact Metropolis swap test:
                 # ΔS = S(x_i, λ_j) + S(x_j, λ_i) - S(x_i, λ_i) - S(x_j, λ_j)
                 delta_s = (s_ij + s_ji) - (s_ii + s_jj)
-                accept = delta_s >= torch.rand(self.B, device=self.device).log()
+                accept = (-delta_s) >= torch.rand(self.B, device=self.device).log()
 
                 self.parameter_matrix[b_idx, node_i] = torch.where(accept, lam_j, lam_i)
                 self.parameter_matrix[b_idx, node_j] = torch.where(accept, lam_i, lam_j)

@@ -3,12 +3,13 @@ from itertools import product
 import os
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 import warnings
 
 import torch
 
 import neoqcd.sun_utils as sun
-from neoqcd.distributedPT import _neorex_checkpoint_state
+from neoqcd.distributedPT import ParallelTempering, _neorex_checkpoint_state
 from neoqcd.mcmc import HBOR, NEMCMC_update
 from neoqcd.smearing import Smearing, _su3_generators
 from neoqcd.smearing_jacobian import LOGDET_VERSION, SmearingStep, StepQuantities, smearing_step
@@ -73,6 +74,42 @@ class ExactSmearingTest(unittest.TestCase):
                 tangent_jacobian = torch.stack(columns, dim=-1)
                 tangent_logdet = torch.linalg.slogdet(tangent_jacobian).logabsdet
                 self.assertLess(abs(float(logdet.item() - tangent_logdet.item())), 1e-7)
+
+
+class ParallelTemperingAcceptanceTest(unittest.TestCase):
+    def test_exact_and_linear_accept_favorable_and_thresholded_swaps(self):
+        pt = object.__new__(ParallelTempering)
+        pt.rank, pt.world_size, pt.B = 0, 2, 4
+        pt.device, pt.param_dtype = torch.device("cpu"), torch.double
+        parameters = torch.tensor([0.0, 2.0], dtype=torch.double)
+        energies = (
+            torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.double),
+            torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.double),
+        )
+        actions = tuple(energy[:, None] * parameters[None, :] for energy in energies)
+        # Delta S is (-2, 0, 2, 2); the last two swaps straddle exp(-2).
+        uniforms = torch.tensor([0.999, 0.999, 0.5, 0.1], dtype=torch.double)
+        expected = torch.tensor([[2.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 0.0]], dtype=torch.double)
+
+        for rule in ("exact", "linear"):
+            with self.subTest(rule=rule):
+                pt.parameter_matrix = parameters.expand(pt.B, -1).clone()
+                payload = actions if rule == "exact" else energies
+
+                def gather(local, gather_list, dst):
+                    for output, source in zip(gather_list, payload):
+                        output.copy_(source)
+
+                attempt = pt._attempt_swaps_exact_actions if rule == "exact" else pt._attempt_swaps_linear_observable
+                with patch("neoqcd.distributedPT.dist.gather", side_effect=gather), patch(
+                    "neoqcd.distributedPT.torch.rand", return_value=uniforms
+                ):
+                    stats = attempt(payload[0], "even")
+
+                self.assertTrue(torch.equal(pt.parameter_matrix, expected))
+                self.assertEqual(stats["n_accepted"], 3)
+                self.assertEqual(stats["n_proposed"], 4)
+                self.assertEqual(stats["link_accepted"], [3])
 
 
 class GroupAndActionTest(unittest.TestCase):
