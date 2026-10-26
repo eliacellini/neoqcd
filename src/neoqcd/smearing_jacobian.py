@@ -327,6 +327,15 @@ def smearing_step(U, C):
     logdet = torch.linalg.slogdet(jacobian_matrix(stepq.jacobian())).logabsdet
     return stepq.Up, logdet
 
+def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100):
+    # Inverse of smearing_step at fixed staple sums C, by the fixed-point iteration of
+    # sun.invert_left_update. Returns U, the log|det| of the inverse map (minus the forward one at U),
+    # the number of iterations and the largest residual |exp(iQ) U - Up|.
+    U, iterations, residual = sun.invert_left_update(
+        lambda V: StepQuantities(V, C).X, Up, tol=tol, max_iter=max_iter
+    )
+    return U, -smearing_step(U, C)[1], iterations, residual
+
 # ----------------------------------------------------------------------------------------------
 # Explicit backward, see notes/stout_smearing_backward.tex. Gradients follow the PyTorch convention
 # for real losses L of complex Z: G_Z = dL/dRe Z + i dL/dIm Z, i.e. dL = Re Tr(G_Z^dagger dZ).

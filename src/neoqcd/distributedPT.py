@@ -759,6 +759,13 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             work = torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
             return x_curr, work
 
+        # MCMC at both ends makes the protocol a palindrome, so the partner's
+        # protocol is the time reversal of this one (detailed balance of the swap).
+        if n_mcmc > 0:
+            self.set_parameter(mcmc, start_parameters)
+            x_updated = mcmc(x_curr, nsteps=n_mcmc, ensembles=False, use_tqdm=False)
+            x_curr = torch.where(active_view, x_updated, x_curr)
+
         for n in range(n_protocol):
             lambda_0 = n / n_protocol
             lambda_1 = (n + 1) / n_protocol
@@ -864,6 +871,25 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         return accept_uint8.to(dtype=torch.bool), stats
 
 
+def _protocol_points(start: torch.Tensor, target: torch.Tensor, n_steps: int) -> list[torch.Tensor]:
+    """
+    The n_steps + 1 protocol parameters from start to target, per chain.
+
+    They are computed from the ordered endpoints, so a chain going down visits bitwise the same
+    points as its partner going up, and each down step can apply the exact inverse of the
+    corresponding up step.
+    """
+    low, high = torch.minimum(start, target), torch.maximum(start, target)
+    down = target < start
+    points = []
+    for n in range(n_steps + 1):
+        up_point = low + (n / n_steps) * (high - low)
+        down_point = low + ((n_steps - n) / n_steps) * (high - low)
+        points.append(torch.where(down, down_point, up_point))
+    points[0], points[-1] = start, target
+    return points
+
+
 @dataclass
 class NEOREXConfig(OREXPTConfig):
     flow_lr: float = 1e-3
@@ -877,9 +903,13 @@ class NEOREXProtocolWrapper(nn.Module):
     Shared stochastic normalizing-flow protocol wrapper for NEO-REX.
 
     The wrapped deterministic NF layer is reused at every internal protocol
-    step. Each deterministic block can be followed by stochastic blocks at the
-    new tempering parameter; those stochastic blocks are applied under no_grad
-    and contribute zero net nonequilibrium work at fixed parameter.
+    step. Stochastic blocks run at the start parameter and after each
+    deterministic block at the new parameter, and a step down the parameter
+    applies the exact inverse (nf_layer.inverse) of the corresponding step up.
+    The protocol of a chain going down is then the time reversal of its
+    partner's, as detailed balance of the swap requires. Stochastic blocks are
+    applied under no_grad and contribute zero net nonequilibrium work at fixed
+    parameter.
     """
 
     def __init__(
@@ -890,7 +920,6 @@ class NEOREXProtocolWrapper(nn.Module):
         work_mode: str = "logdet",
         stochastic_update: Optional[nn.Module] = None,
         stochastic_steps_per_step: int = 1,
-        nf_first: bool = True,
         parameter_name: str = "beta",
     ):
         super().__init__()
@@ -912,7 +941,6 @@ class NEOREXProtocolWrapper(nn.Module):
         self.work_mode = work_mode
         self.stochastic_update = stochastic_update
         self.stochastic_steps_per_step = stochastic_steps_per_step
-        self.nf_first = bool(nf_first)
         self.parameter_name = str(parameter_name)
 
     def set_parameter(self, target: Any, parameter: torch.Tensor):
@@ -966,6 +994,16 @@ class NEOREXProtocolWrapper(nn.Module):
             )
         return out[0], out[1]
 
+    def _call_nf_inverse(self, x: torch.Tensor, parameter: torch.Tensor, delta_parameter: torch.Tensor):
+        inverse = getattr(self.nf_layer, "inverse", None)
+        if inverse is None:
+            raise TypeError(
+                f"{type(self.nf_layer).__name__} has no inverse; NEO-REX needs one for chains moving "
+                "down the parameter."
+            )
+        out = inverse(x, parameter, delta_parameter)
+        return out[0], out[1]
+
     def _run_stochastic_blocks(self, x: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
         if self.stochastic_update is None or self.stochastic_steps_per_step <= 0:
             return x
@@ -991,10 +1029,30 @@ class NEOREXProtocolWrapper(nn.Module):
         x: torch.Tensor,
         parameter_0: torch.Tensor,
         parameter_1: torch.Tensor,
-        delta_parameter: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
-        x_next, aux = self._call_nf(x, parameter_0, delta_parameter)
+        down = torch.as_tensor(parameter_1 < parameter_0, device=x.device)
+        if not bool(down.any()):
+            x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
+        else:
+            if self.work_mode == "work":
+                raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
+            # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1.
+            down = down.expand(x.shape[0])
+            parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
+            parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
+            x_next, aux = x, torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
+            for idx, run in (
+                (torch.nonzero(~down).squeeze(-1), self._call_nf),
+                (torch.nonzero(down).squeeze(-1), self._call_nf_inverse),
+            ):
+                if idx.numel() == 0:
+                    continue
+                low = torch.minimum(parameter_0, parameter_1).index_select(0, idx)
+                step = (parameter_1 - parameter_0).abs().index_select(0, idx)
+                x_part, aux_part = run(x.index_select(0, idx), low, step)
+                x_next = x_next.index_copy(0, idx, x_part)
+                aux = aux.index_copy(0, idx, aux_part.to(device=x.device, dtype=work_dtype))
         aux = aux.to(device=x.device, dtype=work_dtype)
         if self.work_mode == "work":
             dwork = aux
@@ -1011,34 +1069,21 @@ class NEOREXProtocolWrapper(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         if nf_only:
-            delta_beta = beta_target - beta_start
-            return self._run_nf_block(x, beta_start, beta_target, delta_beta)
+            return self._run_nf_block(x, beta_start, beta_target)
 
-        x_curr = x
-        parameter_delta = beta_target - beta_start
+        x_curr = self._run_stochastic_blocks(x, beta_start)
         work = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
+        points = _protocol_points(beta_start, beta_target, self.n_protocol_steps)
 
         for n in range(self.n_protocol_steps):
-            lambda_0 = n / self.n_protocol_steps
-            lambda_1 = (n + 1) / self.n_protocol_steps
-            parameter_0 = beta_start + lambda_0 * parameter_delta
-            parameter_1 = beta_start + lambda_1 * parameter_delta
-            delta_parameter = parameter_1 - parameter_0
-
-            if not self.nf_first:
-                x_curr = self._run_stochastic_blocks(x_curr, parameter_0)
-
+            parameter_0, parameter_1 = points[n], points[n + 1]
             x_next, dwork = self._run_nf_block(
                 x_curr,
                 parameter_0,
                 parameter_1,
-                delta_parameter,
             )
             work = work + dwork
-            x_curr = x_next
-
-            if self.nf_first:
-                x_curr = self._run_stochastic_blocks(x_curr, parameter_1)
+            x_curr = self._run_stochastic_blocks(x_next, parameter_1)
 
         return x_curr, work
 
@@ -1270,26 +1315,17 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         module = self.ddp_flow.module
-        x_curr = x
-        beta_delta = target_betas - start_betas
+        points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
 
         for n in range(int(module.n_protocol_steps)):
-            lambda_0 = n / int(module.n_protocol_steps)
-            lambda_1 = (n + 1) / int(module.n_protocol_steps)
-            beta_0 = start_betas + lambda_0 * beta_delta
-            beta_1 = start_betas + lambda_1 * beta_delta
-
-            if not bool(module.nf_first):
-                x_curr = self._run_stochastic_blocks_active(module, x_curr, beta_0, active_idx)
+            beta_0, beta_1 = points[n], points[n + 1]
 
             x_next, dwork = self._run_nf_block_active(x_curr, beta_0, beta_1, active)
             total_work = total_work + dwork.detach().to(dtype=self.param_dtype)
-            x_curr = x_next.detach()
-
-            if bool(module.nf_first):
-                x_curr = self._run_stochastic_blocks_active(module, x_curr, beta_1, active_idx)
+            x_curr = self._run_stochastic_blocks_active(module, x_next.detach(), beta_1, active_idx)
 
         return x_curr, total_work
 
@@ -1301,10 +1337,10 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         module = self.ddp_flow.module
-        x_curr = x
-        beta_delta = target_betas - start_betas
+        points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
         total_stats = {
             "_flow_loss_sum": 0.0,
             "_flow_loss_count": 0,
@@ -1315,13 +1351,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         }
 
         for n in range(int(module.n_protocol_steps)):
-            lambda_0 = n / int(module.n_protocol_steps)
-            lambda_1 = (n + 1) / int(module.n_protocol_steps)
-            beta_0 = start_betas + lambda_0 * beta_delta
-            beta_1 = start_betas + lambda_1 * beta_delta
-
-            if not bool(module.nf_first):
-                x_curr = self._run_stochastic_blocks_active(module, x_curr, beta_0, active_idx)
+            beta_0, beta_1 = points[n], points[n + 1]
 
             x_in = x_curr.detach()
             x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active)
@@ -1332,10 +1362,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             )
 
             total_work = total_work + dwork.detach().to(dtype=self.param_dtype)
-            x_curr = x_next.detach()
-
-            if bool(module.nf_first):
-                x_curr = self._run_stochastic_blocks_active(module, x_curr, beta_1, active_idx)
+            x_curr = self._run_stochastic_blocks_active(module, x_next.detach(), beta_1, active_idx)
 
         link_loss_sum, link_loss_count = self._flow_loss_link_moments(total_work.detach(), active)
         total_stats["_flow_loss_link_sum"] = link_loss_sum

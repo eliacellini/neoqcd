@@ -3,7 +3,7 @@ import torch.utils.checkpoint as checkpoint
 import numpy as np
 import neoqcd.sun_utils as sun
 from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
-from neoqcd.smearing_jacobian import StepQuantities, exp_coefficients, smearing_step
+from neoqcd.smearing_jacobian import StepQuantities, exp_coefficients, inverse_smearing_step, smearing_step
 from neoqcd.nn import HTCNN
 from neoqcd.utils import set_defect_rho_from_fits
 
@@ -901,20 +901,8 @@ class ResidualNormalizingFlows(torch.nn.Module):
             values_next[:, mu] = values[:, mu] + update
         return values_next
 
-    def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0, current_mask=None):
-        bs = int(cfgs.shape[0])
-        real_dtype = cfgs.real.dtype
-        lin_all, quad_all, delta_v = self._coefficients(beta, delta_beta, bs, real_dtype, cfgs.device)
-        lin = lin_all[:, int(step)]
-        quad = quad_all[:, int(step)]
-
+    def _staples_and_generator(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
         U = cfgs[:, mu]
-        if bool(torch.all(delta_v == 0.0).item()):
-            ident = torch.eye(8, dtype=real_dtype, device=cfgs.device)
-            jac = ident.view((1,) * (U.dim() - 2) + (8, 8)).expand(U.shape[:-2] + (8, 8))
-            detjac = torch.ones(U.shape[:-2], dtype=real_dtype, device=cfgs.device)
-            return U.clone(), detjac, jac
-
         if self.n_pt:
             if current_mask is None:
                 raise ValueError("current_mask is required for residual_n_pt > 0")
@@ -936,7 +924,27 @@ class ResidualNormalizingFlows(torch.nn.Module):
         oidQ = otimes(eye, Q) + otimes(Q, eye)
         f0, f1, f2, B1, B2, _ = generate_coefficients(Q, Q2, eye, oidid, oidQ, self.device, backward=False)
         expQ = generate_expQ(Q, Q2, eye, f0, f1, f2)
-        dexpQdQ = generate_dexpQ_dQ(Q, Q2, B1, B2, f1, f2, eye, oidid, oidQ)
+        return staples, C, expQ, (Q, Q2, B1, B2, f1, f2, eye, oidid, oidQ)
+
+    def _step_coefficients(self, cfgs, beta, delta_beta, step):
+        lin_all, quad_all, delta_v = self._coefficients(
+            beta, delta_beta, int(cfgs.shape[0]), cfgs.real.dtype, cfgs.device
+        )
+        return lin_all[:, int(step)], quad_all[:, int(step)], delta_v
+
+    def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0, current_mask=None):
+        real_dtype = cfgs.real.dtype
+        lin, quad, delta_v = self._step_coefficients(cfgs, beta, delta_beta, step)
+
+        U = cfgs[:, mu]
+        if bool(torch.all(delta_v == 0.0).item()):
+            ident = torch.eye(8, dtype=real_dtype, device=cfgs.device)
+            jac = ident.view((1,) * (U.dim() - 2) + (8, 8)).expand(U.shape[:-2] + (8, 8))
+            detjac = torch.ones(U.shape[:-2], dtype=real_dtype, device=cfgs.device)
+            return U.clone(), detjac, jac
+
+        staples, C, expQ, exp_terms = self._staples_and_generator(cfgs, mu, lin, quad, delta_v, step, current_mask)
+        dexpQdQ = generate_dexpQ_dQ(*exp_terms)
         U_out = sun.SUN_mul(expQ, U)
 
         jac = self._local_tangent_jacobian(staples, U, C, dexpQdQ, expQ, U_out, quad, delta_v)
@@ -987,6 +995,66 @@ class ResidualNormalizingFlows(torch.nn.Module):
                     )
         return cfgs, 0, dlogJ
 
+    def inverse(self, cfgs, mask, dmasking=False, dmask=None, beta=None, delta_beta=None, tol=1e-12, max_iter=100):
+        """
+        Inverse of forward with the same arguments: the masked updates are undone in reverse
+        order. The generator of a mask depends on the updated link only through the link itself
+        (its loops and staples use links the mask leaves fixed), so each mask is inverted by the
+        fixed-point iteration of sun.invert_left_update. Returns (cfgs, 0, logdet of the inverse
+        map); iteration counts and the largest residual are left in self.last_inverse_stats.
+        """
+        if dmasking and (self.n_pt or self.mask_mod != 2):
+            raise ValueError(
+                "cropped/dmasking residual layers require residual_n_pt=0 and residual_mask_mod=2"
+            )
+        real_dtype = cfgs.real.dtype
+        mask = self._runtime_mask(mask, cfgs)
+        ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
+        dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
+        dims = tuple(np.arange(1, self.D + 2))
+        stats = {"iterations": [], "residual": 0.0}
+
+        for sm in reversed(range(self.steps)):
+            lin, quad, delta_v = self._step_coefficients(cfgs, beta, delta_beta, sm)
+            if bool(torch.all(delta_v == 0.0).item()):
+                continue
+            for mu in reversed(range(self.D)):
+                for eo in reversed(range(self.mask_mod)):
+                    if dmasking:
+                        current_mask = mask[eo + mu * self.mask_mod, :] * dmask
+                    else:
+                        current_mask = mask[eo + mu * self.mask_mod, :]
+                    active_mu = current_mask[:, mu]
+                    frozen = cfgs
+
+                    def left_factor(U_mu, mu=mu, current_mask=current_mask, active_mu=active_mu, frozen=frozen):
+                        trial = frozen.clone()
+                        trial[:, mu] = U_mu
+                        _, _, expQ, _ = self._staples_and_generator(trial, mu, lin, quad, delta_v, sm, current_mask)
+                        eye = torch.eye(self.N, dtype=expQ.dtype, device=expQ.device)
+                        return active_mu * expQ + (1 - active_mu) * eye
+
+                    U_mu, iterations, residual = sun.invert_left_update(
+                        left_factor, cfgs[:, mu], tol=tol, max_iter=max_iter
+                    )
+                    if not residual <= tol:
+                        raise RuntimeError(
+                            f"residual-flow inverse did not converge for mask {eo + mu * self.mask_mod}: "
+                            f"residual {float(residual):.3e} after {iterations} iterations"
+                        )
+                    cfgs = cfgs.clone()
+                    cfgs[:, mu] = U_mu
+                    _, jac, _ = self.residual_update_mu(
+                        cfgs, mu, beta=beta, delta_beta=delta_beta, step=sm, current_mask=current_mask
+                    )
+                    active = current_mask.squeeze(-1).squeeze(-1)
+                    masked_jac = active * jac.unsqueeze(1) + (1 - active) * ones
+                    dlogJ = dlogJ - torch.sum(torch.log(torch.clamp(masked_jac, min=1e-12)), dims)
+                    stats["iterations"].append(iterations)
+                    stats["residual"] = max(stats["residual"], float(residual))
+        self.last_inverse_stats = stats
+        return cfgs, 0, dlogJ
+
 
 class ResidualCouplingLayer(torch.nn.Module):
     """
@@ -1012,6 +1080,11 @@ class ResidualCouplingLayer(torch.nn.Module):
         )
         return cfgs, dQ, dlogJ
 
+    def inverse(self, cfgs, flow_pars, rho_layer, beta=None, delta_beta=None, **kwargs):
+        """Inverse of forward with the same beta and delta_beta."""
+        del rho_layer
+        return self.residual_flow.inverse(cfgs, flow_pars.mask, beta=beta, delta_beta=delta_beta, **kwargs)
+
 
 class CouplingLayer(torch.nn.Module):
     def __init__(self, flow_pars, rho_layer, time):
@@ -1028,21 +1101,31 @@ class CouplingLayer(torch.nn.Module):
         self.smearing = Smearing(flow_pars, time)
         #self.register_buffer('time',self.smearing.t)
 
-    def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
+    def _rho(self, rho_layer):
         if self.use_rho_functional:
-            rho_r = rho_layer
-        elif self.smearing.use_hyper_smearing:
-            rho_r = None
-        elif self.fit_train == 0:
-            rho_r = self.rho_layer
-        else:
-            rho_r = rho_layer
+            return rho_layer
+        if self.smearing.use_hyper_smearing:
+            return None
+        return self.rho_layer if self.fit_train == 0 else rho_layer
+
+    def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
         return self.smearing(
             cfgs,
             flow_pars.mask,
-            rho_r,
+            self._rho(rho_layer),
             beta=beta,
             delta_beta=delta_beta,
+        )
+
+    def inverse(self, cfgs, flow_pars, rho_layer, beta=None, delta_beta=None, **kwargs):
+        """Inverse of forward with the same rho_layer, beta and delta_beta."""
+        return self.smearing.inverse(
+            cfgs,
+            flow_pars.mask,
+            self._rho(rho_layer),
+            beta=beta,
+            delta_beta=delta_beta,
+            **kwargs,
         )
 
 class DefectCouplingLayer(CouplingLayer):
@@ -1050,14 +1133,7 @@ class DefectCouplingLayer(CouplingLayer):
         super().__init__(flow_pars, rho_layer, time)
     
     def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
-        if self.use_rho_functional:
-            rho_r = rho_layer
-        elif self.smearing.use_hyper_smearing:
-            rho_r = None
-        elif self.fit_train == 0:
-            rho_r = self.rho_layer
-        else:
-            rho_r = rho_layer
+        rho_r = self._rho(rho_layer)
 
         small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=2)
         small_cfgs, _, dlogJ = self.smearing(
@@ -1074,6 +1150,21 @@ class DefectCouplingLayer(CouplingLayer):
             return small_cfgs, 0, dlogJ
         else:
             return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=2), 0, dlogJ
+
+    def inverse(self, cfgs, flow_pars, rho_layer, beta=None, delta_beta=None, **kwargs):
+        """Inverse of forward with the same rho_layer, beta and delta_beta, on the full lattice."""
+        small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=2)
+        small_cfgs, _, dlogJ = self.smearing.inverse(
+            small_cfgs,
+            flow_pars.small_mask[-1],
+            self._rho(rho_layer),
+            dmasking=True,
+            dmask=flow_pars.smeared_defect_mask[-1],
+            beta=beta,
+            delta_beta=delta_beta,
+            **kwargs,
+        )
+        return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=2), 0, dlogJ
 
 class Smearing(torch.nn.Module):
     def __init__(self, flow_pars, time):
@@ -1103,11 +1194,9 @@ class Smearing(torch.nn.Module):
         
         self.t = time
 
-    def forward(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
+    def _runtime_rho(self, cfgs, rho_layer, beta, delta_beta):
         real_dtype = cfgs.real.dtype
         bs = cfgs.shape[0]
-        dlogJ = torch.zeros(bs, dtype=real_dtype, device=cfgs.device)
-        dims = tuple(np.arange(1,self.D+2))
         if self.use_hyper_smearing:
             rho_runtime = self.hyper_smearing(beta=beta, delta_beta=delta_beta).to(
                 device=cfgs.device,
@@ -1129,6 +1218,19 @@ class Smearing(torch.nn.Module):
                 raise ValueError(
                     f"Batched hyper-smearing rho has leading dim {n_rho}, expected {bs}"
                 )
+        return rho_runtime, batched_rho
+
+    def _mask_rho(self, rho_runtime, batched_rho, sm, m):
+        if not self.use_hyper_smearing:
+            return torch.abs(rho_runtime[sm, m, :])
+        return rho_runtime[:, sm, m, :] if batched_rho else rho_runtime[sm, m, :]
+
+    def forward(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
+        real_dtype = cfgs.real.dtype
+        bs = cfgs.shape[0]
+        dlogJ = torch.zeros(bs, dtype=real_dtype, device=cfgs.device)
+        dims = tuple(np.arange(1,self.D+2))
+        rho_runtime, batched_rho = self._runtime_rho(cfgs, rho_layer, beta, delta_beta)
 
         use_selected_links = self.N == 3 and not self.use_nn
         selected_links = (
@@ -1142,14 +1244,7 @@ class Smearing(torch.nn.Module):
             for mu in range(self.D):
                 for eo in range(2):
                     m = eo + mu * 2
-
-                    if self.use_hyper_smearing:
-                        if batched_rho:
-                            rho = rho_runtime[:, sm, m, :]
-                        else:
-                            rho = rho_runtime[sm, m, :]
-                    else:
-                        rho = torch.abs(rho_runtime[sm, m, :])
+                    rho = self._mask_rho(rho_runtime, batched_rho, sm, m)
 
                     if use_selected_links:
                         sites = selected_links.sites[m]
@@ -1194,6 +1289,45 @@ class Smearing(torch.nn.Module):
         if use_selected_links:
             cfgs = flat.reshape(cfg_shape)
         return cfgs, 0, dlogJ
+
+    def inverse(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None,
+                tol=1e-12, max_iter=100):
+        """
+        Inverse of forward (SU(3) stout path) with the same rho arguments: the masked updates are
+        undone in reverse order. The staples of a mask contain only links it leaves fixed, so they
+        are the same before and after its update and each link is inverted on its own.
+        Returns (cfgs, 0, logdet of the inverse map); iteration counts and the largest residual
+        are left in self.last_inverse_stats.
+        """
+        if self.N != 3 or self.use_nn:
+            raise NotImplementedError("the inverse is implemented for the SU(3) stout path only")
+        rho_runtime, batched_rho = self._runtime_rho(cfgs, rho_layer, beta, delta_beta)
+        links = self._links_for_smearing_mask(mask, dmask if dmasking else None)
+        flat = sun.flat_links(cfgs, self.D)
+        cfg_shape = tuple(cfgs.shape)
+        dlogJ = torch.zeros(cfgs.shape[0], dtype=cfgs.real.dtype, device=cfgs.device)
+        stats = {"iterations": [], "residual": 0.0}
+
+        for sm in reversed(range(self.smearing_steps_per_layer)):
+            for m in reversed(range(2 * self.D)):
+                if links.sites[m].numel() == 0:
+                    continue
+                rho = self._mask_rho(rho_runtime, batched_rho, sm, m)
+                C = self._selected_stout_staples(flat, cfg_shape, links, m, rho)
+                U, logdet, iterations, residual = inverse_smearing_step(
+                    flat.index_select(1, links.links[m]), C, tol=tol, max_iter=max_iter
+                )
+                if not residual <= tol:
+                    raise RuntimeError(
+                        f"stout inverse did not converge for mask {m}: residual {float(residual):.3e} "
+                        f"after {iterations} iterations"
+                    )
+                flat = flat.index_copy(1, links.links[m], U)
+                dlogJ = dlogJ + logdet.sum(dim=1)
+                stats["iterations"].append(iterations)
+                stats["residual"] = max(stats["residual"], float(residual))
+        self.last_inverse_stats = stats
+        return flat.reshape(cfg_shape), 0, dlogJ
 
     def _links_for_smearing_mask(self, mask, dmask=None):
         return self._smearing_links_cache.get(mask, self.D, dmask)

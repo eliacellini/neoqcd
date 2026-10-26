@@ -421,6 +421,28 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         logdet = dlogj.to(dtype=work_dtype)
         return x_out, logdet
 
+    def _inverse_small(self, small_cfgs, bc, delta_bc, **kwargs):
+        return self.layer.smearing.inverse(
+            small_cfgs,
+            self.flow_pars.small_mask[-1],
+            self.layer._rho(None),
+            dmasking=True,
+            dmask=self.flow_pars.smeared_defect_mask[-1],
+            beta=bc,
+            delta_beta=delta_bc,
+            **kwargs,
+        )
+
+    def inverse(self, x: torch.Tensor, bc: torch.Tensor, delta_bc: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse of forward with the same bc and delta_bc: (x, log-Jacobian of the inverse map)."""
+        bs = int(x.shape[0])
+        bc = self._normalize_parameter(bc, bs, x.device)
+        delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
+        work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=2)
+        small_cfgs, _, logdet = self._inverse_small(small_cfgs, bc, delta_bc, **kwargs)
+        return self._embed_small_cfgs(small_cfgs, x, buffer=2), logdet.to(dtype=work_dtype)
+
 
 class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
     """
@@ -478,6 +500,17 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
             delta_beta=delta_bc,
         )
         return self._embed_small_cfgs(small_cfgs, x, buffer=2), logdet.to(dtype=work_dtype)
+
+    def _inverse_small(self, small_cfgs, bc, delta_bc, **kwargs):
+        return self.layer.inverse(
+            small_cfgs,
+            self.flow_pars.small_mask[-1],
+            dmasking=True,
+            dmask=self.flow_pars.smeared_defect_mask[-1],
+            beta=bc,
+            delta_beta=delta_bc,
+            **kwargs,
+        )
 
 
 def _build_neorex_flow_pars(
@@ -604,7 +637,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neorex-flow-lr", type=float, default=1e-3)
     parser.add_argument("--neorex-grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--neorex-max-consecutive-nan-grad-updates", type=int, default=5)
-    parser.add_argument("--neorex-stochastic-first", action="store_true")
     parser.add_argument(
         "--neorex-eval-flow",
         action="store_true",
@@ -1043,7 +1075,6 @@ def main(args: argparse.Namespace) -> None:
             work_mode=args.neorex_work_mode,
             stochastic_update=neorex_mcmc if args.neorex_heatbath_steps_per_step > 0 else None,
             stochastic_steps_per_step=args.neorex_heatbath_steps_per_step,
-            nf_first=not bool(args.neorex_stochastic_first),
             parameter_name="bc",
         )
         pt_cfg = NEOREXConfig(

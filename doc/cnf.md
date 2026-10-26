@@ -108,6 +108,13 @@ runner. NEO-REX computes **full** action differences for this field rather than
 the cropped-layer halo shortcut. Portable CNF checkpoints are distinct from
 the wrapper's `--neorex-load-flow` checkpoints.
 
+In an O-REX/NEO-REX swap the heatbath runs at both ends of the protocol, and a
+chain moving down the ladder applies the inverse of the step its partner takes
+going up (`inverse` of each layer: fixed-point iteration for smearing and
+residual layers, backward integration for a CNF). The two protocols are then
+each other's time reversal, as detailed balance of the swap requires; for a
+CNF the inverse, like the logdet, carries the CF4 integration error.
+
 ### Evaluating a defect field with the smearing layer
 
 A `defect-hyper-smearing` field can instead be evaluated with the finite

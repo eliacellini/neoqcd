@@ -226,3 +226,20 @@ def plaq_index(D, mu, nu):
     # Orient the D-1 plaquettes touching mu into positive/negative slots. This
     # preserves the historical D=4 ordering while also covering SU(2)/D=2.
     return (nu - mu - 1) % D
+
+
+def invert_left_update(left_factor, Up, tol=1e-12, max_iter=100):
+    """Solve X(U) U = Up for a left update by X(U) in SU(N), given left_factor(U) = X(U).
+
+    Fixed-point iteration U <- X(U)^dagger Up, started at U = Up: it converges when X varies
+    slowly with U, as for the small steps of a flow. X is recomputed from U at every iteration, so
+    rounding does not accumulate. Links with X = 1 stay at Up. Returns U, the number of iterations
+    and the largest residual |X(U) U - Up|; the caller decides what to do if it is above tol.
+    """
+    U = Up
+    for iterations in range(max_iter + 1):
+        X = left_factor(U)
+        residual = (SUN_mul(X, U) - Up).abs().amax()
+        if residual <= tol or iterations == max_iter:
+            return U, iterations, residual
+        U = SUN_mul(SUN_dagger(X), Up)

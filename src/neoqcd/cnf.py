@@ -521,13 +521,18 @@ class CNFProtocolLayer(nn.Module):
             "n_steps": self.n_steps,
         }
 
+    def _end(self, cfgs, parameter, delta_parameter):
+        return (torch.as_tensor(parameter, dtype=cfgs.real.dtype, device=cfgs.device)
+                + torch.as_tensor(delta_parameter, dtype=cfgs.real.dtype, device=cfgs.device))
+
     def forward(self, cfgs, parameter, delta_parameter, rho_layer=None):
         del rho_layer
-        return integrate_flow(
-            cfgs, parameter, torch.as_tensor(parameter, dtype=cfgs.real.dtype, device=cfgs.device)
-            + torch.as_tensor(delta_parameter, dtype=cfgs.real.dtype, device=cfgs.device),
-            self.field, self.n_steps,
-        )
+        return integrate_flow(cfgs, parameter, self._end(cfgs, parameter, delta_parameter), self.field, self.n_steps)
+
+    def inverse(self, cfgs, parameter, delta_parameter):
+        """Inverse of forward by backward integration. CF4 is not time-symmetric, so this inverts
+        the numerical map up to the integration error, the same order as the logdet's."""
+        return integrate_flow(cfgs, self._end(cfgs, parameter, delta_parameter), parameter, self.field, self.n_steps)
 
 
 __all__ = [
