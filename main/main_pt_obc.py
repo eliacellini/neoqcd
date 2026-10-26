@@ -687,7 +687,9 @@ def parse_args() -> argparse.Namespace:
     # Accepted for command-template compatibility; not used in this standard PT main.
     parser.add_argument("--update", type=str, default="heatbath")
     parser.add_argument("--train-steps", type=int, default=0)
-    parser.add_argument("--nf-layer-type", type=str, default="", choices=["", "smearing", "residual"])
+    parser.add_argument("--nf-layer-type", type=str, default="", choices=["", "smearing", "residual", "cnf"])
+    parser.add_argument("--cnf-checkpoint", help="Field checkpoint trained by main_cnf_rex.py")
+    parser.add_argument("--cnf-integration-steps", type=int, default=4)
     parser.add_argument("--nf-layers-per-step", type=int, default=0)
     parser.add_argument("--explicit-backward", action="store_true")
     parser.set_defaults(
@@ -835,6 +837,8 @@ def _default_wandb_run_name(args: argparse.Namespace, world_size: int) -> str:
 
 
 def main(args: argparse.Namespace) -> None:
+    if args.algorithm == "neorex" and args.nf_layer_type == "cnf":
+        args.neorex_eval_flow = True
     state = setup_runtime(args)
     rank, world_size, device = state.rank, state.world_size, state.device
     effective_acceptance_rule = (
@@ -1005,9 +1009,22 @@ def main(args: argparse.Namespace) -> None:
         if int(args.neorex_heatbath_steps_per_step) < 0:
             raise ValueError("--neorex-heatbath-steps-per-step must be >= 0")
 
-        neorex_flow_pars = _build_neorex_flow_pars(args, device, mask, defect)
         nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
-        if nf_layer_kind == "residual":
+        neorex_flow_pars = None if nf_layer_kind == "cnf" else _build_neorex_flow_pars(args, device, mask, defect)
+        if nf_layer_kind == "cnf":
+            from neoqcd.cnf import CNFProtocolLayer
+            from neoqcd.cnf_io import load_cnf_checkpoint
+            if not args.cnf_checkpoint or args.cnf_integration_steps < 1:
+                raise ValueError("cnf requires --cnf-checkpoint and positive --cnf-integration-steps")
+            if args.train_steps > 0:
+                raise ValueError("Train CNF fields using main/main_cnf_rex.py before NEO-REX evaluation")
+            if args.neorex_work_mode != "logdet":
+                raise ValueError("CNF returns logdet: use --neorex-work-mode logdet")
+            expected = {key: getattr(args, key) for key in ("D", "T", "L", "beta", "defect_size", "time_slice", "space_slice")}
+            expected["domain"] = "defect"
+            field, _, _, _ = load_cnf_checkpoint(args.cnf_checkpoint, device, expected, (parameter_min, parameter_max))
+            nf_layer = CNFProtocolLayer(field, n_steps=args.cnf_integration_steps)
+        elif nf_layer_kind == "residual":
             nf_layer = ResidualDefectSNFProtocolLayer(neorex_flow_pars)
         else:
             nf_layer = DefectSNFProtocolLayer(neorex_flow_pars)
@@ -1042,7 +1059,7 @@ def main(args: argparse.Namespace) -> None:
             orex_schedule=args.orex_schedule,
             save_work_values=bool(args.save_link_work_values),
             flow_lr=args.neorex_flow_lr,
-            flow_train=True,
+            flow_train=nf_layer_kind != "cnf",
             grad_clip_norm=args.neorex_grad_clip_norm,
             max_consecutive_nan_grad_updates=args.neorex_max_consecutive_nan_grad_updates,
         )

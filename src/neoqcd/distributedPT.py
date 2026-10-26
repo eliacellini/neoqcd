@@ -931,7 +931,7 @@ class NEOREXProtocolWrapper(nn.Module):
         parameter_old: torch.Tensor,
         parameter_new: torch.Tensor,
     ):
-        if hasattr(self.theory, "local_nf_action_change"):
+        if not getattr(self.nf_layer, "full_lattice", False) and hasattr(self.theory, "local_nf_action_change"):
             try:
                 return self.theory.local_nf_action_change(
                     x_old,

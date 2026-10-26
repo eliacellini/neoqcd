@@ -1,5 +1,9 @@
 # neoqcd
 
+Continuous SU(3) CloverChair fields, REX Path Gradient training and PINN
+diagnostics are described in [doc/cnf.md](doc/cnf.md). Training avoids SNF
+integration; evaluation reconstructs the stochastic flow with CF4.
+
 Residual flows support learned gauge-covariant convolutions of frozen links on
 the full lattice (`main/main_nemcmc_snf.py`, `--domain beta`). Select
 `--nf-architecture residual` for static coefficients or `hyper-residual` for

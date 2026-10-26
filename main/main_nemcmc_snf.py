@@ -114,13 +114,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     # NF architecture and its existing conditional-network controls.
     parser.add_argument(
         "--nf-architecture", "--nf-layer-type", dest="nf_architecture",
-        choices=("smearing", "hyper-smearing", "residual", "hyper-residual"),
+        choices=("smearing", "hyper-smearing", "residual", "hyper-residual", "cnf"),
         default=None,
         help=(
             "SNF layer: residual=static trainable coefficients; "
             "hyper-residual=beta-conditioned residual MLP; smearing variants use CouplingLayer."
         ),
     )
+    parser.add_argument("--cnf-checkpoint", help="Field checkpoint trained by main_cnf_rex.py")
+    parser.add_argument("--cnf-integration-steps", type=int, default=4)
     parser.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class"), default="shared")
     parser.add_argument("--hyper-time-embedding-dim", type=int, default=8)
     parser.add_argument("--hyper-hidden-dim", type=int, default=16)
@@ -207,7 +209,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("NEMCMC --checkpoint requires --load-prior")
     if args.algorithm == "nemcmc" and args.rho_functional:
         raise ValueError("--rho-functional requires --algorithm snf")
-    if args.algorithm == "snf" and args.phase == "evaluate" and not args.checkpoint and not args.resume:
+    if args.algorithm == "snf" and args.phase == "evaluate" and not args.checkpoint and not args.resume and not args.cnf_checkpoint:
         raise ValueError("SNF evaluation requires --checkpoint")
     if args.phase == "evaluate" and args.train_steps is not None:
         raise ValueError("--train-steps is valid only in train phase")
@@ -345,7 +347,7 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("bc-initial and bc-final must be distinct")
     if args.domain == "defect" and args.D != 4:
         raise ValueError("The defect patch cutting/embedding adapter is defined for D=4")
-    if args.domain == "defect":
+    if args.domain == "defect" and args.nf_architecture != "cnf":
         if args.T < 4 or args.L < args.defect_size + 4:
             raise ValueError("defect domain requires T >= 4 and L >= defect-size + 4")
         if not 2 <= args.time_slice <= args.T - 2:
@@ -354,6 +356,15 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("space-slice must leave a two-site buffer around the defect")
     if args.algorithm == "nemcmc" and args.nf_architecture != "smearing":
         raise ValueError("NF architecture options are valid only for --algorithm snf")
+    if args.nf_architecture == "cnf":
+        if not args.cnf_checkpoint or args.cnf_integration_steps < 1:
+            raise ValueError("cnf requires --cnf-checkpoint and positive --cnf-integration-steps")
+        if args.phase != "evaluate":
+            raise ValueError("Train CNF fields with main/main_cnf_rex.py (REX Path Gradient)")
+        if args.domain == "defect" and not (0 <= args.time_slice < args.T and 0 <= args.space_slice <= args.L - args.defect_size):
+            raise ValueError("CNF defect must fit inside the lattice")
+    elif args.cnf_checkpoint:
+        raise ValueError("--cnf-checkpoint requires --nf-architecture cnf")
     if args.rho_functional and args.nf_architecture != "smearing":
         raise ValueError("--rho-functional requires the classic --nf-architecture smearing")
     if args.phase == "train" and args.training_mode != "full" and args.rho_functional:
@@ -1095,7 +1106,10 @@ def _build_flow_pars(args, device: torch.device, protocol: list[float], local_ba
     defect = None
     defect_mask = None
     kwargs = {}
-    if args.domain == "defect":
+    if args.domain == "defect" and args.nf_architecture == "cnf":
+        defect = Defect(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice)
+        defect_mask = defect.create_defect_mask().to(device)
+    elif args.domain == "defect":
         buffer = 2
         if args.T < 2 * buffer or args.L < args.defect_size + 2 * buffer:
             raise ValueError("Defect SNF requires T >= 4 and L >= defect-size + 4")
@@ -1218,6 +1232,16 @@ class _StandardSNFProtocolLayer(torch.nn.Module):
 
 def _make_snf_layer(args, flow_pars):
     architecture = args.nf_architecture
+    if architecture == "cnf":
+        from neoqcd.cnf import CNFProtocolLayer
+        from neoqcd.cnf_io import load_cnf_checkpoint
+        expected = {key: getattr(args, key) for key in ("D", "T", "L", "domain")}
+        if args.domain == "defect":
+            expected.update(beta=6.0 if args.beta is None else args.beta,
+                            **{key: getattr(args, key) for key in ("defect_size", "time_slice", "space_slice")})
+        start, end, _, _ = _protocol_endpoints(args)
+        field, _, _, _ = load_cnf_checkpoint(args.cnf_checkpoint, flow_pars.device, expected, (start, end))
+        return CNFProtocolLayer(field, n_steps=args.cnf_integration_steps)
     rho_init = args.smearing_rho_init if architecture == "smearing" else 0.0
     if architecture == "hyper-residual":
         warnings.warn(
@@ -1246,7 +1270,7 @@ def _make_snf_layer(args, flow_pars):
 def _nf_layer_sharing(args) -> str:
     if args.rho_functional:
         return "shared"
-    return "shared" if args.nf_architecture in {"hyper-smearing", "hyper-residual"} else "per_block"
+    return "shared" if args.nf_architecture in {"hyper-smearing", "hyper-residual", "cnf"} else "per_block"
 
 
 def _action(flow_pars, x, domain: str, parameter: float, defect_mask, plaquettes=None):
@@ -1645,6 +1669,10 @@ def _checkpoint_semantics(args, protocol: list[float]) -> dict:
         semantics["smearing_jacobian_version"] = "su3_stout_full_haar_logdet_v1"
     if args.residual_n_pt or args.residual_mask_mod != 2:
         semantics.update(residual_n_pt=args.residual_n_pt, residual_mask_mod=args.residual_mask_mod)
+    if args.nf_architecture == "cnf":
+        payload = torch.load(args.cnf_checkpoint, map_location="cpu", weights_only=True)
+        semantics.update(cnf_config=payload["config"], cnf_integration_steps=args.cnf_integration_steps,
+                         cnf_jacobian="cf4_integrated_divergence_v1")
     return semantics
 
 
