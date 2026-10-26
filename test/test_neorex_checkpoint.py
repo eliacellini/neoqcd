@@ -132,6 +132,19 @@ def _real_neorex_pt(
 
 
 class NEOREXCheckpointTest(unittest.TestCase):
+    def test_cli_rejects_work_mode_for_builtin_layers(self):
+        for layer_type in ("smearing", "residual"):
+            args_list = [
+                "--algorithm", "neorex", "--nf-layer-type", layer_type,
+                "--neorex-work-mode", "work",
+            ]
+            with self.subTest(layer_type=layer_type), mock.patch.object(
+                sys, "argv", ["main_pt_obc", *args_list]
+            ), mock.patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as error:
+                    MAIN.parse_args()
+                self.assertEqual(error.exception.code, 2)
+
     def test_api_checkpoint_is_self_contained_and_legacy_smearing_is_rejected(self):
         pt, flow = _fake_pt()
         with tempfile.TemporaryDirectory() as directory:

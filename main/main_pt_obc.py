@@ -597,7 +597,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orex-schedule", type=str, default="even_odd", choices=["even_odd", "alternating", "even", "odd"])
     parser.add_argument("--neorex-protocol-steps", type=int, default=0)
     parser.add_argument("--neorex-heatbath-steps-per-step", type=int, default=0)
-    parser.add_argument("--neorex-work-mode", type=str, default="logdet", choices=["logdet", "work"])
+    parser.add_argument(
+        "--neorex-work-mode", type=str, default="logdet", choices=["logdet"],
+        help="Built-in NF layers return logdet; work is computed as the action change minus logdet.",
+    )
     parser.add_argument("--neorex-flow-lr", type=float, default=1e-3)
     parser.add_argument("--neorex-grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--neorex-max-consecutive-nan-grad-updates", type=int, default=5)
