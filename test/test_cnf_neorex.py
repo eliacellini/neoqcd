@@ -167,7 +167,7 @@ class CNFNEOREXTest(unittest.TestCase):
 
     def test_defect_field_converts_to_the_neorex_smearing_layer(self):
         spec = importlib.util.spec_from_file_location(
-            "convert_cnf_to_neorex_flow", ROOT / "main" / "convert_cnf_to_neorex_flow.py"
+            "convert_cnf_to_smearing_flow", ROOT / "main" / "convert_cnf_to_smearing_flow.py"
         )
         converter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(converter)
@@ -193,13 +193,13 @@ class CNFNEOREXTest(unittest.TestCase):
                 "--hyper-scale-by-delta", "--hyper-no-normalize-by-nstep",
                 "--batch-size", "2", "--neorex-protocol-steps", "1",
             ]
-            converted = converter.convert(cnf_checkpoint, root / "flow.pt", flags)
+            converted = converter.convert("neorex", cnf_checkpoint, root / "flow.pt", flags)
             self.assertEqual(torch.load(converted, weights_only=True)["source_cnf_epoch"], 7)
 
             mismatched = [*flags[:-1], "2"]
             mismatched[mismatched.index("--hyper-hidden-dim") + 1] = "16"
             with self.assertRaises(RuntimeError):
-                converter.convert(cnf_checkpoint, root / "bad.pt", mismatched)
+                converter.convert("neorex", cnf_checkpoint, root / "bad.pt", mismatched)
 
             argv = [
                 *flags, "--neorex-load-flow", str(converted), "--neorex-eval-flow",

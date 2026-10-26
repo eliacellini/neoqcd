@@ -110,9 +110,12 @@ the wrapper's `--neorex-load-flow` checkpoints.
 
 ### Evaluating a defect field with the smearing layer
 
-A `defect-hyper-smearing` field can instead be evaluated in NEO-REX with the
-finite smearing layer, which has an exact logdet. Copy its network into a
-NEO-REX flow checkpoint, passing the evaluation flags after `--`:
+A `defect-hyper-smearing` field can instead be evaluated with the finite
+smearing layer, which has an exact logdet, either in NEO-REX or in the
+standalone SNF. Copy its network into the runner's checkpoint, passing the
+evaluation flags after `--`.
+
+NEO-REX (`main_pt_obc.py`):
 
 ```sh
 FLAGS=(--cpu --algorithm neorex --D 4 --T 4 --L 6 --N 3 --beta 6
@@ -120,19 +123,35 @@ FLAGS=(--cpu --algorithm neorex --D 4 --T 4 --L 6 --N 3 --beta 6
   --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode per_link
   --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
   --neorex-protocol-steps 2 --neorex-heatbath-steps-per-step 1 --batch-size 16)
-.sunenv/bin/python main/convert_cnf_to_neorex_flow.py results/cnf_defect/cnf_checkpoint.pt \
+.sunenv/bin/python main/convert_cnf_to_smearing_flow.py neorex results/cnf_defect/cnf_checkpoint.pt \
   results/cnf_defect/neorex_flow.pt -- "${FLAGS[@]}"
 .sunenv/bin/torchrun --nnodes 1 --nproc_per_node 4 --master_addr 127.0.0.1 --master_port 29500 \
   main/main_pt_obc.py "${FLAGS[@]}" --neorex-load-flow results/cnf_defect/neorex_flow.pt \
   --neorex-eval-flow --output-dir results/cnf_defect/neorex
 ```
 
-`--hyper-scale-by-delta --hyper-no-normalize-by-nstep` keep the trained
-convention (rho per unit BC, scaled by each protocol step). Geometry, hyper mode
-and network shape must match the field; the converter refuses a mismatch. Each
-protocol step applies rho(bc) * delta_bc with the parities updated in sequence:
-a finite discretization of the field, exact as a map, so step size affects
-efficiency but not the unbiasedness of the acceptance.
+Standalone SNF (`main_nemcmc_snf.py`), from BC=0 to BC=1:
+
+```sh
+FLAGS=(--algorithm snf --domain defect --cpu --D 4 --T 4 --L 6 --beta 6
+  --bc-initial 0 --bc-final 1 --defect-size 1 --time-slice 2 --space-slice 2
+  --nf-architecture hyper-smearing --hyper-smearing-mode per_link
+  --hyper-hidden-dim 16 --hyper-depth 2 --hyper-no-normalize-by-nstep
+  --protocol-steps 6 --orsteps 4 --updates-per-layer 1 --prior-mcmc-steps 1 --batch-size 64)
+.sunenv/bin/python main/convert_cnf_to_smearing_flow.py snf results/cnf_defect/cnf_checkpoint.pt \
+  results/cnf_defect/snf_checkpoint.pt -- "${FLAGS[@]}"
+.sunenv/bin/python main/main_nemcmc_snf.py "${FLAGS[@]}" --phase evaluate \
+  --checkpoint results/cnf_defect/snf_checkpoint.pt --eval-samples 1024 \
+  --output-dir results/cnf_defect/snf
+```
+
+`--hyper-scale-by-delta` (the SNF default) and `--hyper-no-normalize-by-nstep`
+keep the trained convention: rho per unit BC, scaled by each protocol step.
+Geometry, beta, hyper mode and network shape must match the field; the
+converter refuses a mismatch. Each protocol step applies rho(bc) * delta_bc with
+the parities updated in sequence: a finite discretization of the field, exact
+as a map, so step size affects efficiency but not the unbiasedness of the
+weights or acceptance.
 
 ## Numerical limits and checks
 

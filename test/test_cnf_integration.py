@@ -92,6 +92,48 @@ class CNFIntegrationTest(unittest.TestCase):
             summary = json.loads((Path(opts.output_dir) / "summary.json").read_text())
             self.assertIsNotNone(summary["work_mean"])
 
+    def test_defect_field_converts_to_the_standalone_snf_smearing_layer(self):
+        converter = load_main("convert_cnf_to_smearing_flow")
+        snf = load_main("main_nemcmc_snf")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(
+                architecture="defect-hyper-smearing", domain="defect", D=4, T=4, L=6, beta=6.0,
+                defect_size=1, time_slice=2, space_slice=2, parameter_min=0.0, parameter_max=1.0,
+                batch_size=2, hidden_dim=8, depth=1, rho_init=1e-3, residual_n_pt=0,
+                residual_mask_mod=2, orsteps=0, hyper_smearing_mode="per_link",
+            )
+            torch.manual_seed(13)
+            field, _, _ = build_cnf(config)
+            with torch.no_grad():
+                for parameter in field.smearing.hyper_smearing.mlp.parameters():
+                    parameter.add_(0.05 * torch.randn_like(parameter))
+            save_cnf_checkpoint(root / "cnf.pt", field, config, epoch=3)
+            flags = [
+                "--algorithm", "snf", "--domain", "defect", "--cpu", "--D", "4", "--T", "4", "--L", "6",
+                "--beta", "6", "--bc-initial", "0", "--bc-final", "1",
+                "--defect-size", "1", "--time-slice", "2", "--space-slice", "2",
+                "--nf-architecture", "hyper-smearing", "--hyper-smearing-mode", "per_link",
+                "--hyper-hidden-dim", "8", "--hyper-depth", "1", "--hyper-no-normalize-by-nstep",
+                "--batch-size", "2", "--protocol-steps", "2", "--prior-mcmc-steps", "0",
+                "--updates-per-layer", "1", "--orsteps", "0", "--cfg-cache", "off",
+            ]
+            converted = converter.convert("snf", root / "cnf.pt", root / "snf.pt", flags)
+            with self.assertRaisesRegex(ValueError, "per unit parameter"):
+                converter.convert("snf", root / "cnf.pt", root / "bad.pt",
+                                  [f for f in flags if f != "--hyper-no-normalize-by-nstep"])
+
+            args = snf.parse_args([*flags, "--phase", "evaluate", "--thermal-steps", "0", "--eval-steps", "1",
+                                   "--checkpoint", str(converted), "--output-dir", str(root / "run")])
+            snf.main(args)
+            evaluated = snf._safe_torch_load(root / "run" / "snf_checkpoint.pt")["model_state_dict"]
+            prefix = "nf_layer.layer.smearing.hyper_smearing."
+            used = {k.removeprefix(prefix): v for k, v in evaluated.items() if k.startswith(prefix)}
+            reference = field.smearing.hyper_smearing.state_dict()
+            self.assertEqual(used.keys(), reference.keys())
+            for key, value in reference.items():
+                torch.testing.assert_close(used[key], value, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
