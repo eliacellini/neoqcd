@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from neoqcd.cnf_io import build_cnf, save_cnf_checkpoint
 
@@ -19,30 +21,53 @@ MAIN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MAIN)
 
 
+CONFIG = {
+    "architecture": "clover-chair",
+    "domain": "defect",
+    "D": 4,
+    "T": 2,
+    "L": 2,
+    "beta": 6.0,
+    "defect_size": 1,
+    "time_slice": 1,
+    "space_slice": 1,
+    "parameter_min": 0.0,
+    "parameter_max": 1.0,
+    "batch_size": 2,
+    "hidden_dim": 4,
+    "depth": 1,
+    "rho_init": 1e-3,
+    "residual_n_pt": 0,
+    "residual_mask_mod": 2,
+    "orsteps": 0,
+}
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _multirank_worker(rank, world_size, port, argv):
+    # Same environment torchrun provides; main() initializes and destroys the group.
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank),
+        LOCAL_RANK=str(rank), WORLD_SIZE=str(world_size),
+        OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+    )
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if os.uname().sysname == "Darwin" else "lo")
+    torch.set_num_threads(1)
+    with mock.patch.object(sys, "argv", ["main_pt_obc", *argv]):
+        args = MAIN.parse_args()
+    MAIN.main(args)
+
+
 class CNFNEOREXTest(unittest.TestCase):
     def test_cli_loads_full_lattice_cnf_and_saves_neorex_semantics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = {
-                "architecture": "clover-chair",
-                "domain": "defect",
-                "D": 4,
-                "T": 2,
-                "L": 2,
-                "beta": 6.0,
-                "defect_size": 1,
-                "time_slice": 1,
-                "space_slice": 1,
-                "parameter_min": 0.0,
-                "parameter_max": 1.0,
-                "batch_size": 2,
-                "hidden_dim": 4,
-                "depth": 1,
-                "rho_init": 1e-3,
-                "residual_n_pt": 0,
-                "residual_mask_mod": 2,
-                "orsteps": 0,
-            }
+            config = dict(CONFIG)
             field, _, _ = build_cnf(config)
             cnf_checkpoint = root / "cnf.pt"
             save_cnf_checkpoint(cnf_checkpoint, field, config)
@@ -84,6 +109,61 @@ class CNFNEOREXTest(unittest.TestCase):
 
             run_meta = json.loads((output_dir / "run_meta.json").read_text(encoding="utf-8"))
             self.assertIn(str(saved_path), run_meta["neorex_flow_checkpoint"]["saved_paths"])
+
+    def test_multirank_gloo_swaps_every_link_without_training_the_field(self):
+        world_size, steps, batch_size = 3, 2, 2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(CONFIG, batch_size=batch_size)
+            torch.manual_seed(3)
+            field, _, _ = build_cnf(config)
+            with torch.no_grad():
+                # A non-trivial but small drift, so the CNF actually moves the links.
+                for parameter in field.output_layer.parameters():
+                    parameter.normal_(std=1e-3)
+            cnf_checkpoint = root / "cnf.pt"
+            save_cnf_checkpoint(cnf_checkpoint, field, config)
+            output_dir = root / "run"
+            argv = [
+                "--cpu", "--algorithm", "neorex", "--nf-layer-type", "cnf",
+                "--cnf-checkpoint", str(cnf_checkpoint), "--cnf-integration-steps", "1",
+                "--D", "4", "--T", "2", "--L", "2", "--N", "3",
+                "--defect-size", "1", "--time-slice", "1", "--space-slice", "1",
+                "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
+                "--batch-size", str(batch_size), "--neorex-protocol-steps", "1",
+                "--thermal-steps", "1", "--steps", str(steps), "--orsteps", "0",
+                "--no-cfg-cache", "--output-dir", str(output_dir), "--main-dir", str(root),
+                "--neorex-save-flow", "auto",
+            ]
+            mp.spawn(
+                _multirank_worker, args=(world_size, _free_port(), argv),
+                nprocs=world_size, join=True,
+            )
+
+            meta = json.loads((output_dir / "run_meta.json").read_text(encoding="utf-8"))
+            swap = meta["swap"]
+            self.assertEqual(swap["parameter_name"], "bc")
+            self.assertEqual(len(swap["link_proposed"]), world_size - 1)
+            # Both parities ran, so every adjacent pair was proposed on every chain.
+            self.assertTrue(all(count > 0 and count % batch_size == 0 for count in swap["link_proposed"]))
+            self.assertEqual(swap["total_proposed"], sum(swap["link_proposed"]))
+            self.assertLessEqual(swap["total_accepted"], swap["total_proposed"])
+            self.assertTrue(all(0.0 <= rate <= 1.0 for rate in swap["link_acceptance"]))
+
+            work = meta["work"]
+            self.assertEqual(work["count"], swap["total_proposed"])
+            self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in work["link_mean"]))
+            self.assertTrue(any(abs(v) > 0 for v in work["link_mean"]))
+
+            # Evaluation-only: the field saved by NEO-REX equals the loaded checkpoint.
+            saved = torch.load(root / "data" / "neorex_flows" / "global.pt", map_location="cpu", weights_only=True)
+            self.assertEqual(saved["semantic_config"]["layer"], "cnf")
+            reference = field.state_dict()
+            flow_state = saved["state_dict"]
+            field_state = {k.removeprefix("nf_layer.field."): v for k, v in flow_state.items() if k.startswith("nf_layer.field.")}
+            self.assertEqual(field_state.keys(), reference.keys())
+            for key, value in reference.items():
+                torch.testing.assert_close(field_state[key], value, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
