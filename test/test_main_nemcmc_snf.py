@@ -530,7 +530,7 @@ class StandaloneMainTest(unittest.TestCase):
                 )
             )
 
-    def test_defect_class_has_nine_trainable_classes_and_fixed_inactive_baseline(self):
+    def test_defect_class_has_nine_trainable_classes_and_no_rho_outside_them(self):
         args = MAIN.parse_args(
             ["--algorithm", "snf", "--phase", "train", "--domain", "defect", "--cpu",
              "--D", "4", "--T", "4", "--L", "5", "--defect-size", "1",
@@ -547,8 +547,10 @@ class StandaloneMainTest(unittest.TestCase):
         rho = hyper(beta=torch.tensor([5.9]), delta_beta=torch.tensor([0.0]))
         active = hyper.class_masks.sum(dim=0) > 0
         self.assertTrue(torch.isfinite(rho).all().item())
-        self.assertTrue(torch.all(rho[0][~active] == MAIN.HYPER_CLASS_INACTIVE_RHO).item())
-        self.assertTrue(torch.all(rho[0][active] == 0.0).item())
+        self.assertTrue(torch.all(rho == 0.0).item())
+        rho = hyper(beta=torch.tensor([5.9]), delta_beta=torch.tensor([0.1]))
+        self.assertTrue(torch.all(rho[0][~active] == 0.0).item())
+        self.assertTrue(torch.any(rho[0][active] != 0.0).item())
 
     def test_runner_rejects_a_run_with_no_finite_work(self):
         args = MAIN.parse_args(

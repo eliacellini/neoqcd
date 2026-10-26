@@ -297,8 +297,6 @@ class _ConstantSpline:
         return self.value
 
 
-HYPER_CLASS_INACTIVE_RHO = 1e-4
-
 
 class HyperSmearing(torch.nn.Module):
     """
@@ -308,6 +306,8 @@ class HyperSmearing(torch.nn.Module):
     - "shared": one rho value per smearing sub-step, broadcast to all links/plaquettes/sites.
     - "per_link": one rho per (link-parity index m, plaquette index pl) per smearing sub-step.
     - "class": one rho per defect class per smearing sub-step, expanded via fixed class masks.
+      Staples outside every class get rho = 0, and Smearing leaves links with no classified
+      staple untransformed.
     """
 
     CLASS_NAMES = ("t1b", "t1e", "t1c", "t2", "t2b", "t2e", "t2c", "sp", "ex")
@@ -527,18 +527,12 @@ class HyperSmearing(torch.nn.Module):
                     )
                 rho = rho * delta_v.view((bsz,) + (1,) * (rho.dim() - 1))
         rho = self._apply_signed_floor(rho, active_mask=active_mask)
-        if self.mode == "class":
-            # Keep the nine class coefficients trainable, while retaining the
-            # historical positive baseline on links/sites outside their union.
-            # This is applied after delta scaling, clamp and floor so it also
-            # survives delta_beta == 0 and introduces no Jacobian masking.
-            inactive_rho = torch.as_tensor(
-                HYPER_CLASS_INACTIVE_RHO,
-                dtype=rho.dtype,
-                device=rho.device,
-            )
-            rho = active_mask * rho + (1.0 - active_mask) * inactive_rho
         return rho
+
+    def classified_links(self) -> torch.Tensor:
+        """Class mode: (D, *lattice) mask of the links with at least one classified staple."""
+        union = (self.class_masks.sum(dim=0) > 0).any(dim=1)  # (m, *lattice)
+        return union.view(self.D, 2, *union.shape[1:]).any(dim=1)
 
 
 def _su3_generators(dtype=torch.cdouble, device=None):
@@ -1275,7 +1269,8 @@ class Smearing(torch.nn.Module):
 
                     # SU(2) keeps the legacy full-lattice implementation; upstream's selected
                     # exact Jacobian is specifically the SU(3) stout path.
-                    current_mask = mask[m, :] * dmask if dmasking else mask[m, :]
+                    legacy_dmask = self._class_dmask(dmask if dmasking else None)
+                    current_mask = mask[m, :] if legacy_dmask is None else mask[m, :] * legacy_dmask
 
                     cfgs_new, jac = self.stout_smearing(cfgs, mu, rho)
                     cfgs = current_mask * cfgs_new + (1-current_mask) * cfgs
@@ -1329,8 +1324,28 @@ class Smearing(torch.nn.Module):
         self.last_inverse_stats = stats
         return flat.reshape(cfg_shape), 0, dlogJ
 
+    def _class_dmask(self, dmask):
+        """
+        In class mode, restrict dmask to the links with at least one classified staple: the
+        others are not transformed (rather than smeared with rho = 0). The tensor is cached so
+        that the link-index cache, keyed on dmask's identity, keeps working.
+        """
+        if not (self.use_hyper_smearing and self.hyper_smearing.mode == "class"):
+            return dmask
+        key = (id(dmask), None if dmask is None else dmask._version, self.hyper_smearing.class_masks.device)
+        cached = getattr(self, "_class_dmask_cache", None)
+        if cached is not None and cached[0] == key and cached[1] is dmask:
+            return cached[2]
+        classified = self.hyper_smearing.classified_links()
+        if dmask is None:
+            effective = classified.view(1, *classified.shape, 1, 1).to(dtype=torch.float64)
+        else:
+            effective = dmask * classified.view(dmask.shape).to(dtype=dmask.dtype, device=dmask.device)
+        self._class_dmask_cache = (key, dmask, effective)
+        return effective
+
     def _links_for_smearing_mask(self, mask, dmask=None):
-        return self._smearing_links_cache.get(mask, self.D, dmask)
+        return self._smearing_links_cache.get(mask, self.D, self._class_dmask(dmask))
 
     def _rho_at_sites(self, rho, channel, sites, batch_size, lattice_shape):
         rho = rho.to(device=sites.device)

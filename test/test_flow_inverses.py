@@ -214,5 +214,59 @@ class FlowInverseTests(unittest.TestCase):
             )
 
 
+class ClassModeTests(unittest.TestCase):
+    """Links with no classified staple are not transformed, so the map is the identity on them."""
+
+    def setUp(self):
+        torch.manual_seed(8)
+        self.field, self.pars, _ = build_cnf(_defect_config(batch_size=2, defect_size=2, L=7, hyper_smearing_mode="class"))
+        _perturb(self.field)
+        self.layer = DefectCouplingLayer(self.pars, torch.zeros(self.pars.rho_shape, dtype=torch.double), time=1.0)
+        self.layer.smearing.hyper_smearing.load_state_dict(self.field.smearing.hyper_smearing.state_dict())
+        self.cfgs = _smooth_links((2, 4, 4, 7, 7, 7), 0.3)
+        self.bc = torch.tensor([0.2, 0.7], dtype=torch.double)
+
+    def test_only_classified_links_move_and_the_map_is_the_identity_at_zero_step(self):
+        hyper = self.layer.smearing.hyper_smearing
+        smeared = self.pars.smeared_defect_mask[-1].squeeze(0).squeeze(-1).squeeze(-1) > 0
+        classified = hyper.classified_links() & smeared
+        self.assertGreater(int(classified.sum()), 0)
+        self.assertGreater(int(smeared.sum()), int(classified.sum()))
+        with torch.no_grad():
+            out, _, logdet = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=torch.full((2,), 0.3, dtype=torch.double))
+            small_out = self.pars.defect.cut_defect(out, buffer=2)
+            small_in = self.pars.defect.cut_defect(self.cfgs, buffer=2)
+            moved = ((small_out - small_in).abs().amax((-1, -2)) > 0).any(0)
+            self.assertTrue(torch.equal(moved, classified))
+            self.assertTrue(torch.isfinite(logdet).all())
+
+            same, _, logdet = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=torch.zeros(2, dtype=torch.double))
+            self.assertTrue(torch.equal(same, self.cfgs))
+            self.assertTrue(torch.all(logdet == 0))
+
+    def test_field_and_inverse_follow_the_same_links(self):
+        F = self.field.drift(self.cfgs, self.bc)
+        velocity = F.abs().sum(-1).amax(0) > 0
+        with torch.no_grad():
+            out, _, logdet = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=torch.full((2,), 0.3, dtype=torch.double))
+            back, _, logdet_inverse = self.layer.inverse(out, self.pars, None, beta=self.bc, delta_beta=torch.full((2,), 0.3, dtype=torch.double))
+        moved = ((out - self.cfgs).abs().amax((-1, -2)) > 0).any(0)
+        self.assertTrue(torch.equal(velocity, moved))
+        torch.testing.assert_close(back, self.cfgs, rtol=0, atol=1e-11)
+        torch.testing.assert_close(logdet_inverse, -logdet, rtol=0, atol=1e-10)
+
+    def test_path_gradient_is_finite(self):
+        from neoqcd.cnf import path_gradient_loss
+
+        def action(x, t):
+            return -2.0 * sum(p.flatten(1).sum(1).real for p in sun.plaquette_fields(x, 4))
+
+        result = path_gradient_loss(self.field, action, self.cfgs, self.bc)
+        result["loss"].sum().backward()
+        grads = [p.grad for p in self.field.parameters() if p.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+
+
 if __name__ == "__main__":
     unittest.main()

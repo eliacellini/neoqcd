@@ -354,6 +354,8 @@ class DefectSNFProtocolLayer(torch.nn.Module):
                 else None
             ),
         }
+        if hyper.mode == "class":
+            semantics["class_unclassified_links"] = "frozen"
         return semantics
 
     def _normalize_parameter(self, parameter: torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:

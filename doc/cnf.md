@@ -51,7 +51,9 @@ smeared patch have zero velocity. To first order in the step it equals the
 finite layer, so the trained network can be evaluated with that layer and its
 exact logdet (see below). It needs D=4, `T >= 4`, `L >= defect-size + 4` and a
 two-site buffer around the defect; `--hyper-smearing-mode` may be `shared`,
-`per_link` or `class`.
+`per_link` or `class`. The classes cover the staples that cross the defect
+boundary, so `class` suits large defects: links with no classified staple are
+not transformed (zero velocity), and unclassified staples get rho = 0.
 
 ## Run
 

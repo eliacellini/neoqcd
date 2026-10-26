@@ -34,7 +34,6 @@ import neoqcd.sun_utils as sun
 from neoqcd.smearing import (
     CouplingLayer,
     DefectCouplingLayer,
-    HYPER_CLASS_INACTIVE_RHO,
     ResidualCouplingLayer,
     ResidualNormalizingFlows,
 )
@@ -1654,7 +1653,9 @@ def _checkpoint_semantics(args, protocol: list[float]) -> dict:
         "hyper_activation": args.hyper_activation,
         "hyper_normalize_by_nstep": bool(args.hyper_normalize_by_nstep),
         "hyper_scale_by_delta": bool(args.hyper_scale_by_delta),
-        "hyper_class_inactive_rho": float(HYPER_CLASS_INACTIVE_RHO),
+        # Value of the class-mode baseline that unclassified links once got; kept so that the
+        # checkpoints of the other modes still match. Class mode now freezes those links.
+        "hyper_class_inactive_rho": 1e-4,
         "hyper_rho_eps": float(args.hyper_rho_eps),
         "hyper_rho_max": float(args.hyper_rho_max),
         "residual_include_imag": bool(args.residual_include_imag),
@@ -1667,6 +1668,9 @@ def _checkpoint_semantics(args, protocol: list[float]) -> dict:
     }
     if args.algorithm == "snf" and args.nf_architecture in {"smearing", "hyper-smearing"}:
         semantics["smearing_jacobian_version"] = "su3_stout_full_haar_logdet_v1"
+    if args.hyper_smearing_mode == "class":
+        del semantics["hyper_class_inactive_rho"]
+        semantics["hyper_class_unclassified_links"] = "frozen"
     if args.residual_n_pt or args.residual_mask_mod != 2:
         semantics.update(residual_n_pt=args.residual_n_pt, residual_mask_mod=args.residual_mask_mod)
     if args.nf_architecture == "cnf":
