@@ -224,6 +224,7 @@ __marimo__/
 
 # Project outputs
 results/
+output/
 job/reports/
 reports/*
 !reports/.gitkeep

@@ -41,6 +41,12 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 .sunenv/bin/python -m unittest \
   test.test_residual_normalizing_flows test.test_residual_frozen_convolution -v
 ```
 
+The whole suite (including a three-rank Gloo NEO-REX run) is discovered with:
+
+```sh
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 .sunenv/bin/python -m unittest discover -s test -t .
+```
+
 ## Classic SU(3) smearing Jacobian
 
 Classic SU(3) smearing now uses the exact full-Haar log determinant. The old
