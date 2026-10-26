@@ -38,7 +38,13 @@ def build_cnf(config, device="cpu"):
         residual_coeff_init=c["rho_init"],
     )
     if architecture == "clover-chair":
-        field = CloverChairLinkDrift(D, hidden_dim=c["hidden_dim"], depth=c["depth"])
+        # Checkpoints without this key predate the normalization and keep the raw parameter.
+        time_range = None
+        if c.get("time_normalization", "none") == "unit_interval":
+            time_range = (c["parameter_min"], c["parameter_max"])
+        elif c.get("time_normalization", "none") != "none":
+            raise ValueError(f"unknown time_normalization {c['time_normalization']!r}")
+        field = CloverChairLinkDrift(D, hidden_dim=c["hidden_dim"], depth=c["depth"], time_range=time_range)
     else:
         field = make_existing_drift(architecture, pars, rho_init=c["rho_init"])
     field.cnf_config = dict(config)

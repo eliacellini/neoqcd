@@ -134,7 +134,7 @@ class _LayerNorm(nn.Module):
 class CloverChairLinkDrift(nn.Module):
     """SU(3) version of CloverChairLinkDrift, without coarse or conditional inputs."""
 
-    def __init__(self, D, hidden_dim=16, depth=2, loop_max=2, zero_init=True):
+    def __init__(self, D, hidden_dim=16, depth=2, loop_max=2, zero_init=True, time_range=None):
         super().__init__()
         self.D = int(D)
         self.hidden_dim = int(hidden_dim)
@@ -144,6 +144,14 @@ class CloverChairLinkDrift(nn.Module):
             raise ValueError("CloverChairLinkDrift requires D >= 2")
         if self.hidden_dim < 1 or self.depth < 0 or self.loop_max < 1:
             raise ValueError("hidden_dim and loop_max must be positive; depth must be non-negative")
+        # The time encoder sees (t - t_min) / (t_max - t_min); None keeps the raw parameter.
+        if time_range is not None:
+            time_range = tuple(float(v) for v in time_range)
+            if len(time_range) != 2 or not all(math.isfinite(v) for v in time_range):
+                raise ValueError("time_range must be two finite values")
+            if not time_range[1] > time_range[0]:
+                raise ValueError("time_range must satisfy t_min < t_max")
+        self.time_range = time_range
 
         # Keep complex generators as ordinary attributes: Module.to(dtype=...) must not cast them.
         self._generators = _su3_generators(dtype=torch.cdouble, device="cpu")
@@ -302,6 +310,8 @@ class CloverChairLinkDrift(nn.Module):
 
     def _drift_given(self, U, S, C, t, generators, structure):
         inputs, vector, structure = self._context_and_vectors(U, S, C, generators, structure)
+        if self.time_range is not None:
+            t = (t - self.time_range[0]) / (self.time_range[1] - self.time_range[0])
         t_emb = self.time_encoder(t[:, None]).view(
             U.shape[0], *([1] * (self.D + 1)), self.hidden_dim
         )
@@ -341,6 +351,7 @@ class CloverChairLinkDrift(nn.Module):
             "hidden_dim": self.hidden_dim,
             "depth": self.depth,
             "loop_max": self.loop_max,
+            "time_range": self.time_range,
         }
 
 

@@ -58,6 +58,16 @@ class CNFIntegrationTest(unittest.TestCase):
                 torch.testing.assert_close(a, b)
             with self.assertRaisesRegex(ValueError, "domain"):
                 load_cnf_checkpoint(checkpoint, expected={"domain": "defect"})
+            self.assertIsNone(restored.time_range)
+
+            # Runner-created configs normalize the encoder input over the trained interval.
+            runner.main(["--output-dir", directory, "--D", "2", "--T", "2", "--L", "2",
+                         "--parameter-min", ".5", "--parameter-max", "1", "--replicas", "2",
+                         "--hidden-dim", "4", "--depth", "1", "--batch-size", "2",
+                         "--warmup", "0", "--epochs", "1"])
+            trained, _, _, payload = load_cnf_checkpoint(Path(directory) / "cnf_checkpoint.pt")
+            self.assertEqual(payload["config"]["time_normalization"], "unit_interval")
+            self.assertEqual(trained.time_range, (0.5, 1.0))
             with self.assertRaisesRegex(ValueError, "interval"):
                 load_cnf_checkpoint(checkpoint, parameter_range=(.5, 6.))
             opts = snf.parse_args(["--algorithm", "snf", "--phase", "evaluate", "--domain", "beta",

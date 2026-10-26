@@ -132,6 +132,7 @@ def main(argv=None):
         config = payload["config"]
     else:
         config = {key: value for key, value in vars(args).items() if not isinstance(value, Path)}
+        config["time_normalization"] = "unit_interval"
         field, pars, mask = build_cnf(config, args.device)
         payload = None
     ladder = torch.linspace(config["parameter_min"], config["parameter_max"], config["replicas"], dtype=torch.float64, device=args.device)

@@ -165,6 +165,22 @@ class CloverChairCNFTest(unittest.TestCase):
         self.assertEqual(layer.smearing_jacobian_version, None)
         self.assertEqual(layer.checkpoint_semantics["integrator"], "CF4")
 
+    def test_time_range_feeds_unit_interval_to_encoder(self):
+        U = random_su3()
+        raw = CloverChairLinkDrift(2, hidden_dim=4, depth=1, loop_max=1, zero_init=False).to(dtype=U.real.dtype)
+        scaled = CloverChairLinkDrift(
+            2, hidden_dim=4, depth=1, loop_max=1, zero_init=False, time_range=(5.8, 6.2)
+        ).to(dtype=U.real.dtype)
+        scaled.load_state_dict(raw.state_dict())
+        F, div = scaled(U, torch.tensor(6.1, dtype=torch.double))
+        F_raw, div_raw = raw(U, torch.tensor(0.75, dtype=torch.double))
+        torch.testing.assert_close(F, F_raw, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(div, div_raw, rtol=1e-12, atol=1e-12)
+        self.assertEqual(scaled.checkpoint_semantics["time_range"], (5.8, 6.2))
+        for bad in ((1.0, 1.0), (2.0, 1.0), (0.0, math.inf)):
+            with self.subTest(time_range=bad), self.assertRaises(ValueError):
+                CloverChairLinkDrift(2, hidden_dim=4, depth=1, time_range=bad)
+
 
 if __name__ == "__main__":
     unittest.main()
