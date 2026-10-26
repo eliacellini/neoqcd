@@ -217,6 +217,103 @@ class ExistingDrift(nn.Module):
         return self._field(cfgs, t, divergence=True)
 
 
+class DefectHyperSmearingDrift(nn.Module):
+    """The infinitesimal generator of the NEO-REX defect coupling layer.
+
+    The hyper-smearing generator acts on the links the discrete DefectCouplingLayer
+    smears in its cropped patch; every other link has zero velocity. rho is evaluated
+    with unit delta, so the field is a velocity per unit boundary coupling.
+    """
+
+    buffer = 2
+
+    def __init__(self, flow_pars):
+        super().__init__()
+        if int(flow_pars.N) != 3 or int(flow_pars.D) != 4:
+            raise ValueError("DefectHyperSmearingDrift supports SU(3) in D=4")
+        if int(flow_pars.rho_shape_type) != 3 or not flow_pars.use_hyper_smearing:
+            raise ValueError("DefectHyperSmearingDrift requires rho_shape_type=3 hyper-smearing")
+        if not flow_pars.hyper_scale_by_delta or flow_pars.hyper_normalize_by_nstep:
+            raise ValueError(
+                "a velocity per unit parameter requires hyper_scale_by_delta=True "
+                "and hyper_normalize_by_nstep=False"
+            )
+        if flow_pars.defect is None or not flow_pars.small_mask or not flow_pars.smeared_defect_mask:
+            raise ValueError("DefectHyperSmearingDrift requires the defect patch masks")
+        self.D = 4
+        self.defect = flow_pars.defect
+        self.steps = int(flow_pars.smearing_steps_per_layer)
+        self.smearing = Smearing(flow_pars, time=1.0)
+        # Plain attributes: the link-selection cache is keyed on these exact tensors.
+        self.small_mask = flow_pars.small_mask[-1]
+        self.smeared_defect_mask = flow_pars.smeared_defect_mask[-1]
+        self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
+
+    def _rho(self, t, cfgs):
+        t = torch.as_tensor(t, dtype=torch.float64, device=cfgs.device).reshape(-1)
+        hyper = self.smearing.hyper_smearing
+        if t.numel() == 1:
+            return hyper(beta=t[0], delta_beta=1.0), False
+        if t.numel() != cfgs.shape[0]:
+            raise ValueError(f"t has {t.numel()} values, expected 1 or {cfgs.shape[0]}")
+        return hyper(beta=t, delta_beta=torch.ones_like(t)), True
+
+    def _field(self, cfgs, t, *, divergence):
+        if not torch.is_tensor(cfgs) or not torch.is_complex(cfgs) or cfgs.shape[-2:] != (3, 3):
+            raise ValueError("cfgs must be a complex SU(3) link tensor ending in (3, 3)")
+        if cfgs.dim() != self.D + 4 or cfgs.shape[1] != self.D:
+            raise ValueError(f"cfgs must have shape (B, {self.D}, *lattice, 3, 3)")
+        rho, batched = self._rho(t, cfgs)
+        rho = rho.to(device=cfgs.device, dtype=cfgs.real.dtype)
+        links = self.smearing._links_for_smearing_mask(self.small_mask, self.smeared_defect_mask)
+        small = self.defect.cut_defect(cfgs, buffer=self.buffer)
+        cfg_shape = tuple(small.shape)
+        flat = sun.flat_links(small, self.D)
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+        coeffs = cfgs.real.new_zeros((*flat.shape[:2], 8))
+        div = cfgs.real.new_zeros(cfgs.shape[0])
+
+        for m in range(2 * self.D):
+            index = links.links[m]
+            if index.numel() == 0:
+                continue
+
+            def q_fn(value, m=m, index=index):
+                U = value.index_select(1, index)
+                q = 0
+                # Every substep contributes its instantaneous generator at the same configuration.
+                for step in range(self.steps):
+                    rho_step = rho[:, step, m] if batched else rho[step, m]
+                    C = self.smearing._selected_stout_staples(value, cfg_shape, links, m, rho_step)
+                    q = q + generate_Q(generate_omega(C, U), 3)
+                return _matrix_to_coordinates(q, generators)
+
+            coeffs = coeffs.index_copy(1, index, q_fn(flat))
+            if not divergence:
+                continue
+            # Staples of a parity class never contain its own links, so perturbing the
+            # whole class at once leaves only the diagonal derivatives.
+            U = flat.index_select(1, index)
+            for a in range(8):
+                tangent = torch.zeros_like(flat).index_copy(1, index, 1j * (generators[a] @ U))
+                _, dq = torch.func.jvp(q_fn, (flat,), (tangent,))
+                div = div + dq[..., a].sum(1)
+
+        coeffs = coeffs.reshape(*cfg_shape[:-2], 8)
+        full = cfgs.real.new_zeros((*cfgs.shape[:-2], 8))
+        return self.defect.embedding(coeffs, full, buffer=self.buffer), div
+
+    def drift(self, cfgs, t):
+        """Return Lie-algebra coordinates with shape ``cfgs.shape[:-2] + (8,)``."""
+        return self._field(cfgs, t, divergence=False)[0]
+
+    def forward(self, cfgs, t):
+        """Return ``(F, div F)`` for the Haar-measure Lie-algebra field."""
+        return self._field(cfgs, t, divergence=True)
+
+
 def make_existing_drift(architecture, flow_pars, rho_init=1e-3):
     """Build the infinitesimal field associated with an existing SNF architecture."""
+    if str(architecture).lower() == "defect-hyper-smearing":
+        return DefectHyperSmearingDrift(flow_pars)
     return ExistingDrift(architecture, flow_pars, rho_init=rho_init)

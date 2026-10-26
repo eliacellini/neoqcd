@@ -21,7 +21,7 @@ from neoqcd.mcmc import HBOR
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--phase", choices=("train", "evaluate"), default="train")
-    p.add_argument("--architecture", choices=("clover-chair", "smearing", "hyper-smearing", "residual", "hyper-residual"), default="clover-chair")
+    p.add_argument("--architecture", choices=("clover-chair", "smearing", "hyper-smearing", "defect-hyper-smearing", "residual", "hyper-residual"), default="clover-chair")
     p.add_argument("--domain", choices=("beta", "defect"), default="beta")
     p.add_argument("--D", type=int, default=2)
     p.add_argument("--T", type=int, default=4)
@@ -38,7 +38,7 @@ def parse_args(argv=None):
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--rho-init", type=float, default=1e-3)
     p.add_argument("--rho-functional", action="store_true")
-    p.add_argument("--hyper-smearing-mode", choices=("shared", "per_link"), default="shared")
+    p.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class"), default="shared")
     p.add_argument("--residual-n-pt", type=int, default=0)
     p.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2)
     p.add_argument("--orsteps", type=int, default=1)
@@ -78,8 +78,17 @@ def parse_args(argv=None):
         p.error("evaluation requires --checkpoint")
     if args.rho_functional and args.architecture != "smearing":
         p.error("rho-functional requires architecture=smearing")
-    if args.hyper_smearing_mode != "shared" and args.architecture != "hyper-smearing":
-        p.error("hyper-smearing-mode requires architecture=hyper-smearing")
+    if args.hyper_smearing_mode != "shared" and args.architecture not in {"hyper-smearing", "defect-hyper-smearing"}:
+        p.error("hyper-smearing-mode requires a hyper-smearing architecture")
+    if args.hyper_smearing_mode == "class" and args.architecture != "defect-hyper-smearing":
+        p.error("hyper-smearing-mode=class requires architecture=defect-hyper-smearing")
+    if args.architecture == "defect-hyper-smearing":
+        if args.domain != "defect":
+            p.error("defect-hyper-smearing requires --domain defect")
+        if args.T < 4 or args.L < args.defect_size + 4:
+            p.error("defect-hyper-smearing requires T >= 4 and L >= defect-size + 4")
+        if not (2 <= args.time_slice <= args.T - 2 and 2 <= args.space_slice <= args.L - args.defect_size - 2):
+            p.error("defect-hyper-smearing requires a two-site buffer around the defect")
     return args
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from neoqcd.flow import FlowPars
-from neoqcd.utils import Defect, create_mask
+from neoqcd.utils import Defect, create_around_defect_mask, create_mask
 
 
 def build_cnf(config, device="cpu"):
@@ -22,13 +22,16 @@ def build_cnf(config, device="cpu"):
         defect = Defect(D, T, L, c["defect_size"], c["time_slice"], c["space_slice"])
         defect_mask = defect.create_defect_mask().to(device)
     architecture = c["architecture"]
+    patch = {}
+    if architecture == "defect-hyper-smearing":
+        patch = _defect_patch(c, device)
     pars = FlowPars(
         D=D, T=T, L=L, N=3, mask=create_mask(D, T, L).to(device),
         protocol=[c["parameter_max"]], batch_size=c["batch_size"], device=device,
         defect=defect, orsteps=c["orsteps"],
-        use_hyper_smearing=architecture == "hyper-smearing",
+        use_hyper_smearing=architecture in {"hyper-smearing", "defect-hyper-smearing"},
         hyper_smearing_mode=c.get("hyper_smearing_mode", "shared"),
-        rho_shape_type=1 if c.get("hyper_smearing_mode") == "per_link" else 0,
+        rho_shape_type=3 if patch else 1 if c.get("hyper_smearing_mode") == "per_link" else 0,
         use_rho_functional=c.get("rho_functional", False), rho_scale_fac=c["rho_init"],
         hyper_hidden_dim=c["hidden_dim"], hyper_depth=c["depth"],
         hyper_normalize_by_nstep=False, hyper_scale_by_delta=True,
@@ -36,6 +39,7 @@ def build_cnf(config, device="cpu"):
         residual_parameterization="static" if architecture == "residual" else "hyper",
         residual_n_pt=c["residual_n_pt"], residual_mask_mod=c["residual_mask_mod"],
         residual_coeff_init=c["rho_init"],
+        **patch,
     )
     if architecture == "clover-chair":
         # Checkpoints without this key predate the normalization and keep the raw parameter.
@@ -49,6 +53,26 @@ def build_cnf(config, device="cpu"):
         field = make_existing_drift(architecture, pars, rho_init=c["rho_init"])
     field.cnf_config = dict(config)
     return field.to(device=device, dtype=torch.float64), pars, defect_mask
+
+
+def _defect_patch(c, device):
+    """Cropped patch masks of the NEO-REX defect coupling layer (buffer 2)."""
+    D, T, L = (int(c[key]) for key in ("D", "T", "L"))
+    size, time_slice, space_slice = (int(c[key]) for key in ("defect_size", "time_slice", "space_slice"))
+    buffer = 2
+    if c["domain"] != "defect" or D != 4:
+        raise ValueError("defect-hyper-smearing requires domain='defect' and D=4")
+    if T < 2 * buffer or L < size + 2 * buffer:
+        raise ValueError(f"defect-hyper-smearing requires T >= 4 and L >= defect_size + 4; got T={T}, L={L}")
+    if not buffer <= time_slice <= T - buffer or not buffer <= space_slice <= L - size - buffer:
+        raise ValueError("defect-hyper-smearing requires a two-site buffer around the defect")
+    small_t, small_l = 2 * buffer, size + 2 * buffer
+    small_defect = Defect(D, small_t, small_l, size, time_slice=buffer, space_slice=buffer)
+    return {
+        "small_mask": [create_mask(D, small_t, small_l).to(device)],
+        "smeared_defect_mask": [create_around_defect_mask(D, size, buffer=buffer).to(device)],
+        "small_defect_mask": [small_defect.create_defect_mask().to(device)],
+    }
 
 
 def save_cnf_checkpoint(path, field, config, *, epoch=0, trainer=None):
