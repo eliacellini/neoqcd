@@ -30,19 +30,25 @@ def _shift(field, direction, amount):
     return torch.roll(field, shifts=amount, dims=1 + direction)
 
 
-def _link(U, direction, sign):
-    link = U[:, direction]
-    return link if sign > 0 else sun.SUN_dagger(_shift(link, direction, -1))
+def _links_and_daggers(U):
+    """The D link fields and their conjugate transposes, conjugated once for every path."""
+    return U.unbind(1), torch.conj_physical(U).transpose(-2, -1).unbind(1)
 
 
-def _path_product(U, steps):
+def _path_product(U, steps, links=None):
+    """Ordered product along a path; links=_links_and_daggers(U) shares their work across paths."""
+    links, daggers = _links_and_daggers(U) if links is None else links
     offset = [0] * U.shape[1]
     product = None
     for direction, sign in steps:
-        link = _link(U, direction, sign)
-        for axis, amount in enumerate(offset):
-            if amount:
-                link = _shift(link, axis, amount)
+        shift = list(offset)
+        if sign < 0:
+            shift[direction] -= 1
+        axes = [axis for axis, amount in enumerate(shift) if amount]
+        link = links[direction] if sign > 0 else daggers[direction]
+        if axes:
+            # One roll over every shifted axis; rolls commute with the dagger.
+            link = torch.roll(link, shifts=[shift[axis] for axis in axes], dims=[1 + axis for axis in axes])
         product = link if product is None else sun.SUN_mul(product, link)
         offset[direction] += sign
     return product
@@ -258,6 +264,7 @@ class CloverChairLinkDrift(nn.Module):
 
     def _staples(self, U):
         extents = tuple(int(n) for n in U.shape[2:-2])
+        links = _links_and_daggers(U)
         per_direction = []
         for mu in range(self.D):
             channels = []
@@ -270,21 +277,21 @@ class CloverChairLinkDrift(nn.Module):
                     start = tuple(-int(i == mu) for i in range(self.D))
                     safe = not _uses_periodic_link(paths, mu, start, extents)
                     channels.append(
-                        _shift(_path_product(U, paths), mu, 1) if safe else torch.zeros_like(U[:, mu])
+                        _shift(_path_product(U, paths, links), mu, 1) if safe else torch.zeros_like(U[:, mu])
                     )
             for paths in self._rect_paths[mu]:
                 safe = not _uses_periodic_link(
                     paths, mu, tuple(-int(i == mu) for i in range(self.D)), extents
                 )
                 channels.append(
-                    _shift(_path_product(U, paths), mu, 1) if safe else torch.zeros_like(U[:, mu])
+                    _shift(_path_product(U, paths, links), mu, 1) if safe else torch.zeros_like(U[:, mu])
                 )
             for paths in self._chair_path_data[mu]:
                 safe = not _uses_periodic_link(
                     paths, mu, tuple(-int(i == mu) for i in range(self.D)), extents
                 )
                 channels.append(
-                    _shift(_path_product(U, paths), mu, 1) if safe else torch.zeros_like(U[:, mu])
+                    _shift(_path_product(U, paths, links), mu, 1) if safe else torch.zeros_like(U[:, mu])
                 )
             per_direction.append(torch.stack(channels, dim=1))
         return torch.stack(per_direction, dim=1)
@@ -292,6 +299,7 @@ class CloverChairLinkDrift(nn.Module):
     def _leaves(self, U):
         paths = _clover_paths(self.D)
         extents = tuple(int(n) for n in U.shape[2:-2])
+        links = _links_and_daggers(U)
         per_direction = []
         for mu in range(self.D):
             channels = []
@@ -299,7 +307,7 @@ class CloverChairLinkDrift(nn.Module):
             for index in indices:
                 path = paths[index]
                 safe = not _uses_periodic_link(path, mu, (0,) * self.D, extents)
-                channels.append(_path_product(U, path) if safe else torch.zeros_like(U[:, mu]))
+                channels.append(_path_product(U, path, links) if safe else torch.zeros_like(U[:, mu]))
             per_direction.append(torch.stack(channels, dim=1))
         return torch.stack(per_direction, dim=1)
 

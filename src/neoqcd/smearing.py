@@ -760,13 +760,30 @@ class ResidualNormalizingFlows(torch.nn.Module):
         delta_v = delta_v.to(device=device, dtype=dtype)
         return lin, quad, delta_v
 
+    def _staple_pair(self, links, daggers, mu, nu):
+        """sun.pstaple and sun.nstaple of direction mu in the plane (mu, nu), bit for bit.
+
+        links and daggers are the D link fields and their conjugate transposes, computed once:
+        the conjugations are not repeated for every staple and its backward.
+        """
+        D = self.D
+        dim_mu, dim_nu = -D + mu - 2, -D + nu - 2
+        upper = sun.SUN_mul(sun.SUN_mul(torch.roll(links[nu], 1, dim_mu), torch.roll(daggers[mu], 1, dim_nu)),
+                            daggers[nu])
+        lower = sun.SUN_mul(sun.SUN_mul(torch.roll(daggers[nu], 1, dim_mu), daggers[mu]), links[nu])
+        return upper, torch.roll(lower, -1, dim_nu)
+
+    @staticmethod
+    def _links_and_daggers(cfgs):
+        return cfgs.unbind(1), torch.conj_physical(cfgs).transpose(-2, -1).unbind(1)
+
     def _oriented_staples(self, cfgs, mu):
+        links, daggers = self._links_and_daggers(cfgs)
         staples = []
         for nu in range(self.D):
             if nu == mu:
                 continue
-            staples.append(sun.pstaple(cfgs, mu, nu, self.D))
-            staples.append(sun.nstaple(cfgs, mu, nu, self.D))
+            staples.extend(self._staple_pair(links, daggers, mu, nu))
         return torch.stack(staples, dim=1)
 
     def _features(self, staples, U):
@@ -883,21 +900,23 @@ class ResidualNormalizingFlows(torch.nn.Module):
 
     def _frozen_convolution(self, values, step, point):
         # Staple helpers run opposite to a link; their daggers are link-like.
-        eta = self.conv_eta[int(step), int(point)].to(dtype=values.real.dtype, device=values.device)
-        values_next = values.clone()
+        # With real eta, the dagger of the weighted staple sum is the weighted sum of the daggers.
+        # Cast once to the complex dtype: per-term type promotion would launch a cast per product.
+        eta = self.conv_eta[int(step), int(point)].to(dtype=values.dtype, device=values.device)
+        links, daggers = self._links_and_daggers(values)
+        values_next = []
         for mu in range(self.D):
-            update = torch.zeros_like(values[:, mu])
+            update = None
             nu_index = 0
             for nu in range(self.D):
                 if nu == mu:
                     continue
-                update = update + eta[mu, nu_index] * (
-                    sun.SUN_dagger(sun.pstaple(values, mu, nu, self.D))
-                    + sun.SUN_dagger(sun.nstaple(values, mu, nu, self.D))
-                )
+                upper, lower = self._staple_pair(links, daggers, mu, nu)
+                term = eta[mu, nu_index] * (upper + lower)
+                update = term if update is None else update + term
                 nu_index += 1
-            values_next[:, mu] = values[:, mu] + update
-        return values_next
+            values_next.append(links[mu] + sun.SUN_dagger(update))
+        return torch.stack(values_next, dim=1)
 
     def staple_sum(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
         """
