@@ -289,6 +289,34 @@ def det_Jac(J):
     return torch.linalg.det(J)
 
 
+_LATTICE_IDS = {}
+
+
+def _lattice_shifts(lattice, device):
+    """Flat site ids of a periodic box and their +-1 rolls along each axis (the torch.roll convention)."""
+    key = (tuple(lattice), str(device))
+    if key not in _LATTICE_IDS:
+        ids = torch.arange(int(np.prod(lattice)), device=device).reshape(lattice)
+        _LATTICE_IDS[key] = {(amount, axis): torch.roll(ids, amount, dims=axis).flatten()
+                             for axis in range(len(lattice)) for amount in (1, -1)}
+    return _LATTICE_IDS[key]
+
+
+def _staple_tables(lattice, direction, sites, device):
+    """For links (direction, sites): one (6, n) table of flat link ids per other direction, as sun.staples_at reads."""
+    D, V = len(lattice), int(np.prod(lattice))
+    shift = _lattice_shifts(lattice, device)
+    tables = []
+    for nu in range(D):
+        if nu == direction:
+            continue
+        xpmu, xpnu, xmnu = shift[(1, direction)], shift[(1, nu)], shift[(-1, nu)]
+        y = xmnu[sites]
+        tables.append(torch.stack((nu * V + xpmu[sites], direction * V + xpnu[sites], nu * V + sites,
+                                   nu * V + xpmu[y], direction * V + y, nu * V + y)))
+    return tables
+
+
 class _ConstantSpline:
     def __init__(self, value: float):
         self.value = float(value)
@@ -1016,6 +1044,53 @@ class ResidualNormalizingFlows(torch.nn.Module):
         with record_function("residual.staples"):
             return self._oriented_staples(cfgs, mu)
 
+    def _convolution_plan(self, lattice, mu, sites, device):
+        """Index tables for the staples of links (mu, sites) and, per convolution point, for the
+        links whose convolved values those staples read (computed backwards from the staples)."""
+        key = (tuple(lattice), int(mu), str(device), sites.cpu().numpy().tobytes())
+        cache = self.__dict__.setdefault("_convolution_plans", {})
+        if key in cache:
+            return cache[key]
+        V = int(np.prod(lattice))
+        final = _staple_tables(lattice, mu, sites, device)
+        needed = torch.cat([table.flatten() for table in final]).unique()
+        stages = []
+        for _ in range(self.n_pt):
+            # A convolved link reads itself and its own staples one point earlier.
+            stage = []
+            for direction in range(self.D):
+                ids = needed[needed // V == direction]
+                if ids.numel():
+                    stage.append((direction, ids, _staple_tables(lattice, direction, ids % V, device)))
+            stages.append(stage)
+            reads = [needed] + [table.flatten() for _, _, tables in stage for table in tables]
+            needed = torch.cat(reads).unique()
+        cache[key] = (final, stages[::-1])
+        return cache[key]
+
+    def _selected_staples(self, cfgs, mu, step, current_mask, sites):
+        """_mask_staples gathered at sites, with every convolution evaluated only where it is read."""
+        lattice = tuple(cfgs.shape[2:2 + self.D])
+        final, stages = self._convolution_plan(lattice, mu, sites, cfgs.device)
+        if self.n_pt:
+            with record_function("residual.frozen_convolution"):
+                flat = ((1.0 - current_mask) * cfgs).flatten(1, self.D + 1)
+                for point, stage in enumerate(stages):
+                    eta = self.conv_eta[int(step), point].to(dtype=cfgs.dtype, device=cfgs.device)
+                    convolved = flat
+                    for direction, ids, tables in stage:
+                        update = None
+                        for nu_index, table in enumerate(tables):
+                            upper, lower = sun.staples_at(flat, table)
+                            term = eta[direction, nu_index] * (upper + lower)
+                            update = term if update is None else update + term
+                        convolved = convolved.index_copy(1, ids, flat.index_select(1, ids) + sun.SUN_dagger(update))
+                    flat = convolved
+        else:
+            flat = cfgs.flatten(1, self.D + 1)
+        with record_function("residual.staples"):
+            return torch.stack([staple for table in final for staple in sun.staples_at(flat, table)], dim=1)
+
     def staple_sum(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
         """
         The weighted staple sum C of the links in direction mu, with exp(iQ(C U^dagger)) their
@@ -1059,7 +1134,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
         if lin.dim() > 2:  # per-staple coefficients carry the site axes
             lin = lin.flatten(2).index_select(2, sites)
             quad = quad.flatten(3).index_select(3, sites)
-        staples = self._mask_staples(cfgs, mu, step, current_mask).flatten(2, self.D + 1).index_select(2, sites)
+        staples = self._selected_staples(cfgs, mu, step, current_mask, sites)
         links = cfgs[:, mu].flatten(1, self.D)
         U = links.index_select(1, sites)
         iterations, residual = 0, 0.0
