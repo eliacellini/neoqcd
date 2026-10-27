@@ -45,6 +45,7 @@ def main():
     field, pars, defect_mask, payload = load_cnf_checkpoint(args.checkpoint, device)
     layer = DefectCouplingLayer(pars, torch.zeros(pars.rho_shape, dtype=torch.double, device=device), time=1.0)
     layer.smearing.hyper_smearing.load_state_dict(field.smearing.hyper_smearing.state_dict())
+    layer = layer.to(device)
     D, T, L = int(pars.D), int(pars.T), int(pars.L)
     for batch in args.batch:
         U = sun.SUN_haar((batch, D, T, *([L] * (D - 1)), 3), dtype=torch.cdouble, device=device)
