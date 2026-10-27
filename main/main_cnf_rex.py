@@ -64,6 +64,9 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, help="Resume training or load a field for evaluation")
+    p.add_argument("--init-cfgs", type=Path,
+                   help="Start the chains from a main_pt_obc.py configuration cache (data/cfgs/<run>): "
+                        "rank r loads the chains it thermalized at the r-th rung of the same ladder")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--protocol-steps", type=int, default=4)
     p.add_argument("--integration-steps", type=int, default=4)
@@ -93,6 +96,8 @@ def parse_args(argv=None):
             p.error("defect must fit inside the lattice")
     if args.phase == "evaluate" and args.checkpoint is None:
         p.error("evaluation requires --checkpoint")
+    if args.init_cfgs is not None and (args.checkpoint is not None or args.domain != "defect"):
+        p.error("--init-cfgs starts a new defect run: it excludes --checkpoint and needs --domain defect")
     if args.rho_functional and args.architecture != "smearing":
         p.error("rho-functional requires architecture=smearing")
     if args.hyper_smearing_mode != "shared" and args.architecture not in {"hyper-smearing", "defect-hyper-smearing"}:
@@ -213,6 +218,26 @@ def _profiled_step(trainer, path):
     return metrics
 
 
+def _thermalized_cfgs(directory, config, ladder, rank, world_size):
+    """This rank's chains from a main_pt_obc.py cache, after checking it describes this run."""
+    if not (directory / "DONE").exists():
+        raise ValueError(f"{directory} is not a completed configuration cache")
+    key = json.loads((directory / "meta.json").read_text())["key"]
+    expected = {"D": config["D"], "T": config["T"], "L": config["L"], "N": 3, "beta": config["beta"],
+                "defect_size": config["defect_size"], "time_slice": config["time_slice"],
+                "space_slice": config["space_slice"], "batch_size": config["batch_size"],
+                "world_size": world_size, "parameter_name": "bc", "orsteps": config["orsteps"]}
+    for name, value in expected.items():
+        if key.get(name) != value:
+            raise ValueError(f"configuration cache {name}: cached {key.get(name)!r}, this run {value!r}")
+    if not torch.allclose(torch.tensor(key["parameter_ladder"], dtype=torch.float64), ladder.cpu(), rtol=0, atol=1e-12):
+        raise ValueError("configuration cache was thermalized on another ladder")
+    payload = torch.load(directory / f"rank_{rank:03d}.pt", map_location="cpu", weights_only=True)
+    if int(payload["rank"]) != rank:
+        raise ValueError(f"configuration cache file of rank {payload['rank']} read by rank {rank}")
+    return payload["cfgs"]
+
+
 def _shard_path(checkpoint, rank):
     return checkpoint.with_name(f"{checkpoint.stem}.rank{rank}{checkpoint.suffix}")
 
@@ -254,6 +279,14 @@ def main(argv=None):
                 torch.cuda.set_rng_state_all(payload["cuda_rng"])
         start = payload["epoch"]
     else:
+        if args.init_cfgs is not None:
+            if not distributed:
+                raise SystemExit("--init-cfgs needs one replica per rank under torchrun")
+            # A new trainer has rank r's chains at ladder[r], as in the thermalization run.
+            cfgs = _thermalized_cfgs(args.init_cfgs, config, ladder, rank, world_size)
+            if tuple(cfgs.shape) != tuple(trainer.x.shape):
+                raise ValueError(f"cached chains {tuple(cfgs.shape)}, trainer chains {tuple(trainer.x.shape)}")
+            trainer.x.copy_(cfgs.to(device=trainer.x.device, dtype=trainer.x.dtype))
         trainer.warmup(config["warmup"])
     if rank == 0:
         args.output_dir.mkdir(parents=True, exist_ok=True)

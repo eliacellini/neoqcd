@@ -449,6 +449,9 @@ class DistributedCNFREXTrainer:
         self.n_updates += 1
 
         labels, losses, residuals = self._gather(self._labels()), self._gather(loss), self._gather(xi)
+        # Average plaquette Re tr P / N per chain, to follow the thermalization of each rung.
+        with torch.no_grad():
+            plaquettes = self._gather(sun.plaquette_SUN(self.x, int(self.flow_pars.D), int(self.flow_pars.N)))
         by_rung = [labels == k for k in range(self.world_size)]
         n_links = self.world_size - 1
         links = torch.tensor(stats["link_accepted"] + stats["link_proposed"], dtype=torch.float64, device=self.device) \
@@ -464,6 +467,7 @@ class DistributedCNFREXTrainer:
             "losses_by_rung": [float(losses[r].mean()) for r in by_rung],
             "pinn_by_rung": [float(self.volume * residuals[r].var(unbiased=False)) for r in by_rung],
             "residuals_by_rung": [float(residuals[r].mean()) for r in by_rung],
+            "plaquette_by_rung": [float(plaquettes[r].mean()) for r in by_rung],
             "swap_acceptance_by_edge": [float(v) for v in accepted / proposed.clamp_min(1.0)],
             "swap_acceptance": float(accepted.sum() / proposed.sum().clamp_min(1.0)),
             "grad_norm": grad_norm,

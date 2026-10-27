@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from neoqcd.cnf import path_gradient_loss
 from neoqcd.cnf_io import build_cnf
 from neoqcd.cnf_training import DistributedCNFREXTrainer
-from test.test_cnf_neorex import _free_port
+from test.test_cnf_neorex import _free_port, _multirank_worker as _pt_obc_worker
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = dict(
@@ -108,6 +108,38 @@ class DistributedPathGradientTest(unittest.TestCase):
             checkpoint = torch.load(out / "cnf_checkpoint.pt", weights_only=False)
             self.assertEqual(checkpoint["epoch"], 2)
             self.assertTrue(checkpoint["trainer"]["distributed"])
+
+    def test_training_starts_from_chains_thermalized_by_pt_obc(self):
+        geometry = ["--D", "4", "--T", "4", "--L", "6", "--defect-size", "1", "--time-slice", "2",
+                    "--space-slice", "2", "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
+                    "--batch-size", "2", "--orsteps", "1"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mp.spawn(_pt_obc_worker, args=(3, _free_port(), [
+                "--cpu", "--algorithm", "pt", "--N", "3", *geometry, "--thermal-steps", "2", "--steps", "0",
+                "--main-dir", str(root), "--output-dir", str(root / "pt"), "--cfg-cache-dir", str(root / "cfgs"),
+            ]), nprocs=3, join=True)
+            (cache,) = (root / "cfgs").iterdir()
+
+            out = root / "run"
+            train = ["--architecture", "defect-hyper-smearing", "--domain", "defect", *geometry, "--replicas", "3",
+                     "--hidden-dim", "4", "--depth", "1", "--warmup", "0", "--epochs", "1", "--output-dir", str(out)]
+            mp.spawn(_main_worker, args=(3, _free_port(), [*train, "--init-cfgs", str(cache)]), nprocs=3, join=True)
+            (line,) = [json.loads(line) for line in (out / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual(len(line["plaquette_by_rung"]), 3)
+            self.assertTrue(all(0.0 < p < 1.0 for p in line["plaquette_by_rung"]))
+
+            spec = importlib.util.spec_from_file_location("main_cnf_rex", ROOT / "main" / "main_cnf_rex.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            config = json.loads((out / "config.json").read_text())
+            ladder = torch.linspace(0.0, 1.0, 3, dtype=torch.float64)
+            cached = torch.load(cache / "rank_001.pt", weights_only=True)["cfgs"]
+            torch.testing.assert_close(module._thermalized_cfgs(cache, config, ladder, 1, 3), cached, rtol=0, atol=0)
+            with self.assertRaisesRegex(ValueError, "orsteps"):
+                module._thermalized_cfgs(cache, dict(config, orsteps=4), ladder, 1, 3)
+            with self.assertRaisesRegex(ValueError, "ladder"):
+                module._thermalized_cfgs(cache, config, torch.linspace(0.0, 0.5, 3, dtype=torch.float64), 1, 3)
 
 
 if __name__ == "__main__":
