@@ -46,7 +46,7 @@ for entry in ${FIELDS:?set FIELDS}; do
     smearing) NET=(--nf-architecture hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}" --hyper-hidden-dim 16
                    --hyper-depth 2 --hyper-no-normalize-by-nstep) ;;
     residual) NET=(--nf-architecture hyper-residual --hyper-hidden-dim 16 --hyper-depth 2
-                   --residual-n-pt 1 --residual-mask-mod 4) ;;
+                   --residual-n-pt 1 --residual-mask-mod 4 --residual-mode "${RESIDUAL_MODE:-shared}") ;;
     clover)   NET=(--nf-architecture cnf --cnf-checkpoint "$ckpt" --cnf-integration-steps "$CNF_STEPS") ;;
     *) echo "unknown field $name" >&2; exit 2 ;;
   esac

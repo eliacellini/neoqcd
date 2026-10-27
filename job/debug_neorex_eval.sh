@@ -46,7 +46,7 @@ for entry in ${METHODS:?set METHODS}; do
                    --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
                    --hyper-rho-eps 0 --hyper-rho-max 0) ;;
     residual) ALG=(--algorithm neorex --nf-layer-type residual --hyper-hidden-dim 16 --hyper-depth 2
-                   --residual-n-pt 1 --residual-mask-mod 4 --residual-quadratic --residual-include-imag
+                   --residual-n-pt 1 --residual-mask-mod 4 --residual-mode "${RESIDUAL_MODE:-shared}" --residual-quadratic --residual-include-imag
                    --residual-coeff-max 0) ;;
     clover)   ALG=(--algorithm neorex --nf-layer-type cnf --cnf-checkpoint "$ckpt" --cnf-integration-steps "$CNF_STEPS") ;;
     *) echo "unknown method $name" >&2; exit 2 ;;
