@@ -63,7 +63,7 @@ class StoutInverseTests(unittest.TestCase):
                     U = flat.index_select(1, links.links[m])
                     Up, logdet = smearing_step(U, C)
                     self.assertGreater((Up - U).abs().max().item(), 1e-4)
-                    U_back, logdet_inverse, iterations, residual = inverse_smearing_step(Up, C)
+                    U_back, logdet_inverse, iterations, residual = inverse_smearing_step(Up, C, check_every=1)
                     self.assertLessEqual(residual.item(), 1e-12)
                     self.assertLess(iterations, 20)
                     torch.testing.assert_close(U_back, U, rtol=0, atol=1e-11)

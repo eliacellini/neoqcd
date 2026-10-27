@@ -327,12 +327,13 @@ def smearing_step(U, C):
     logdet = torch.linalg.slogdet(jacobian_matrix(stepq.jacobian())).logabsdet
     return stepq.Up, logdet
 
-def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100):
+def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100, check_every=4):
     # Inverse of smearing_step at fixed staple sums C, by the fixed-point iteration of
-    # sun.invert_left_update. Returns U, the log|det| of the inverse map (minus the forward one at U),
+    # sun.invert_left_update, testing convergence every check_every iterations (each test waits for
+    # the device). Returns U, the log|det| of the inverse map (minus the forward one at U),
     # the number of iterations and the largest residual |exp(iQ) U - Up|.
     U, iterations, residual = sun.invert_left_update(
-        lambda V: StepQuantities(V, C).X, Up, tol=tol, max_iter=max_iter
+        lambda V: StepQuantities(V, C).X, Up, tol=tol, max_iter=max_iter, check_every=check_every
     )
     return U, -smearing_step(U, C)[1], iterations, residual
 
