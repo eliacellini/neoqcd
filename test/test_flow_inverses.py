@@ -217,9 +217,11 @@ class FlowInverseTests(unittest.TestCase):
 class ClassModeTests(unittest.TestCase):
     """Links with no classified staple are not transformed, so the map is the identity on them."""
 
+    MODE = "class"
+
     def setUp(self):
         torch.manual_seed(8)
-        self.field, self.pars, _ = build_cnf(_defect_config(batch_size=2, defect_size=2, L=7, hyper_smearing_mode="class"))
+        self.field, self.pars, _ = build_cnf(_defect_config(batch_size=2, defect_size=2, L=7, hyper_smearing_mode=self.MODE))
         _perturb(self.field)
         self.layer = DefectCouplingLayer(self.pars, torch.zeros(self.pars.rho_shape, dtype=torch.double), time=1.0)
         self.layer.smearing.hyper_smearing.load_state_dict(self.field.smearing.hyper_smearing.state_dict())
@@ -266,6 +268,21 @@ class ClassModeTests(unittest.TestCase):
         grads = [p.grad for p in self.field.parameters() if p.grad is not None]
         self.assertTrue(grads)
         self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+
+
+class PerSiteModeTests(ClassModeTests):
+    """One rho per covered link and staple: the class-mode guarantees, with independent values."""
+
+    MODE = "per_site"
+
+    def test_every_covered_staple_has_its_own_rho(self):
+        hyper = self.layer.smearing.hyper_smearing
+        active = hyper.active_entries()
+        self.assertEqual(hyper.coeffs_per_step, int(active.sum()))
+        rho = hyper(beta=0.4, delta_beta=1.0)[0]
+        self.assertTrue(torch.all(rho[~active] == 0))
+        # After the perturbation, the covered entries take (almost) all different values.
+        self.assertGreater(rho[active].unique().numel(), 0.9 * int(active.sum()))
 
 
 if __name__ == "__main__":

@@ -309,6 +309,9 @@ class HyperSmearing(torch.nn.Module):
     - "class": one rho per defect class per smearing sub-step, expanded via fixed class masks.
       Staples outside every class get rho = 0, and Smearing leaves links with no classified
       staple untransformed.
+    - "per_site": one rho per link and staple orientation at every position the defect classes
+      cover (the defect links and those with a defect link in a staple); the others are 0 and
+      left untransformed, as in class mode.
     """
 
     CLASS_NAMES = ("t1b", "t1e", "t1c", "t2", "t2b", "t2e", "t2c", "sp", "ex")
@@ -316,9 +319,9 @@ class HyperSmearing(torch.nn.Module):
     def __init__(self, flow_pars, time):
         super().__init__()
         self.mode = str(getattr(flow_pars, "hyper_smearing_mode", "shared")).lower()
-        if self.mode not in {"shared", "per_link", "class"}:
+        if self.mode not in {"shared", "per_link", "class", "per_site"}:
             raise ValueError(
-                f"hyper_smearing_mode must be 'shared', 'per_link', or 'class', got {self.mode!r}"
+                f"hyper_smearing_mode must be 'shared', 'per_link', 'class' or 'per_site', got {self.mode!r}"
             )
 
         self.D = int(flow_pars.D)
@@ -367,10 +370,15 @@ class HyperSmearing(torch.nn.Module):
             self.coeffs_per_step = self.n_m * self.n_pl
         else:
             if int(flow_pars.rho_shape_type) != 3:
-                raise ValueError("hyper_smearing_mode='class' requires rho_shape_type=3")
-            self.coeffs_per_step = len(self.CLASS_NAMES)
+                raise ValueError(f"hyper_smearing_mode={self.mode!r} requires rho_shape_type=3")
             class_masks = self._build_class_masks(flow_pars)
             self.register_buffer("class_masks", class_masks.to(dtype=torch.float64))
+            if self.mode == "class":
+                self.coeffs_per_step = len(self.CLASS_NAMES)
+            else:
+                # Flat indices of the (m, pl, *site) entries some class covers.
+                self.register_buffer("site_index", torch.nonzero(self.active_entries().flatten()).squeeze(1))
+                self.coeffs_per_step = int(self.site_index.numel())
 
         # embedding = fourier(beta) || [beta, time]
         in_dim = self.scalar_emb_dim + 2
@@ -467,6 +475,8 @@ class HyperSmearing(torch.nn.Module):
             if self.mode == "per_link":
                 view = (self.smearing_steps, self.n_m, self.n_pl) + (1,) * spatial_rank
                 return coeffs.view(view).expand(self.rho_shape)
+            if self.mode == "per_site":
+                return self._scatter_sites(coeffs)
             return torch.einsum("sc,c...->s...", coeffs, self.class_masks)
 
         if coeffs.dim() == 3:
@@ -477,9 +487,21 @@ class HyperSmearing(torch.nn.Module):
             if self.mode == "per_link":
                 view = (bsz, self.smearing_steps, self.n_m, self.n_pl) + (1,) * spatial_rank
                 return coeffs.view(view).expand((bsz,) + self.rho_shape)
+            if self.mode == "per_site":
+                return self._scatter_sites(coeffs)
             return torch.einsum("bsc,c...->bs...", coeffs, self.class_masks)
 
         raise ValueError(f"Unsupported coeffs shape {tuple(coeffs.shape)}")
+
+    def _scatter_sites(self, coeffs: torch.Tensor) -> torch.Tensor:
+        """(..., steps, n_sites) -> (..., *rho_shape), zero outside the covered entries."""
+        entries = self.class_masks[0].numel()
+        flat = coeffs.new_zeros(*coeffs.shape[:-1], entries).index_copy(-1, self.site_index, coeffs)
+        return flat.view(*coeffs.shape[:-1], *self.class_masks.shape[1:])
+
+    def active_entries(self) -> torch.Tensor:
+        """Class and per_site modes: (m, pl, *site) mask of the staples some class covers."""
+        return self.class_masks.sum(dim=0) > 0
 
     def _apply_signed_floor(self, rho: torch.Tensor, active_mask: torch.Tensor = None) -> torch.Tensor:
         if self.rho_eps <= 0.0:
@@ -499,8 +521,8 @@ class HyperSmearing(torch.nn.Module):
         rho = self._expand_coeffs(coeffs)
         if self.normalize_by_nstep:
             rho = rho / float(self.nstep)
-        if self.mode == "class":
-            active_base = (self.class_masks.sum(dim=0, keepdim=True) > 0).to(dtype=rho.dtype)
+        if self.mode in {"class", "per_site"}:
+            active_base = self.active_entries().unsqueeze(0).to(dtype=rho.dtype)
             if rho.dim() == len(self.rho_shape):
                 active_mask = active_base.expand_as(rho)
             else:
@@ -531,8 +553,8 @@ class HyperSmearing(torch.nn.Module):
         return rho
 
     def classified_links(self) -> torch.Tensor:
-        """Class mode: (D, *lattice) mask of the links with at least one classified staple."""
-        union = (self.class_masks.sum(dim=0) > 0).any(dim=1)  # (m, *lattice)
+        """Class and per_site modes: (D, *lattice) mask of the links with a classified staple."""
+        union = self.active_entries().any(dim=1)  # (m, *lattice)
         return union.view(self.D, 2, *union.shape[1:]).any(dim=1)
 
 
@@ -1364,11 +1386,11 @@ class Smearing(torch.nn.Module):
 
     def _class_dmask(self, dmask):
         """
-        In class mode, restrict dmask to the links with at least one classified staple: the
+        In class and per_site modes, restrict dmask to the links with at least one classified staple: the
         others are not transformed (rather than smeared with rho = 0). The tensor is cached so
         that the link-index cache, keyed on dmask's identity, keeps working.
         """
-        if not (self.use_hyper_smearing and self.hyper_smearing.mode == "class"):
+        if not (self.use_hyper_smearing and self.hyper_smearing.mode in {"class", "per_site"}):
             return dmask
         key = (id(dmask), None if dmask is None else dmask._version, self.hyper_smearing.class_masks.device)
         cached = getattr(self, "_class_dmask_cache", None)

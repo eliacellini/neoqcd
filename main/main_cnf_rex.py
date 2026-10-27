@@ -43,7 +43,7 @@ def parse_args(argv=None):
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--rho-init", type=float, default=1e-3)
     p.add_argument("--rho-functional", action="store_true")
-    p.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class"), default="shared")
+    p.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class", "per_site"), default="shared")
     p.add_argument("--residual-n-pt", type=int, default=0)
     p.add_argument("--loop-max", type=int, default=2,
                    help="Largest rectangle side of the clover-chair loops (1: plaquettes and chairs only)")
@@ -108,8 +108,8 @@ def parse_args(argv=None):
         p.error("rho-functional requires architecture=smearing")
     if args.hyper_smearing_mode != "shared" and args.architecture not in {"hyper-smearing", "defect-hyper-smearing"}:
         p.error("hyper-smearing-mode requires a hyper-smearing architecture")
-    if args.hyper_smearing_mode == "class" and args.architecture != "defect-hyper-smearing":
-        p.error("hyper-smearing-mode=class requires architecture=defect-hyper-smearing")
+    if args.hyper_smearing_mode in {"class", "per_site"} and args.architecture != "defect-hyper-smearing":
+        p.error(f"hyper-smearing-mode={args.hyper_smearing_mode} requires architecture=defect-hyper-smearing")
     if args.architecture in DEFECT_PATCH_ARCHITECTURES:
         if args.domain != "defect":
             p.error(f"{args.architecture} requires --domain defect")

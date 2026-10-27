@@ -354,7 +354,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
                 else None
             ),
         }
-        if hyper.mode == "class":
+        if hyper.mode in {"class", "per_site"}:
             semantics["class_unclassified_links"] = "frozen"
         return semantics
 
@@ -635,7 +635,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neorex-flow-checkpoint-name", type=str, default="global.pt")
     parser.add_argument("--use-hyper-smearing", dest="use_hyper_smearing", action="store_true")
     parser.add_argument("--no-hyper-smearing", dest="use_hyper_smearing", action="store_false")
-    parser.add_argument("--hyper-smearing-mode", type=str, default="per_link", choices=["shared", "per_link", "class"])
+    parser.add_argument("--hyper-smearing-mode", type=str, default="per_link", choices=["shared", "per_link", "class", "per_site"])
     parser.add_argument("--hyper-time-embedding-dim", type=int, default=8)
     parser.add_argument("--hyper-hidden-dim", type=int, default=16)
     parser.add_argument("--hyper-depth", type=int, default=2)

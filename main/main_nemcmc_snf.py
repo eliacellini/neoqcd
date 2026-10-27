@@ -122,7 +122,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--cnf-checkpoint", help="Field checkpoint trained by main_cnf_rex.py")
     parser.add_argument("--cnf-integration-steps", type=int, default=4)
-    parser.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class"), default="shared")
+    parser.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class", "per_site"), default="shared")
     parser.add_argument("--hyper-time-embedding-dim", type=int, default=8)
     parser.add_argument("--hyper-hidden-dim", type=int, default=16)
     parser.add_argument("--hyper-depth", type=int, default=2)
@@ -378,8 +378,8 @@ def validate_args(args: argparse.Namespace) -> None:
         # residual-n-pt; only the full periodic lattice needs a consistent colouring.
         if args.domain == "beta" and (args.T % args.residual_mask_mod or args.L % args.residual_mask_mod):
             raise ValueError("T and L must be multiples of residual-mask-mod for periodic coloring")
-    if args.hyper_smearing_mode == "class" and (args.domain != "defect" or args.nf_architecture != "hyper-smearing"):
-        raise ValueError("hyper-smearing-mode=class is supported only for defect hyper-smearing")
+    if args.hyper_smearing_mode in {"class", "per_site"} and (args.domain != "defect" or args.nf_architecture != "hyper-smearing"):
+        raise ValueError(f"hyper-smearing-mode={args.hyper_smearing_mode} is supported only for defect hyper-smearing")
     if args.nf_architecture != "hyper-smearing" and args.hyper_smearing_mode != "shared":
         raise ValueError("hyper-smearing-mode is meaningful only with --nf-architecture hyper-smearing")
     if args.explicit_backward and (args.algorithm != "snf" or args.nf_architecture not in {"smearing", "hyper-smearing"}):
@@ -1668,7 +1668,7 @@ def _checkpoint_semantics(args, protocol: list[float]) -> dict:
     }
     if args.algorithm == "snf" and args.nf_architecture in {"smearing", "hyper-smearing"}:
         semantics["smearing_jacobian_version"] = "su3_stout_full_haar_logdet_v1"
-    if args.hyper_smearing_mode == "class":
+    if args.hyper_smearing_mode in {"class", "per_site"}:
         del semantics["hyper_class_inactive_rho"]
         semantics["hyper_class_unclassified_links"] = "frozen"
     if args.residual_n_pt or args.residual_mask_mod != 2:
