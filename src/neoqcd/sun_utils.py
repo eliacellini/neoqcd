@@ -71,10 +71,10 @@ def SUN_dagger(cfgs):
 
 def SUN_mul(U,V):
     if U.is_cuda:
-        W = U[..., :, 0, None] * V[..., None, 0, :]
-        for j in range(1, U.shape[-1]):
-            W = torch.addcmul(W, U[..., :, j, None], V[..., None, j, :])
-        return W
+        # One broadcast product and one sum: on an A100 forward + backward is 2.6x faster than
+        # an addcmul per column, whose indexed slices each zero-fill a tensor in the backward
+        # (main/bench_sun_mul.py), and 5x faster than matmul, for 18% more peak memory.
+        return (U.unsqueeze(-1) * V.unsqueeze(-3)).sum(-2)
     return torch.einsum('...ij,...jk->...ik',U,V)
 
 def plaquette_SUN(cfgs, D, N):

@@ -382,7 +382,7 @@ class CloverChairLinkDrift(nn.Module):
         generators, structure = self._basis(U)
         S, C = self._staples(U), self._leaves(U)
         f = lambda value: self._drift_given(value, S, C, t, generators, structure)
-        tangents = [1j * generators[a] @ U for a in directions]
+        tangents = [sun.SUN_mul(1j * generators[a], U) for a in directions]
         return diagonal_derivative(f, U, tangents, directions).flatten(1).sum(1)
 
     def divergence_terms(self, t, directions_per_term=1):
@@ -468,7 +468,7 @@ class DefectCloverChairDrift(nn.Module):
     def _divergence_term(self, cfgs, t, directions):
         # The derivative along each generator direction of each transformed link, loops held fixed.
         small, generators, f = self._patch(cfgs, t)
-        tangents = [1j * generators[a] @ small for a in directions]
+        tangents = [sun.SUN_mul(1j * generators[a], small) for a in directions]
         return (diagonal_derivative(f, small, tangents, directions).flatten(2) * self._valid).flatten(1).sum(1)
 
     def divergence_terms(self, t, directions_per_term=1):
@@ -511,12 +511,12 @@ def apply_velocity(U, coeff, h=1.0):
         raise ValueError("coeff must have shape U.shape[:-2] + (8,)")
     H = coeff_to_matrix(coeff * _batch_step(h, coeff))
     exponent = 1j * H
-    return torch.matmul(torch.matrix_exp(exponent), U)
+    return sun.SUN_mul(torch.matrix_exp(exponent), U)
 
 
 def lie_tangent(U, coeff):
     """Tangent i F_a T_a U at U (not the finite exponential update)."""
-    return torch.matmul(1j * coeff_to_matrix(coeff), U)
+    return sun.SUN_mul(1j * coeff_to_matrix(coeff), U)
 
 
 def _as_time(t, U):

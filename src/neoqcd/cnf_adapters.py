@@ -302,7 +302,7 @@ class DefectHyperSmearingDrift(nn.Module):
             return cfgs.real.new_zeros(cfgs.shape[0])
         generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
         links = flat.index_select(1, index)
-        tangents = [torch.zeros_like(flat).index_copy(1, index, 1j * (generators[a] @ links)) for a in directions]
+        tangents = [torch.zeros_like(flat).index_copy(1, index, sun.SUN_mul(1j * generators[a], links)) for a in directions]
         return diagonal_derivative(q_fn, flat, tangents, directions).sum(1)
 
     def divergence_terms(self, t, directions_per_term=1):
@@ -405,7 +405,7 @@ class DefectResidualDrift(nn.Module):
         tangents = []
         for a in directions:
             tangent = torch.zeros_like(small)
-            tangent[:, mu] = 1j * (generators[a] @ small[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
+            tangent[:, mu] = sun.SUN_mul(1j * generators[a], small[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
             tangents.append(tangent)
         return diagonal_derivative(q_fn, small, tangents, directions).flatten(1).sum(1)
 
