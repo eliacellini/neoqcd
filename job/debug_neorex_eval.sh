@@ -42,7 +42,7 @@ for entry in ${METHODS:?set METHODS}; do
   name="${entry%%:*}"; ckpt="${entry#*:}"
   case "$name" in
     orex)     ALG=(--algorithm orex --orex-protocol-steps "$K" --orex-mcmc-steps-per-step 1) ;;
-    smearing) ALG=(--algorithm neorex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode per_link
+    smearing) ALG=(--algorithm neorex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}"
                    --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
                    --hyper-rho-eps 0 --hyper-rho-max 0) ;;
     residual) ALG=(--algorithm neorex --nf-layer-type residual --hyper-hidden-dim 16 --hyper-depth 2

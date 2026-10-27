@@ -43,7 +43,7 @@ EVAL=(--phase evaluate --eval-samples 512 --wandb-mode disabled --main-dir "$PWD
 for entry in ${FIELDS:?set FIELDS}; do
   name="${entry%%:*}"; ckpt="${entry#*:}"
   case "$name" in
-    smearing) NET=(--nf-architecture hyper-smearing --hyper-smearing-mode per_link --hyper-hidden-dim 16
+    smearing) NET=(--nf-architecture hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}" --hyper-hidden-dim 16
                    --hyper-depth 2 --hyper-no-normalize-by-nstep) ;;
     residual) NET=(--nf-architecture hyper-residual --hyper-hidden-dim 16 --hyper-depth 2
                    --residual-n-pt 1 --residual-mask-mod 4) ;;
