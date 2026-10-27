@@ -35,7 +35,12 @@ ARGS=(
   "$@"
 )
 
-# SLURM_NODEID must expand on each node, not on the batch host.
-srun bash -c "python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
+mkdir -p "$OUT"
+
+# SLURM_NODEID must expand on each node, not on the batch host. nvidia-smi samples, every 2 s,
+# the fraction of time each GPU was running a kernel.
+srun bash -c "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv -l 2 \
+  > $OUT/gpu_utilization.node\$SLURM_NODEID.csv & \
+  python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
   --nproc_per_node=4 --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-  main/main_cnf_rex.py ${ARGS[*]}"
+  main/main_cnf_rex.py ${ARGS[*]}; status=\$?; kill \$!; exit \$status"
