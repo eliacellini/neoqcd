@@ -16,7 +16,7 @@
 # training (chains from the job/thermalize_defect.sh cache). Every swap runs K protocol
 # steps, each with one MCMC update (1 HB + 4 OR) and, for NEO-REX, the flow layer.
 # Smearing and residual fields are copied into their finite layer; CloverChair is a CNF.
-# Usage: METHODS="orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 sbatch job/debug_neorex_eval.sh
+# Usage: METHODS="orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ mkdir -p "$OUT"
 
 COMMON=(
   --D 4 --T 8 --L 8 --N 3 --beta 6 --defect-size 2 --time-slice 4 --space-slice 3
-  --parameter-min 0 --parameter-max 1 --batch-size 8 --orsteps 4 --thermal-steps 1000
+  --parameter-min 0 --parameter-max 1 --batch-size "${BATCH:-8}" --orsteps 4 --thermal-steps 1000
 )
 
 for entry in ${METHODS:?set METHODS}; do
