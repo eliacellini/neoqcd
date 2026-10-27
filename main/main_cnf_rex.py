@@ -53,6 +53,10 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
+                   help="cosine: decay from the run's lr to --lr-min over epochs 0..--epochs, set from the "
+                        "epoch number, so a resumed run follows the same curve")
+    p.add_argument("--lr-min", type=float, default=0.0)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--pg-chunk-size", type=int, default=0,
                    help="Chains per path-gradient chunk to bound memory (0: all chains of a rung at once)")
@@ -96,6 +100,8 @@ def parse_args(argv=None):
             p.error("defect must fit inside the lattice")
     if args.phase == "evaluate" and args.checkpoint is None:
         p.error("evaluation requires --checkpoint")
+    if not 0 <= args.lr_min <= args.lr:
+        p.error("require 0 <= lr-min <= lr")
     if args.init_cfgs is not None and (args.checkpoint is not None or args.domain != "defect"):
         p.error("--init-cfgs starts a new defect run: it excludes --checkpoint and needs --domain defect")
     if args.rho_functional and args.architecture != "smearing":
@@ -238,6 +244,13 @@ def _thermalized_cfgs(directory, config, ladder, rank, world_size):
     return payload["cfgs"]
 
 
+def _learning_rate(lr, args, epoch):
+    """Learning rate of a 0-based epoch: lr, or its cosine decay to lr_min at the last epoch."""
+    if args.lr_schedule == "constant":
+        return lr
+    return args.lr_min + 0.5 * (lr - args.lr_min) * (1 + math.cos(math.pi * epoch / args.epochs))
+
+
 def _shard_path(checkpoint, rank):
     return checkpoint.with_name(f"{checkpoint.stem}.rank{rank}{checkpoint.suffix}")
 
@@ -309,11 +322,14 @@ def main(argv=None):
     try:
         for epoch in range(start, args.epochs):
             start_time = time.perf_counter()
+            lr = _learning_rate(config["lr"], args, epoch)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             if rank == 0 and epoch + 1 == args.profile_epoch:
                 metrics = _profiled_step(trainer, args.output_dir / f"profile_epoch{epoch + 1}.txt")
             else:
                 metrics = trainer.step()
-            metrics = {"epoch": epoch + 1, **metrics, "epoch_s": round(time.perf_counter() - start_time, 3)}
+            metrics = {"epoch": epoch + 1, **metrics, "lr": lr, "epoch_s": round(time.perf_counter() - start_time, 3)}
             if rank == 0:
                 line = json.dumps(metrics)
                 output.write(line + "\n")

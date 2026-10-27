@@ -109,6 +109,26 @@ class DistributedPathGradientTest(unittest.TestCase):
             self.assertEqual(checkpoint["epoch"], 2)
             self.assertTrue(checkpoint["trainer"]["distributed"])
 
+    def test_cosine_learning_rate_decays_with_the_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "run"
+            base = ["--architecture", "hyper-residual", "--domain", "beta", "--D", "2", "--T", "4", "--L", "4",
+                    "--replicas", "3", "--batch-size", "2", "--hidden-dim", "4", "--depth", "1", "--warmup", "0",
+                    "--save-every", "1", "--lr", "1e-2", "--lr-schedule", "cosine", "--lr-min", "1e-4",
+                    "--output-dir", str(out)]
+            mp.spawn(_main_worker, args=(3, _free_port(), [*base, "--epochs", "4"]), nprocs=3, join=True)
+            first = [json.loads(line)["lr"] for line in (out / "metrics.jsonl").read_text().splitlines()]
+            # The rate depends on the epoch number only, so a resumed run continues the same curve.
+            spec = importlib.util.spec_from_file_location("main_cnf_rex", ROOT / "main" / "main_cnf_rex.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            args = module.parse_args([*base, "--epochs", "4"])
+            expected = [module._learning_rate(1e-2, args, epoch) for epoch in range(4)]
+            self.assertEqual(first, expected)
+            self.assertEqual(expected[0], 1e-2)
+            self.assertTrue(all(a > b > 1e-4 for a, b in zip(expected, expected[1:])))
+            self.assertAlmostEqual(module._learning_rate(1e-2, args, 4), 1e-4)
+
     def test_training_starts_from_chains_thermalized_by_pt_obc(self):
         geometry = ["--D", "4", "--T", "4", "--L", "6", "--defect-size", "1", "--time-slice", "2",
                     "--space-slice", "2", "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
