@@ -182,5 +182,95 @@ class CloverChairCNFTest(unittest.TestCase):
                 CloverChairLinkDrift(2, hidden_dim=4, depth=1, time_range=bad)
 
 
+class DefectCloverChairTests(unittest.TestCase):
+    """The patch field equals the lattice CloverChair restricted to the links next to the defect."""
+
+    def _fields(self, T=8, L=8):
+        from neoqcd.cnf_io import build_cnf
+
+        torch.manual_seed(12)
+        config = dict(
+            architecture="defect-clover-chair", domain="defect", D=4, T=T, L=L, beta=6.0, defect_size=1,
+            time_slice=3, space_slice=3, parameter_min=0.0, parameter_max=1.0, batch_size=1, hidden_dim=4,
+            depth=1, rho_init=1e-3, residual_n_pt=0, residual_mask_mod=2, orsteps=0,
+            time_normalization="unit_interval",
+        )
+        field, pars, _ = build_cnf(config)
+        with torch.no_grad():
+            for parameter in field.parameters():
+                parameter.add_(0.05 * torch.randn_like(parameter))
+        return field, pars
+
+    def test_matches_the_lattice_field_on_the_defect_links(self):
+        # loop_max=1 (buffer 2) keeps the lattice reference affordable; the check does not
+        # depend on loop_max. The patch [0, 4) x [0, 5)^3 sits inside a 6^4 torus, so a loop
+        # leaving the patch would differ from the lattice one.
+        from neoqcd.cnf import CloverChairLinkDrift, DefectCloverChairDrift
+        from neoqcd.flow import FlowPars
+        from neoqcd.theory import build_nf_changed_link_mask
+        from neoqcd.utils import Defect, create_mask, defect_patch
+
+        torch.manual_seed(12)
+        defect = Defect(4, 6, 6, 1, 2, 2)
+        pars = FlowPars(D=4, T=6, L=6, N=3, mask=create_mask(4, 6, 6), protocol=[1.0], batch_size=1,
+                        device="cpu", defect=defect, **defect_patch(4, 6, 6, 1, 2, 2, buffer=2))
+        full = CloverChairLinkDrift(4, hidden_dim=4, depth=1, loop_max=1, zero_init=False).to(dtype=torch.double)
+        with self.assertRaisesRegex(ValueError, "patch buffer"):
+            DefectCloverChairDrift(CloverChairLinkDrift(4, hidden_dim=4, depth=1, loop_max=2), pars)
+        field = DefectCloverChairDrift(full, pars)
+        U = sun.SUN_haar((1, 4, 6, 6, 6, 6, 3), dtype=torch.cdouble)
+        t = torch.tensor([0.4], dtype=torch.double)
+        changed = build_nf_changed_link_mask(pars, device=torch.device("cpu"))[None]
+        self.assertEqual(int(changed.sum()), 75)
+        with torch.no_grad():
+            F, divergence = field(U, t)
+            reference = full.drift(U, t)
+            self.assertGreater(float(reference[changed].abs().max()), 1e-3)
+            torch.testing.assert_close(F[changed], reference[changed], rtol=1e-12, atol=1e-13)
+            self.assertEqual(float(F[~changed].abs().max()), 0.0)
+
+            generators, structure = full._basis(U)
+            S, C = full._staples(U), full._leaves(U)
+            tt = full._time(t, U)
+            f = lambda value: full._drift_given(value, S, C, tt, generators, structure)
+            expected = sum(
+                (torch.func.jvp(f, (U,), (1j * generators[a] @ U,))[1][..., a] * changed).sum()
+                for a in range(8)
+            )
+        torch.testing.assert_close(divergence[0], expected, rtol=1e-11, atol=1e-12)
+
+    def test_loop_max_sets_the_loops_and_the_patch_buffer(self):
+        from neoqcd.cnf_io import build_cnf
+
+        base = dict(
+            architecture="defect-clover-chair", domain="defect", D=4, T=6, L=8, beta=6.0, defect_size=1,
+            time_slice=3, space_slice=3, parameter_min=0.0, parameter_max=1.0, batch_size=1, hidden_dim=4,
+            depth=1, rho_init=1e-3, residual_n_pt=0, residual_mask_mod=2, orsteps=0,
+        )
+        # Checkpoints without the key used loop_max = 2.
+        for extra, loop_max in (({}, 2), ({"loop_max": 1}, 1), ({"loop_max": 2}, 2)):
+            with self.subTest(**extra):
+                field, pars, _ = build_cnf(dict(base, **extra))
+                self.assertEqual((field.loop_max, field.buffer, pars.patch_buffer), (loop_max, loop_max + 1, loop_max + 1))
+        lattice, _, _ = build_cnf(dict(base, architecture="clover-chair", domain="beta", loop_max=1))
+        self.assertEqual(lattice.loop_max, 1)
+
+    def test_path_gradient_reaches_the_network_with_bounded_memory(self):
+        from neoqcd.cnf import path_gradient_loss
+
+        field, _ = self._fields(T=6, L=8)
+        self.assertEqual(field.buffer, 3)
+        U = sun.SUN_haar((2, 4, 6, 8, 8, 8, 3), dtype=torch.cdouble)
+
+        def action(value, t):
+            return -2.0 * sum(p.flatten(1).sum(1).real for p in sun.plaquette_fields(value, 4))
+
+        result = path_gradient_loss(field, action, U, torch.tensor([0.3, 0.7], dtype=torch.double), chunk_size=1)
+        result["loss"].sum().backward()
+        grads = [p.grad for p in field.parameters() if p.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -176,7 +176,8 @@ class ResidualFrozenConvolutionTest(unittest.TestCase):
     def test_invalid_crop_and_periodic_masks_are_rejected(self):
         layer, pars = make_layer(n_pt=1, mask_mod=4)
         x = random_su3(pars.init_shape[:-1])
-        with self.assertRaisesRegex(ValueError, "dmasking|cropped"):
+        # On the defect patch a convolution needs a three-site buffer; these masks carry the default two.
+        with self.assertRaisesRegex(ValueError, "patch_buffer >= 3"):
             layer(x, pars.mask, dmasking=True, dmask=torch.ones_like(x[..., :1, :1]), delta_beta=torch.tensor([0.02]))
 
         bad_layer, bad_pars = make_layer(T=2, L=4, n_pt=0, mask_mod=4)
@@ -229,13 +230,58 @@ class ResidualFrozenConvolutionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 MAIN.parse_args(argv)
 
-        with self.assertRaisesRegex(ValueError, "full lattice|beta domain"):
-            MAIN.parse_args(
-                ["--algorithm", "snf", "--phase", "train", "--domain", "defect", "--cpu",
-                 "--D", "4", "--T", "4", "--L", "6", "--batch-size", "1",
-                 "--nf-architecture", "residual", "--defect-size", "2", "--time-slice", "2",
-                 "--space-slice", "2", "--residual-n-pt", "1", "--cfg-cache", "off"]
-            )
+        # On the defect a convolution widens the patch buffer to three sites.
+        defect = ["--algorithm", "snf", "--phase", "train", "--domain", "defect", "--cpu", "--D", "4",
+                  "--batch-size", "1", "--nf-architecture", "residual", "--defect-size", "2",
+                  "--residual-n-pt", "1", "--cfg-cache", "off"]
+        with self.assertRaisesRegex(ValueError, "T >= 6"):
+            MAIN.parse_args(defect + ["--T", "4", "--L", "6", "--time-slice", "2", "--space-slice", "2"])
+        args = MAIN.parse_args(defect + ["--T", "6", "--L", "8", "--time-slice", "3", "--space-slice", "3"])
+        flow, _ = MAIN._build_flow_pars(args, torch.device("cpu"), [0.5], 1)
+        self.assertEqual(flow.patch_buffer, 3)
+        self.assertEqual(tuple(flow.small_mask[-1].shape[3:7]), (6, 8, 8, 8))
+
+    @unittest.skipUnless(MAIN is not None, "standalone main dependencies unavailable")
+    def test_defect_patch_matches_the_periodic_lattice_restricted_to_the_same_links(self):
+        from neoqcd.theory import build_nf_changed_link_mask
+
+        # Patch origin at (0, 0, 0, 0): the patch colouring equals the lattice one.
+        for mask_mod in (2, 4):
+            with self.subTest(mask_mod=mask_mod):
+                torch.manual_seed(31 + mask_mod)
+                args = MAIN.parse_args(
+                    ["--algorithm", "snf", "--phase", "train", "--domain", "defect", "--cpu",
+                     "--D", "4", "--T", "8", "--L", "8", "--batch-size", "2",
+                     "--nf-architecture", "hyper-residual", "--defect-size", "1", "--time-slice", "3",
+                     "--space-slice", "3", "--residual-n-pt", "1", "--residual-mask-mod", str(mask_mod),
+                     "--cfg-cache", "off"]
+                )
+                flow, _ = MAIN._build_flow_pars(args, torch.device("cpu"), [0.5], 2)
+                self.assertEqual(flow.patch_buffer, 3)
+                patch = MAIN._make_snf_layer(args, flow)
+                with torch.no_grad():
+                    for parameter in patch.parameters():
+                        parameter.add_(0.05 * torch.randn_like(parameter))
+                full = ResidualNormalizingFlows(flow)
+                full.load_state_dict(patch.layer.state_dict())
+
+                x = random_su3((2, 4, 8, 8, 8, 8))
+                bc = torch.tensor([0.3, 0.6], dtype=torch.float64)
+                delta = torch.tensor([0.25, -0.25], dtype=torch.float64)
+                changed = build_nf_changed_link_mask(flow, device=torch.device("cpu"))
+                dmask = changed.to(torch.float64).view(1, *changed.shape, 1, 1)
+                with torch.no_grad():
+                    y_patch, logdet_patch = patch(x, bc, delta)
+                    y_full, _, logdet_full = full(x, flow.mask, dmasking=True, dmask=dmask, beta=bc, delta_beta=delta)
+                    back, logdet_back = patch.layer.inverse(
+                        flow.defect.cut_defect(y_patch, buffer=3), flow.small_mask[-1], dmasking=True,
+                        dmask=flow.smeared_defect_mask[-1], beta=bc, delta_beta=delta,
+                    )[::2]
+                self.assertGreater((y_patch - x).abs().max().item(), 1e-3)
+                torch.testing.assert_close(y_patch, y_full, rtol=0, atol=1e-12)
+                torch.testing.assert_close(logdet_patch, logdet_full, rtol=0, atol=1e-11)
+                torch.testing.assert_close(back, flow.defect.cut_defect(x, buffer=3), rtol=0, atol=1e-11)
+                torch.testing.assert_close(logdet_back, -logdet_patch, rtol=0, atol=1e-10)
 
 
 if __name__ == "__main__":

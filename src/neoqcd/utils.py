@@ -424,6 +424,39 @@ def create_around_defect_mask(D, dsize, buffer=2):
 
     return kappa_mask_d.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
+
+def residual_patch_buffer(n_pt):
+    """
+    Patch buffer of a residual layer on the defect: plaquette staples reach two sites from the
+    patch edge and each frozen-link convolution one more, so no path of a transformed link
+    wraps around the (non-periodic) patch.
+    """
+    return 2 + int(n_pt)
+
+
+def defect_patch(D, T, L, dsize, time_slice, space_slice, buffer=2, device=None):
+    """
+    Masks of the cropped patch around the defect on which the defect flow layers act.
+
+    The transformed links (smeared_defect_mask) do not depend on the buffer; a larger buffer
+    only makes room for longer paths. Returns FlowPars keyword arguments.
+    """
+    D, T, L, dsize, buffer = int(D), int(T), int(L), int(dsize), int(buffer)
+    if D != 4:
+        raise ValueError("the defect patch is defined for D=4")
+    if not buffer <= time_slice <= T - buffer:
+        raise ValueError(f"time-slice must satisfy {buffer} <= time-slice <= T-{buffer} for a {buffer}-site patch buffer")
+    if not buffer <= space_slice <= L - dsize - buffer:
+        raise ValueError(f"space-slice must leave a {buffer}-site buffer around the defect")
+    small_t, small_l = 2 * buffer, dsize + 2 * buffer
+    small_defect = Defect(D, small_t, small_l, dsize, time_slice=buffer, space_slice=buffer)
+    return {
+        "small_mask": [create_mask(D, small_t, small_l).to(device)],
+        "smeared_defect_mask": [create_around_defect_mask(D, dsize, buffer=buffer).to(device)],
+        "small_defect_mask": [small_defect.create_defect_mask().to(device)],
+        "patch_buffer": buffer,
+    }
+
 def create_defect_plaquette_mask(D, dsize, defect_mask, buffer=2):
 
     defect = defect_mask[1]

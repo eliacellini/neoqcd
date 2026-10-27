@@ -124,6 +124,116 @@ class ExistingDriftTests(unittest.TestCase):
                 self.assertTrue(any(p.grad is not None for p in field.parameters()))
 
 
+class DefectResidualDriftTests(unittest.TestCase):
+    """The defect residual field, with rectangles (one frozen convolution, mod 4) and without."""
+
+    CASES = {"plaquettes": dict(residual_n_pt=0, residual_mask_mod=2, T=4, L=6, time_slice=2, space_slice=2),
+             "rectangles": dict(residual_n_pt=1, residual_mask_mod=4, T=6, L=8, time_slice=3, space_slice=3)}
+
+    def _field(self, case):
+        from neoqcd.cnf_io import build_cnf
+
+        torch.manual_seed(9)
+        config = _defect_config(architecture="defect-hyper-residual", **self.CASES[case])
+        field, pars, _ = build_cnf(config)
+        with torch.no_grad():
+            for parameter in field.residual.parameters():
+                parameter.add_(0.05 * torch.randn_like(parameter))
+        cfgs = sun.SUN_haar((1, 4, config["T"], config["L"], config["L"], config["L"], 3), dtype=torch.cdouble)
+        return field, pars, cfgs
+
+    def test_velocity_lives_on_the_transformed_defect_links(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                field, pars, cfgs = self._field(case)
+                self.assertEqual(field.buffer, 2 + self.CASES[case]["residual_n_pt"])
+                active = field.drift(cfgs, 0.4).abs().sum(-1) > 0
+                self.assertEqual(int(active.sum()), 75)
+
+    def test_a_link_never_moves_the_velocity_of_its_own_class(self):
+        # The divergence perturbs a whole class at once; that is exact only if no link of a
+        # class enters the velocity of another link of the same class.
+        field, _, cfgs = self._field("rectangles")
+        t = torch.tensor(0.6, dtype=torch.double)
+        residual, buffer, defect = field.residual, field.buffer, field.defect
+        small = defect.cut_defect(cfgs, buffer=buffer)
+        # (classes, 1, D, *patch, 1, 1) -> the links of each class, on the full lattice
+        mask = residual._runtime_mask(field.small_mask, small, periodic=False) * field.smeared_defect_mask
+        zero = torch.zeros((1, *cfgs.shape[1:-2], 1), dtype=torch.double)
+        generators = field.generators
+        with torch.no_grad():
+            for m in range(mask.shape[0]):
+                in_patch = mask[m, 0, ..., 0, 0].to(torch.double)[None, ..., None]
+                members = defect.embedding(in_patch, zero, buffer=buffer)[0, ..., 0] > 0
+                links = members.nonzero()
+                if len(links) < 2:
+                    continue
+                index = (0, *links[0].tolist())
+                for a in (0, 5):
+                    tangent = torch.zeros_like(cfgs)
+                    tangent[index] = 1j * generators[a] @ cfgs[index]
+                    _, dF = torch.func.jvp(lambda U: field.drift(U, t), (cfgs,), (tangent,))
+                    others = members.clone()
+                    others[tuple(links[0].tolist())] = False
+                    self.assertEqual(float(dF[0][others].abs().max()), 0.0, f"class {m}")
+
+    def test_divergence_matches_link_by_link_derivatives_without_convolutions(self):
+        field, _, cfgs = self._field("plaquettes")
+        t = torch.tensor(0.6, dtype=torch.double)
+        generators = field.generators
+        expected = 0.0
+        # No autograd graph: hundreds of derivatives kept alive through the weights exhaust memory.
+        with torch.no_grad():
+            F, div = field(cfgs, t)
+            for link in (F[0].abs().sum(-1) > 0).nonzero():
+                index = (0, *link.tolist())
+                for a in range(8):
+                    tangent = torch.zeros_like(cfgs)
+                    tangent[index] = 1j * generators[a] @ cfgs[index]
+                    _, dF = torch.func.jvp(lambda U: field.drift(U, t), (cfgs,), (tangent,))
+                    expected += dF[index][a].item()
+        self.assertAlmostEqual(div[0].item(), expected, delta=1e-10 * max(1.0, abs(expected)))
+
+    def test_first_order_agreement_with_the_finite_defect_layer(self):
+        from neoqcd.cnf import apply_velocity
+        from neoqcd.smearing import ResidualNormalizingFlows
+
+        for case in self.CASES:
+            with self.subTest(case=case):
+                field, pars, cfgs = self._field(case)
+                layer = ResidualNormalizingFlows(pars)
+                layer.load_state_dict(field.residual.state_dict())
+                bc = torch.tensor([0.35], dtype=torch.double)
+                F, div = field(cfgs, bc)
+                buffer = field.buffer
+                errors = []
+                for h in (1e-3, 2e-3):
+                    with torch.no_grad():
+                        small, _, logdet = layer(
+                            pars.defect.cut_defect(cfgs, buffer=buffer), pars.small_mask[-1], dmasking=True,
+                            dmask=pars.smeared_defect_mask[-1], beta=bc, delta_beta=torch.tensor([h], dtype=torch.double),
+                        )
+                    finite = pars.defect.embedding(small, cfgs, buffer=buffer)
+                    continuous = apply_velocity(cfgs, F, h)
+                    errors.append(((finite - continuous).abs().max().item(), (logdet - h * div).abs().max().item()))
+                    self.assertGreater((continuous - cfgs).abs().max().item(), 100 * errors[-1][0])
+                for coarse, fine in zip(errors[1], errors[0]):
+                    self.assertAlmostEqual(coarse / fine, 4.0, delta=0.5)
+
+    def test_path_gradient_reaches_the_network(self):
+        field, _, cfgs = self._field("rectangles")
+
+        def action(U, t):
+            return -2.0 * sum(p.flatten(1).sum(1).real for p in sun.plaquette_fields(U, 4))
+
+        result = path_gradient_loss(field, action, cfgs.expand(2, *cfgs.shape[1:]).clone(), torch.tensor([0.3, 0.7], dtype=torch.double))
+        result["loss"].sum().backward()
+        grads = [p.grad for p in field.parameters() if p.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+        self.assertIsNotNone(field.residual.conv_eta.grad)
+
+
 if __name__ == "__main__":
     unittest.main()
 

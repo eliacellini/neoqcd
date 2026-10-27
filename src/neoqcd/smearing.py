@@ -5,7 +5,7 @@ import neoqcd.sun_utils as sun
 from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
 from neoqcd.smearing_jacobian import StepQuantities, exp_coefficients, inverse_smearing_step, smearing_step
 from neoqcd.nn import HTCNN
-from neoqcd.utils import set_defect_rho_from_fits
+from neoqcd.utils import residual_patch_buffer, set_defect_rho_from_fits
 
 
 #functions for smearing
@@ -639,6 +639,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
             raise ValueError("residual_n_pt must be non-negative")
         if self.mask_mod not in (2, 4):
             raise ValueError("residual_mask_mod must be 2 or 4")
+        self.patch_buffer = int(getattr(flow_pars, "patch_buffer", 2))
 
         self.n_oriented_plaquettes = 2 * (self.D - 1)
         self.n_features = self.n_oriented_plaquettes * (2 if self.include_imag else 1)
@@ -840,7 +841,9 @@ class ResidualNormalizingFlows(torch.nn.Module):
             cols.append(self._tangent_coordinates(delta_U_out, U_out))
         return torch.stack(cols, dim=-1)
 
-    def _runtime_mask(self, mask, cfgs):
+    def _runtime_mask(self, mask, cfgs, periodic=True):
+        # A cropped defect patch is not periodic: its buffer keeps the paths of transformed links
+        # from wrapping, so the colouring need not be consistent across its edges.
         lattice_shape = tuple(cfgs.shape[2:-2])
         if len(lattice_shape) != self.D:
             raise ValueError(
@@ -851,13 +854,13 @@ class ResidualNormalizingFlows(torch.nn.Module):
                 raise ValueError(
                     f"residual mask has leading dimension {mask.shape[0]}, expected {2 * self.D}"
                 )
-            if self.n_pt and any(size % self.mask_mod for size in lattice_shape):
+            if periodic and self.n_pt and any(size % self.mask_mod for size in lattice_shape):
                 raise ValueError(
                     "residual_n_pt > 0 with residual_mask_mod=2 requires even periodic lattice extents"
                 )
             return mask
 
-        if any(size % self.mask_mod for size in lattice_shape):
+        if periodic and any(size % self.mask_mod for size in lattice_shape):
             raise ValueError(
                 "residual_mask_mod=4 requires every periodic lattice extent to be divisible by 4"
             )
@@ -895,7 +898,12 @@ class ResidualNormalizingFlows(torch.nn.Module):
             values_next[:, mu] = values[:, mu] + update
         return values_next
 
-    def _staples_and_generator(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
+    def staple_sum(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
+        """
+        The weighted staple sum C of the links in direction mu, with exp(iQ(C U^dagger)) their
+        update. With frozen-link convolutions, current_mask marks the links being updated:
+        they are removed before the convolution, so C never depends on another updated link.
+        """
         U = cfgs[:, mu]
         if self.n_pt:
             if current_mask is None:
@@ -908,8 +916,11 @@ class ResidualNormalizingFlows(torch.nn.Module):
             staples = self._oriented_staples(cfgs, mu)
         features = self._features(staples, U)
         weights = self._feature_weights(features, lin, quad)
-        C = self._staple_sum(staples, weights, delta_v)
+        return staples, self._staple_sum(staples, weights, delta_v)
 
+    def _staples_and_generator(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
+        U = cfgs[:, mu]
+        staples, C = self.staple_sum(cfgs, mu, lin, quad, delta_v, step, current_mask)
         eye = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
         omega = generate_omega(C, U)
         Q = generate_Q(omega, self.N)
@@ -946,12 +957,13 @@ class ResidualNormalizingFlows(torch.nn.Module):
         return U_out, detjac, jac
 
     def forward(self, cfgs, mask, dmasking=False, dmask=None, beta=None, delta_beta=None):
-        if dmasking and (self.n_pt or self.mask_mod != 2):
+        if dmasking and self.patch_buffer < residual_patch_buffer(self.n_pt):
             raise ValueError(
-                "cropped/dmasking residual layers require residual_n_pt=0 and residual_mask_mod=2"
+                f"a residual layer with residual_n_pt={self.n_pt} on the defect patch needs "
+                f"patch_buffer >= {residual_patch_buffer(self.n_pt)}, got {self.patch_buffer}"
             )
         real_dtype = cfgs.real.dtype
-        mask = self._runtime_mask(mask, cfgs)
+        mask = self._runtime_mask(mask, cfgs, periodic=not dmasking)
         ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
         if cfgs.shape[0] == 0:
@@ -997,12 +1009,13 @@ class ResidualNormalizingFlows(torch.nn.Module):
         fixed-point iteration of sun.invert_left_update. Returns (cfgs, 0, logdet of the inverse
         map); iteration counts and the largest residual are left in self.last_inverse_stats.
         """
-        if dmasking and (self.n_pt or self.mask_mod != 2):
+        if dmasking and self.patch_buffer < residual_patch_buffer(self.n_pt):
             raise ValueError(
-                "cropped/dmasking residual layers require residual_n_pt=0 and residual_mask_mod=2"
+                f"a residual layer with residual_n_pt={self.n_pt} on the defect patch needs "
+                f"patch_buffer >= {residual_patch_buffer(self.n_pt)}, got {self.patch_buffer}"
             )
         real_dtype = cfgs.real.dtype
-        mask = self._runtime_mask(mask, cfgs)
+        mask = self._runtime_mask(mask, cfgs, periodic=not dmasking)
         ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
         dims = tuple(np.arange(1, self.D + 2))
@@ -1129,7 +1142,8 @@ class DefectCouplingLayer(CouplingLayer):
     def forward(self, cfgs, flow_pars, rho_layer, is_training=False, beta=None, delta_beta=None):
         rho_r = self._rho(rho_layer)
 
-        small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=2)
+        buffer = getattr(flow_pars, "patch_buffer", 2)
+        small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=buffer)
         small_cfgs, _, dlogJ = self.smearing(
             small_cfgs,
             flow_pars.small_mask[-1],
@@ -1143,11 +1157,11 @@ class DefectCouplingLayer(CouplingLayer):
         if is_training:
             return small_cfgs, 0, dlogJ
         else:
-            return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=2), 0, dlogJ
+            return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=buffer), 0, dlogJ
 
     def inverse(self, cfgs, flow_pars, rho_layer, beta=None, delta_beta=None, **kwargs):
         """Inverse of forward with the same rho_layer, beta and delta_beta, on the full lattice."""
-        small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=2)
+        small_cfgs = flow_pars.defect.cut_defect(cfgs, buffer=getattr(flow_pars, "patch_buffer", 2))
         small_cfgs, _, dlogJ = self.smearing.inverse(
             small_cfgs,
             flow_pars.small_mask[-1],
@@ -1158,7 +1172,7 @@ class DefectCouplingLayer(CouplingLayer):
             delta_beta=delta_beta,
             **kwargs,
         )
-        return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=2), 0, dlogJ
+        return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=getattr(flow_pars, "patch_buffer", 2)), 0, dlogJ
 
 class Smearing(torch.nn.Module):
     def __init__(self, flow_pars, time):

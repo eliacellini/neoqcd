@@ -38,7 +38,7 @@ from neoqcd.smearing import (
     ResidualNormalizingFlows,
 )
 from neoqcd.theory import Wilson_action
-from neoqcd.utils import Defect, create_around_defect_mask, create_mask
+from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer
 
 
 # Kept separate from model/protocol RNG streams.  The rank term deliberately
@@ -347,12 +347,13 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.domain == "defect" and args.D != 4:
         raise ValueError("The defect patch cutting/embedding adapter is defined for D=4")
     if args.domain == "defect" and args.nf_architecture != "cnf":
-        if args.T < 4 or args.L < args.defect_size + 4:
-            raise ValueError("defect domain requires T >= 4 and L >= defect-size + 4")
-        if not 2 <= args.time_slice <= args.T - 2:
-            raise ValueError("time-slice must satisfy 2 <= time-slice <= T-2")
-        if not 2 <= args.space_slice <= args.L - args.defect_size - 2:
-            raise ValueError("space-slice must leave a two-site buffer around the defect")
+        buffer = _patch_buffer(args)
+        if args.T < 2 * buffer or args.L < args.defect_size + 2 * buffer:
+            raise ValueError(f"defect domain requires T >= {2 * buffer} and L >= defect-size + {2 * buffer}")
+        if not buffer <= args.time_slice <= args.T - buffer:
+            raise ValueError(f"time-slice must satisfy {buffer} <= time-slice <= T-{buffer}")
+        if not buffer <= args.space_slice <= args.L - args.defect_size - buffer:
+            raise ValueError(f"space-slice must leave a {buffer}-site buffer around the defect")
     if args.algorithm == "nemcmc" and args.nf_architecture != "smearing":
         raise ValueError("NF architecture options are valid only for --algorithm snf")
     if args.nf_architecture == "cnf":
@@ -373,9 +374,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.residual_n_pt or args.residual_mask_mod != 2:
         if args.algorithm != "snf" or args.nf_architecture not in {"residual", "hyper-residual"}:
             raise ValueError("residual-n-pt and residual-mask-mod require a residual SNF architecture")
-        if args.domain != "beta":
-            raise ValueError("Extended residual layers require the full lattice beta domain; defect crops have a fixed halo")
-        if args.T % args.residual_mask_mod or args.L % args.residual_mask_mod:
+        # On the defect the layer acts on a cropped, non-periodic patch whose buffer grows with
+        # residual-n-pt; only the full periodic lattice needs a consistent colouring.
+        if args.domain == "beta" and (args.T % args.residual_mask_mod or args.L % args.residual_mask_mod):
             raise ValueError("T and L must be multiples of residual-mask-mod for periodic coloring")
     if args.hyper_smearing_mode == "class" and (args.domain != "defect" or args.nf_architecture != "hyper-smearing"):
         raise ValueError("hyper-smearing-mode=class is supported only for defect hyper-smearing")
@@ -1100,6 +1101,13 @@ def prepare_prior(args, flow_pars, defect_mask, prior: float, end: float, parame
     return cfgs, "refresh" if mode == "refresh" else "saved"
 
 
+def _patch_buffer(args) -> int:
+    """Buffer of the cropped defect patch: wider for residual layers with frozen convolutions."""
+    if args.nf_architecture in {"residual", "hyper-residual"}:
+        return residual_patch_buffer(args.residual_n_pt)
+    return 2
+
+
 def _build_flow_pars(args, device: torch.device, protocol: list[float], local_batch: int):
     mask = create_mask(args.D, args.T, args.L).to(device)
     defect = None
@@ -1109,22 +1117,12 @@ def _build_flow_pars(args, device: torch.device, protocol: list[float], local_ba
         defect = Defect(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice)
         defect_mask = defect.create_defect_mask().to(device)
     elif args.domain == "defect":
-        buffer = 2
-        if args.T < 2 * buffer or args.L < args.defect_size + 2 * buffer:
-            raise ValueError("Defect SNF requires T >= 4 and L >= defect-size + 4")
-        if not buffer <= args.time_slice <= args.T - buffer:
-            raise ValueError("time-slice must satisfy 2 <= time-slice <= T-2")
-        if not buffer <= args.space_slice <= args.L - args.defect_size - buffer:
-            raise ValueError("space-slice must leave a two-site buffer around the defect")
         defect = Defect(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice)
         defect_mask = defect.create_defect_mask().to(device)
-        small_t, small_l = 2 * buffer, args.defect_size + 2 * buffer
-        small_defect = Defect(args.D, small_t, small_l, args.defect_size, buffer, buffer)
         kwargs.update(
             rho_shape_type=3,
-            smeared_defect_mask=[create_around_defect_mask(args.D, args.defect_size, buffer).to(device)],
-            small_mask=[create_mask(args.D, small_t, small_l).to(device)],
-            small_defect_mask=[small_defect.create_defect_mask().to(device)],
+            **defect_patch(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice,
+                           buffer=_patch_buffer(args), device=device),
         )
     architecture = args.nf_architecture
     use_hyper_smearing = architecture == "hyper-smearing"
@@ -1182,7 +1180,8 @@ class _DefectSNFProtocolLayer(torch.nn.Module):
             )
             self.layer = DefectCouplingLayer(flow_pars, rho0, 1.0)
 
-    def _embed(self, small_cfgs, cfgs, buffer=2):
+    def _embed(self, small_cfgs, cfgs):
+        buffer = self.flow_pars.patch_buffer
         defect = self.flow_pars.defect
         t, s, dsize, D = defect.time_slice, defect.space_slice, defect.dsize, defect.D
         out = cfgs.clone()
@@ -1195,7 +1194,7 @@ class _DefectSNFProtocolLayer(torch.nn.Module):
     def forward(self, x, parameter, delta_parameter, rho_layer=None):
         work_dtype = x.real.dtype
         if isinstance(self.layer, ResidualNormalizingFlows):
-            small = self.flow_pars.defect.cut_defect(x, buffer=2)
+            small = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
             small, _, logdet = self.layer(
                 small, self.flow_pars.small_mask[-1], dmasking=True,
                 dmask=self.flow_pars.smeared_defect_mask[-1], beta=parameter,

@@ -6,8 +6,10 @@ the eight left-invariant directional derivatives of F, with the loop paths
 held fixed because paths that wrap back onto their own link are excluded.
 """
 
+import contextlib
 import itertools
 import math
+import functools
 from functools import lru_cache
 
 import torch
@@ -159,6 +161,12 @@ class CloverChairLinkDrift(nn.Module):
         commutator = commutator - commutator.transpose(0, 1)
         trace = torch.einsum("abij,cji->abc", commutator, self._generators)
         self._structure_constants = (-2j * trace).real
+        # f_abc has 54 non-zero entries: the bracket sums them per c instead of building (..., 8, 8).
+        self._bracket_terms = tuple(
+            (torch.tensor(a), torch.tensor(b), self._structure_constants[a, b, c])
+            for c in range(8)
+            for a, b in [self._structure_constants[:, :, c].nonzero().T.tolist()]
+        )
 
         self.k0 = 2 * (self.D - 1)
         self.n_rectangles = 2 * (self.D - 1) * (sum(range(1, self.loop_max + 1)) * self.loop_max - 1)
@@ -322,7 +330,9 @@ class CloverChairLinkDrift(nn.Module):
         a, b = out[..., :self.n_vec], out[..., self.n_vec:]
         anti_i = vector.index_select(-2, self._anti_i)
         anti_j = vector.index_select(-2, self._anti_j)
-        cross = torch.einsum("...pa,...pb,abc->...pc", anti_i, anti_j, structure)
+        cross = torch.stack([
+            (anti_i[..., a] * anti_j[..., b] * f.to(anti_i)).sum(-1) for a, b, f in self._bracket_terms
+        ], dim=-1)
         return (a.unsqueeze(-1) * vector).sum(-2) + (b.unsqueeze(-1) * cross).sum(-2)
 
     def drift(self, U, t):
@@ -343,6 +353,20 @@ class CloverChairLinkDrift(nn.Module):
         divergence = sum(dF[a, ..., a] for a in range(8)).flatten(1).sum(1)
         return F[0], divergence
 
+    def _divergence_term(self, U, t, a):
+        # The derivative along generator a of every link, with the open staples held fixed.
+        self._validate_U(U)
+        t = self._time(t, U)
+        generators, structure = self._basis(U)
+        S, C = self._staples(U), self._leaves(U)
+        f = lambda value: self._drift_given(value, S, C, t, generators, structure)
+        _, dF = torch.func.jvp(f, (U,), (1j * generators[a] @ U,))
+        return dF[..., a].flatten(1).sum(1)
+
+    def divergence_terms(self, t):
+        """Callables U -> (B,) summing to the divergence: one per generator direction."""
+        return [functools.partial(self._divergence_term, t=t, a=a) for a in range(8)]
+
     @property
     def checkpoint_semantics(self):
         return {
@@ -353,6 +377,89 @@ class CloverChairLinkDrift(nn.Module):
             "loop_max": self.loop_max,
             "time_range": self.time_range,
         }
+
+
+class DefectCloverChairDrift(nn.Module):
+    """A CloverChair field acting only on the links next to a defect.
+
+    The field sees a cropped patch around the defect whose buffer (loop_max + 1 sites) holds
+    every loop of a transformed link, so no path wraps around the patch. Loops are built on the
+    patch, the network runs only on the transformed links, and every other link has zero
+    velocity.
+    """
+
+    def __init__(self, field, flow_pars):
+        super().__init__()
+        if int(field.D) != 4 or flow_pars.defect is None or not flow_pars.smeared_defect_mask:
+            raise ValueError("DefectCloverChairDrift requires D=4 and the defect patch masks")
+        if int(flow_pars.patch_buffer) < field.loop_max + 1:
+            raise ValueError(f"loop_max={field.loop_max} needs a patch buffer of {field.loop_max + 1}")
+        self.field = field
+        self.D = field.D
+        self.defect = flow_pars.defect
+        self.buffer = int(flow_pars.patch_buffer)
+        smeared = flow_pars.smeared_defect_mask[-1][0, ..., 0, 0].cpu() > 0  # (D, *patch)
+        sites = [smeared[mu].flatten().nonzero().squeeze(-1) for mu in range(self.D)]
+        n = max(len(index) for index in sites)
+        # Pad each direction to the same count with a repeated site; padded entries are masked.
+        index = torch.stack([torch.cat((i, i[:1].expand(n - len(i)))) for i in sites])
+        valid = torch.stack([torch.arange(n) < len(i) for i in sites])
+        self.register_buffer("_sites", index, persistent=False)
+        self.register_buffer("_valid", valid, persistent=False)
+
+    @property
+    def loop_max(self):
+        return self.field.loop_max
+
+    def _gather(self, X, channels):
+        """(B, D, [K,] *patch, 3, 3) -> (B, D, [K,] n, 1, 1, 1, 3, 3) on the transformed links."""
+        start = 2 + int(channels)
+        flat = [X[:, mu].flatten(start - 1, start - 2 + self.D) for mu in range(self.D)]
+        picked = torch.stack([f.index_select(start - 1, self._sites[mu]) for mu, f in enumerate(flat)], dim=1)
+        return picked.view(*picked.shape[:start + 1], *([1] * (self.D - 1)), 3, 3)
+
+    def _patch(self, cfgs, t):
+        field = self.field
+        field._validate_U(cfgs)
+        small = self.defect.cut_defect(cfgs, buffer=self.buffer)
+        t = field._time(t, small)
+        generators, structure = field._basis(small)
+        S, C = self._gather(field._staples(small), True), self._gather(field._leaves(small), True)
+        f = lambda value: field._drift_given(self._gather(value, False), S, C, t, generators, structure)
+        return small, generators, f
+
+    def _embed(self, F_sites, cfgs, small):
+        """Velocities of the transformed links -> the full lattice, zero elsewhere."""
+        F_sites = F_sites.flatten(2, 1 + self.D) * self._valid.unsqueeze(-1)
+        patch = F_sites.new_zeros((*small.shape[:2], small.shape[2:-2].numel(), 8))
+        for mu in range(self.D):
+            patch[:, mu] = patch[:, mu].index_add(1, self._sites[mu], F_sites[:, mu])
+        patch = patch.view(*small.shape[:-2], 8)
+        return self.defect.embedding(patch, cfgs.real.new_zeros((*cfgs.shape[:-2], 8)), buffer=self.buffer)
+
+    def drift(self, cfgs, t):
+        """Return Lie-algebra coordinates with shape ``cfgs.shape[:-2] + (8,)``."""
+        small, _, f = self._patch(cfgs, t)
+        return self._embed(f(small), cfgs, small)
+
+    def _divergence_term(self, cfgs, t, a):
+        # The derivative along generator a of each transformed link, with its loops held fixed.
+        small, generators, f = self._patch(cfgs, t)
+        _, dF = torch.func.jvp(f, (small,), (1j * generators[a] @ small,))
+        return (dF[..., a].flatten(2) * self._valid).flatten(1).sum(1)
+
+    def divergence_terms(self, t):
+        """Callables cfgs -> (B,) summing to the divergence: one per generator direction."""
+        return [functools.partial(self._divergence_term, t=t, a=a) for a in range(8)]
+
+    def forward(self, cfgs, t):
+        """Return ``(F, div F)`` for the Haar-measure Lie-algebra field."""
+        return self.drift(cfgs, t), sum(term(cfgs) for term in self.divergence_terms(t))
+
+    @property
+    def checkpoint_semantics(self):
+        return {**self.field.checkpoint_semantics, "field": type(self).__name__,
+                "inner_field": type(self.field).__name__, "patch_buffer": self.buffer}
 
 
 def coeff_to_matrix(coeff):
@@ -443,15 +550,68 @@ def _pinn(xi, t, volume):
     return volume * total / max(count, 1)
 
 
-def path_gradient_loss(model, action_fn, U, t, volume=None):
-    """Path-gradient training loss and the same-rung PINN residual variance."""
+@contextlib.contextmanager
+def _frozen_parameters(model):
+    flags = [(parameter, parameter.requires_grad) for parameter in model.parameters()]
+    for parameter, _ in flags:
+        parameter.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for parameter, flag in flags:
+            parameter.requires_grad_(flag)
+
+
+def _residual_and_gradient(model, action_fn, U, t, V):
+    """xi and its link gradient at frozen parameters, one divergence term at a time.
+
+    The divergence is a sum of terms (one per link class and generator direction); each is
+    differentiated on its own and its graph freed, so memory is that of one term. The gradient
+    follows PyTorch's complex convention: d xi = Re sum conj(G) dU.
+    """
+    U = U.detach().requires_grad_(True)
+    with _frozen_parameters(model):
+        velocity = lie_tangent(U, model.drift(U, t))
+        _, dSdt = torch.func.jvp(lambda time: action_fn(U, time), (t,), (torch.ones_like(t),))
+        if dSdt.shape != (U.shape[0],):
+            raise ValueError(f"action_fn must return one value per chain ({U.shape[0]},)")
+        _, FgradS = torch.func.jvp(lambda value: action_fn(value, t), (U,), (velocity,))
+        smooth = (dSdt + FgradS) / V
+        (gradient,) = torch.autograd.grad(smooth.sum(), U)
+        xi = smooth.detach()
+        for term in model.divergence_terms(t):
+            value = term(U) / V
+            (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
+            if term_gradient is not None:
+                gradient = gradient - term_gradient
+            xi = xi - value.detach()
+    return xi, gradient
+
+
+def path_gradient_loss(model, action_fn, U, t, volume=None, chunk_size=None):
+    """Path-gradient training loss and the same-rung PINN residual variance.
+
+    loss = F_theta . grad xi, with xi at frozen parameters. Fields that expose
+    divergence_terms(t) get grad xi one divergence term (and one chunk of chains) at a time,
+    which bounds memory; the others use a forward derivative of xi along F_theta.
+    """
     V = _volume(U, volume)
     t = _as_time(t, U)
     coeff = model.drift(U, t)
     velocity = lie_tangent(U, coeff)
-    frozen = _frozen_model(model)
-    residual = lambda value: path_gradient_residual(frozen, action_fn, value, t, V)[0]
-    xi, loss = torch.func.jvp(residual, (U,), (velocity,))
+    if hasattr(model, "divergence_terms"):
+        size = U.shape[0] if chunk_size is None else int(chunk_size)
+        parts = [
+            _residual_and_gradient(model, action_fn, U[start:start + size], t[start:start + size], V)
+            for start in range(0, U.shape[0], size)
+        ]
+        xi = torch.cat([part[0] for part in parts])
+        gradient = torch.cat([part[1] for part in parts])
+        loss = (gradient.conj() * velocity).real.flatten(1).sum(1)
+    else:
+        frozen = _frozen_model(model)
+        residual = lambda value: path_gradient_residual(frozen, action_fn, value, t, V)[0]
+        xi, loss = torch.func.jvp(residual, (U,), (velocity,))
     return {
         "loss": loss,
         "xi": xi.detach(),
@@ -536,6 +696,6 @@ class CNFProtocolLayer(nn.Module):
 
 
 __all__ = [
-    "CloverChairLinkDrift", "CNFProtocolLayer", "apply_velocity", "coeff_to_matrix",
+    "CloverChairLinkDrift", "CNFProtocolLayer", "DefectCloverChairDrift", "apply_velocity", "coeff_to_matrix",
     "integrate_flow", "lie_tangent", "path_gradient_loss", "path_gradient_residual",
 ]

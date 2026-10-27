@@ -58,6 +58,7 @@ class CNFREXTrainer:
         updates_per_replica=1,
         grad_clip_norm=0.0,
         initial_cfgs=None,
+        chunk_size=None,
     ):
         self.field = field
         self.flow_pars = flow_pars
@@ -68,6 +69,8 @@ class CNFREXTrainer:
         self.batch_size = int(batch_size)
         self.updates_per_replica = int(updates_per_replica)
         self.grad_clip_norm = float(grad_clip_norm)
+        # Chains per path-gradient chunk (None: all chains of a rung at once); memory only.
+        self.chunk_size = None if chunk_size is None else int(chunk_size)
         device = torch.device(flow_pars.device)
         self.parameters = torch.as_tensor(parameters, dtype=torch.float64, device=device).reshape(-1)
         if self.domain not in {"beta", "defect"}:
@@ -195,6 +198,7 @@ class CNFREXTrainer:
                 self.x[i],
                 parameter,
                 volume=self.volume,
+                chunk_size=self.chunk_size,
             )
             loss = result["loss"]
             xi = result["xi"]

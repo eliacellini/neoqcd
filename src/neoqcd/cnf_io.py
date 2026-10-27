@@ -7,11 +7,11 @@ from pathlib import Path
 import torch
 
 from neoqcd.flow import FlowPars
-from neoqcd.utils import Defect, create_around_defect_mask, create_mask
+from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer
 
 
 def build_cnf(config, device="cpu"):
-    from neoqcd.cnf import CloverChairLinkDrift
+    from neoqcd.cnf import CloverChairLinkDrift, DefectCloverChairDrift
     from neoqcd.cnf_adapters import make_existing_drift
 
     c = config
@@ -23,7 +23,7 @@ def build_cnf(config, device="cpu"):
         defect_mask = defect.create_defect_mask().to(device)
     architecture = c["architecture"]
     patch = {}
-    if architecture == "defect-hyper-smearing":
+    if architecture in DEFECT_PATCH_ARCHITECTURES:
         patch = _defect_patch(c, device)
     pars = FlowPars(
         D=D, T=T, L=L, N=3, mask=create_mask(D, T, L).to(device),
@@ -41,38 +41,46 @@ def build_cnf(config, device="cpu"):
         residual_coeff_init=c["rho_init"],
         **patch,
     )
-    if architecture == "clover-chair":
+    if architecture in {"clover-chair", "defect-clover-chair"}:
         # Checkpoints without this key predate the normalization and keep the raw parameter.
         time_range = None
         if c.get("time_normalization", "none") == "unit_interval":
             time_range = (c["parameter_min"], c["parameter_max"])
         elif c.get("time_normalization", "none") != "none":
             raise ValueError(f"unknown time_normalization {c['time_normalization']!r}")
-        field = CloverChairLinkDrift(D, hidden_dim=c["hidden_dim"], depth=c["depth"], time_range=time_range)
+        field = CloverChairLinkDrift(D, hidden_dim=c["hidden_dim"], depth=c["depth"],
+                                     loop_max=c.get("loop_max", DEFAULT_LOOP_MAX), time_range=time_range)
+        if architecture == "defect-clover-chair":
+            field = DefectCloverChairDrift(field, pars)
     else:
         field = make_existing_drift(architecture, pars, rho_init=c["rho_init"])
     field.cnf_config = dict(config)
     return field.to(device=device, dtype=torch.float64), pars, defect_mask
 
 
+DEFECT_PATCH_ARCHITECTURES = ("defect-hyper-smearing", "defect-hyper-residual", "defect-clover-chair")
+# Largest rectangle side of a CloverChair field; checkpoints without the key used this value.
+DEFAULT_LOOP_MAX = 2
+
+
+def defect_patch_buffer(architecture, residual_n_pt=0, loop_max=DEFAULT_LOOP_MAX):
+    """Sites around the defect a patch needs so that no loop of a transformed link wraps."""
+    if architecture == "defect-hyper-residual":
+        return residual_patch_buffer(residual_n_pt)
+    if architecture == "defect-clover-chair":
+        # CloverChair loops reach loop_max sites from a link.
+        return int(loop_max) + 1
+    return 2
+
+
 def _defect_patch(c, device):
-    """Cropped patch masks of the NEO-REX defect coupling layer (buffer 2)."""
-    D, T, L = (int(c[key]) for key in ("D", "T", "L"))
-    size, time_slice, space_slice = (int(c[key]) for key in ("defect_size", "time_slice", "space_slice"))
-    buffer = 2
-    if c["domain"] != "defect" or D != 4:
-        raise ValueError("defect-hyper-smearing requires domain='defect' and D=4")
-    if T < 2 * buffer or L < size + 2 * buffer:
-        raise ValueError(f"defect-hyper-smearing requires T >= 4 and L >= defect_size + 4; got T={T}, L={L}")
-    if not buffer <= time_slice <= T - buffer or not buffer <= space_slice <= L - size - buffer:
-        raise ValueError("defect-hyper-smearing requires a two-site buffer around the defect")
-    small_t, small_l = 2 * buffer, size + 2 * buffer
-    small_defect = Defect(D, small_t, small_l, size, time_slice=buffer, space_slice=buffer)
-    return {
-        "small_mask": [create_mask(D, small_t, small_l).to(device)],
-        "smeared_defect_mask": [create_around_defect_mask(D, size, buffer=buffer).to(device)],
-        "small_defect_mask": [small_defect.create_defect_mask().to(device)],
-    }
+    """Cropped patch masks of the defect fields, with the buffer their loops need."""
+    if c["domain"] != "defect" or int(c["D"]) != 4:
+        raise ValueError(f"{c['architecture']} requires domain='defect' and D=4")
+    buffer = defect_patch_buffer(c["architecture"], c["residual_n_pt"], c.get("loop_max", DEFAULT_LOOP_MAX))
+    return defect_patch(
+        c["D"], c["T"], c["L"], c["defect_size"], c["time_slice"], c["space_slice"], buffer=buffer, device=device
+    )
 
 
 def save_cnf_checkpoint(path, field, config, *, epoch=0, trainer=None):

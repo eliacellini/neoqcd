@@ -28,7 +28,7 @@ from neoqcd.mcmc import DefectMCMCAdapter, HBOR
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
 from neoqcd.smearing_jacobian import LOGDET_VERSION
 from neoqcd.theory import Wilson_action
-from neoqcd.utils import Defect, create_around_defect_mask, create_mask
+from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer
 
 
 @dataclass
@@ -305,7 +305,7 @@ def _checkpoint_patch_semantics(flow_pars: FlowPars) -> dict:
             "T": int(flow_pars.T),
             "L": int(flow_pars.L),
             "defect_size": int(defect.dsize),
-            "crop_buffer": 2,
+            "crop_buffer": int(getattr(flow_pars, "patch_buffer", 2)),
         },
         "small_mask": _checkpoint_tensor_semantics(flow_pars.small_mask[-1]),
         "smeared_defect_mask": _checkpoint_tensor_semantics(
@@ -419,7 +419,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
             )
         finally:
             self.layer.smearing.jac_shape = old_jac_shape
-        x_out = self._embed_small_cfgs(x_small, x, buffer=2)
+        x_out = self._embed_small_cfgs(x_small, x, buffer=self.flow_pars.patch_buffer)
         logdet = dlogj.to(dtype=work_dtype)
         return x_out, logdet
 
@@ -441,9 +441,9 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         bc = self._normalize_parameter(bc, bs, x.device)
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=2)
+        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self._inverse_small(small_cfgs, bc, delta_bc, **kwargs)
-        return self._embed_small_cfgs(small_cfgs, x, buffer=2), logdet.to(dtype=work_dtype)
+        return self._embed_small_cfgs(small_cfgs, x, buffer=self.flow_pars.patch_buffer), logdet.to(dtype=work_dtype)
 
 
 class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
@@ -492,7 +492,7 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
 
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=2)
+        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self.layer(
             small_cfgs,
             self.flow_pars.small_mask[-1],
@@ -501,7 +501,7 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
             beta=bc,
             delta_beta=delta_bc,
         )
-        return self._embed_small_cfgs(small_cfgs, x, buffer=2), logdet.to(dtype=work_dtype)
+        return self._embed_small_cfgs(small_cfgs, x, buffer=self.flow_pars.patch_buffer), logdet.to(dtype=work_dtype)
 
     def _inverse_small(self, small_cfgs, bc, delta_bc, **kwargs):
         return self.layer.inverse(
@@ -521,37 +521,12 @@ def _build_neorex_flow_pars(
     mask: torch.Tensor,
     defect: Defect,
 ) -> FlowPars:
-    buffer = 2
-    required_t = 2 * buffer
-    required_l = int(args.defect_size) + 2 * buffer
-    if args.T < required_t or args.L < required_l:
-        raise ValueError(
-            f"NEO-REX defect NF requires T >= {required_t} and L >= {required_l}; "
-            f"got T={args.T}, L={args.L}"
-        )
-    if args.time_slice < buffer or args.time_slice > (args.T - buffer):
-        raise ValueError(
-            f"time_slice must satisfy {buffer} <= time_slice <= {args.T - buffer} for NEO-REX"
-        )
-    if args.space_slice < buffer or args.space_slice > (args.L - args.defect_size - buffer):
-        raise ValueError(
-            f"space_slice must satisfy {buffer} <= space_slice <= {args.L - args.defect_size - buffer} "
-            "for NEO-REX"
-        )
-
-    small_t = 2 * buffer
-    small_l = int(args.defect_size) + 2 * buffer
-    small_mask = create_mask(args.D, small_t, small_l).to(device)
-    smeared_defect_mask = create_around_defect_mask(args.D, args.defect_size, buffer=buffer).to(device)
-    small_defect = Defect(
-        D=args.D,
-        T=small_t,
-        L=small_l,
-        dsize=args.defect_size,
-        time_slice=buffer,
-        space_slice=buffer,
-    )
-    small_defect_mask = small_defect.create_defect_mask().to(device)
+    residual = str(getattr(args, "nf_layer_type", "") or "smearing").lower() == "residual"
+    buffer = residual_patch_buffer(args.residual_n_pt) if residual else 2
+    if args.residual_n_pt < 0:
+        raise ValueError("--residual-n-pt must be non-negative")
+    patch = defect_patch(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice,
+                         buffer=buffer, device=device)
 
     neorex_nstep = int(args.neorex_protocol_steps)
     protocol = [float(args.beta)] * neorex_nstep
@@ -585,10 +560,10 @@ def _build_neorex_flow_pars(
         residual_quadratic=args.residual_quadratic,
         residual_coeff_init=args.residual_coeff_init,
         residual_coeff_max=args.residual_coeff_max,
+        residual_n_pt=args.residual_n_pt,
+        residual_mask_mod=args.residual_mask_mod,
         defect=defect,
-        smeared_defect_mask=[smeared_defect_mask],
-        small_mask=[small_mask],
-        small_defect_mask=[small_defect_mask],
+        **patch,
     )
 
 
@@ -678,6 +653,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-no-quadratic", dest="residual_quadratic", action="store_false")
     parser.add_argument("--residual-coeff-init", type=float, default=1e-3)
     parser.add_argument("--residual-coeff-max", type=float, default=0.0)
+    parser.add_argument("--residual-n-pt", type=int, default=0,
+                        help="Frozen-link convolutions (rectangles and chairs); widens the defect patch buffer to 2 + n")
+    parser.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2)
 
     # Run control
     parser.add_argument("--thermal-steps", type=int, default=10)

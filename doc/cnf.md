@@ -24,6 +24,12 @@ differentiated. PG gradients reach the live field only. PINN is a diagnostic,
 computed separately within each replica; it is not the training objective.
 At least two chains per replica are required to estimate its variance.
 
+The fields expose their divergence as a sum of terms (one per link class and
+generator direction). `grad xi_frozen` is accumulated one term at a time, and
+`--pg-chunk-size N` also splits the chains of a rung, so memory is that of a
+single term; the loss is then `F_theta . grad xi_frozen`. This is the same
+gradient as differentiating `xi_frozen` along `F_theta` at once.
+
 The drift uses traceless Hermitian projections of loop anti-Hermitian parts,
 gauge-invariant scalar/Gram features and SU(3) commutator channels. It is a
 minimal equivariant extension, not a complete basis of SU(3) invariants:
@@ -32,7 +38,9 @@ Its time encoder sees the parameter rescaled to [0, 1] over the trained interval
 (`time_normalization: unit_interval` in new checkpoints; older ones keep the raw
 parameter). Haar divergence uses eight directional derivatives with the other links held
 fixed. On short periodic lattices, paths that reuse their target link are
-zeroed to preserve the validity of this diagonal derivative.
+zeroed to preserve the validity of this diagonal derivative. `--loop-max`
+(default 2) is the largest rectangle side of its loops; 1 keeps plaquettes,
+chairs and clover leaves only.
 
 The other supported architectures are `smearing`, `hyper-smearing`, `residual`
 and `hyper-residual`. Their pre-exponential generators define velocities per
@@ -54,6 +62,19 @@ two-site buffer around the defect; `--hyper-smearing-mode` may be `shared`,
 `per_link` or `class`. The classes cover the staples that cross the defect
 boundary, so `class` suits large defects: links with no classified staple are
 not transformed (zero velocity), and unclassified staples get rho = 0.
+
+`defect-hyper-residual` is the same construction for the residual layer
+(`ResidualDefectSNFProtocolLayer` in NEO-REX, the residual defect layer of the
+standalone SNF), including frozen-link convolutions (`--residual-n-pt`, which
+add rectangles and chairs) and mask mod 4. `defect-clover-chair` restricts a
+CloverChair field to the same links: loops are built on the patch and the
+network runs only on the transformed links.
+
+A defect patch is not periodic, so its buffer must hold every loop of a
+transformed link: 2 sites for plaquette staples, `2 + residual-n-pt` for the
+residual layer and `loop-max + 1` for CloverChair. The time and space slices must
+leave that buffer inside the lattice. The transformed links do not depend on
+the buffer.
 
 ## Run
 
@@ -117,12 +138,18 @@ residual layers, backward integration for a CNF). The two protocols are then
 each other's time reversal, as detailed balance of the swap requires; for a
 CNF the inverse, like the logdet, carries the CF4 integration error.
 
-### Evaluating a defect field with the smearing layer
+### Evaluating a field with its finite layer
 
-A `defect-hyper-smearing` field can instead be evaluated with the finite
-smearing layer, which has an exact logdet, either in NEO-REX or in the
-standalone SNF. Copy its network into the runner's checkpoint, passing the
-evaluation flags after `--`.
+A `defect-hyper-smearing`, `defect-hyper-residual`, `hyper-smearing` or
+`hyper-residual` field holds the same network as a finite layer, which has an
+exact logdet. Instead of integrating it, copy that network into the runner's
+checkpoint, passing the evaluation flags after `--`: NEO-REX takes the defect
+fields (`--nf-layer-type smearing --use-hyper-smearing` or `--nf-layer-type
+residual`), the standalone SNF takes all four (`--nf-architecture
+hyper-smearing` or `hyper-residual`, with the matching domain). The converter
+checks geometry, network settings and that the protocol lies in the trained
+interval. Residual layers need `--residual-quadratic --residual-include-imag
+--residual-coeff-max 0`, as the field.
 
 NEO-REX (`main_pt_obc.py`):
 

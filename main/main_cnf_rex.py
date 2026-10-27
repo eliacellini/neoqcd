@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from neoqcd.cnf import CNFProtocolLayer, integrate_flow
-from neoqcd.cnf_io import build_cnf, load_cnf_checkpoint, save_cnf_checkpoint
+from neoqcd.cnf_io import DEFECT_PATCH_ARCHITECTURES, build_cnf, defect_patch_buffer, load_cnf_checkpoint, save_cnf_checkpoint
 from neoqcd.cnf_training import CNFREXTrainer
 from neoqcd.distributedPT import NEOREXProtocolWrapper
 from neoqcd.mcmc import HBOR
@@ -21,7 +21,7 @@ from neoqcd.mcmc import HBOR
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--phase", choices=("train", "evaluate"), default="train")
-    p.add_argument("--architecture", choices=("clover-chair", "smearing", "hyper-smearing", "defect-hyper-smearing", "residual", "hyper-residual"), default="clover-chair")
+    p.add_argument("--architecture", choices=("clover-chair", "smearing", "hyper-smearing", "defect-hyper-smearing", "residual", "hyper-residual", "defect-hyper-residual", "defect-clover-chair"), default="clover-chair")
     p.add_argument("--domain", choices=("beta", "defect"), default="beta")
     p.add_argument("--D", type=int, default=2)
     p.add_argument("--T", type=int, default=4)
@@ -40,6 +40,8 @@ def parse_args(argv=None):
     p.add_argument("--rho-functional", action="store_true")
     p.add_argument("--hyper-smearing-mode", choices=("shared", "per_link", "class"), default="shared")
     p.add_argument("--residual-n-pt", type=int, default=0)
+    p.add_argument("--loop-max", type=int, default=2,
+                   help="Largest rectangle side of the clover-chair loops (1: plaquettes and chairs only)")
     p.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2)
     p.add_argument("--orsteps", type=int, default=1)
     p.add_argument("--mcmc-steps", type=int, default=1)
@@ -47,6 +49,8 @@ def parse_args(argv=None):
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
+    p.add_argument("--pg-chunk-size", type=int, default=0,
+                   help="Chains per path-gradient chunk to bound memory (0: all chains of a rung at once)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -63,6 +67,10 @@ def parse_args(argv=None):
         p.error("batch-size and replicas must be >=2")
     if args.D not in (2, 3, 4) or min(args.T, args.L) < 2 or args.T % 2 or args.L % 2:
         p.error("HBOR requires 2 <= D <= 4 and even T,L >=2")
+    if args.loop_max < 1:
+        p.error("--loop-max must be at least 1")
+    if args.pg_chunk_size < 0:
+        p.error("--pg-chunk-size must be non-negative")
     if args.warmup < 0 or args.orsteps < 0 or args.residual_n_pt < 0:
         p.error("warmup, orsteps and residual-n-pt must be nonnegative")
     if not all(math.isfinite(v) for v in (args.parameter_min, args.parameter_max, args.lr, args.beta, args.rho_init, args.grad_clip_norm)):
@@ -82,13 +90,15 @@ def parse_args(argv=None):
         p.error("hyper-smearing-mode requires a hyper-smearing architecture")
     if args.hyper_smearing_mode == "class" and args.architecture != "defect-hyper-smearing":
         p.error("hyper-smearing-mode=class requires architecture=defect-hyper-smearing")
-    if args.architecture == "defect-hyper-smearing":
+    if args.architecture in DEFECT_PATCH_ARCHITECTURES:
         if args.domain != "defect":
-            p.error("defect-hyper-smearing requires --domain defect")
-        if args.T < 4 or args.L < args.defect_size + 4:
-            p.error("defect-hyper-smearing requires T >= 4 and L >= defect-size + 4")
-        if not (2 <= args.time_slice <= args.T - 2 and 2 <= args.space_slice <= args.L - args.defect_size - 2):
-            p.error("defect-hyper-smearing requires a two-site buffer around the defect")
+            p.error(f"{args.architecture} requires --domain defect")
+        # Longer loops (residual convolutions, CloverChair) need a wider patch buffer.
+        b = defect_patch_buffer(args.architecture, args.residual_n_pt, args.loop_max)
+        if args.T < 2 * b or args.L < args.defect_size + 2 * b:
+            p.error(f"{args.architecture} requires T >= {2 * b} and L >= defect-size + {2 * b}")
+        if not (b <= args.time_slice <= args.T - b and b <= args.space_slice <= args.L - args.defect_size - b):
+            p.error(f"{args.architecture} requires a {b}-site buffer around the defect")
     return args
 
 
@@ -148,7 +158,7 @@ def main(argv=None):
     optimizer = torch.optim.Adam(field.parameters(), lr=config["lr"])
     trainer = CNFREXTrainer(field, pars, ladder, optimizer, domain=config["domain"], beta=config["beta"],
                            defect_mask=mask, batch_size=config["batch_size"], updates_per_replica=config["mcmc_steps"],
-                           grad_clip_norm=config["grad_clip_norm"])
+                           grad_clip_norm=config["grad_clip_norm"], chunk_size=args.pg_chunk_size or None)
     start = 0
     if payload and "trainer" in payload:
         trainer.load_state_dict(payload["trainer"])

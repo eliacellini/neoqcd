@@ -1,5 +1,7 @@
 """Continuous drift fields induced by the existing SU(3) SNF layers."""
 
+import functools
+
 import torch
 from torch import nn
 
@@ -174,39 +176,52 @@ class ExistingDrift(nn.Module):
             return self._smearing_generator(cfgs, t, mu, color, rho)
         return self._residual_generator(cfgs, t, mu, color, sites, *residual_coeffs)
 
-    def _field(self, cfgs, t, *, divergence):
+    def _validate(self, cfgs):
         if not torch.is_tensor(cfgs) or not torch.is_complex(cfgs) or cfgs.shape[-2:] != (3, 3):
             raise ValueError("cfgs must be a complex SU(3) link tensor ending in (3, 3)")
         if cfgs.dim() != self.D + 4 or cfgs.shape[1] != self.D:
             raise ValueError(f"cfgs must have shape (B, {self.D}, *lattice, 3, 3)")
-        masks = self._masks(cfgs)
-        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
-        coeffs = cfgs.real.new_zeros((*cfgs.shape[:-2], 8))
-        div = cfgs.real.new_zeros(cfgs.shape[0])
+
+    def _class_generator(self, cfgs, t, mu, color):
+        """Coordinates of the generator of the links of one class, and the class sites."""
+        sites = self._masks(cfgs)[color][1]
         rho = self._smearing_rho(t, cfgs) if self.architecture in {"smearing", "hyper-smearing"} else None
         residual_coeffs = self._residual_coefficients(cfgs, t) if self.architecture in {
             "residual", "hyper-residual"
         } else None
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+        active = sites.to(dtype=cfgs.real.dtype).unsqueeze(0)
+        q_fn = lambda u: _matrix_to_coordinates(
+            self._generator(u, t, mu, color, sites, rho, residual_coeffs), generators
+        ) * active.unsqueeze(-1)
+        return q_fn, active
 
+    def _divergence_term(self, cfgs, t, mu, color, a):
+        # A class never enters its own generator, so perturbing it at once leaves the diagonal.
+        q_fn, active = self._class_generator(cfgs, t, mu, color)
+        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
+        tangent = torch.zeros_like(cfgs)
+        tangent[:, mu] = 1j * torch.einsum("ij,b...jk->b...ik", generator, cfgs[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
+        _, dcoeff = torch.func.jvp(q_fn, (cfgs,), (tangent,))
+        return dcoeff[..., a].flatten(1).sum(1)
+
+    def divergence_terms(self, t):
+        """Callables cfgs -> (B,) summing to the divergence: one per (link class, direction)."""
+        return [
+            functools.partial(self._divergence_term, t=t, mu=mu, color=color, a=a)
+            for mu in range(self.D) for color in range(self.mask_mod) for a in range(8)
+        ]
+
+    def _field(self, cfgs, t, *, divergence):
+        self._validate(cfgs)
+        coeffs = cfgs.real.new_zeros((*cfgs.shape[:-2], 8))
         for mu in range(self.D):
-            for color, sites in masks:
-                q_fn = lambda u, mu=mu, color=color, sites=sites: _matrix_to_coordinates(
-                    self._generator(u, t, mu, color, sites, rho, residual_coeffs), generators
-                )
-                q = q_fn(cfgs)
-                active = sites.to(dtype=cfgs.real.dtype).unsqueeze(0)
-                coeffs[:, mu] = coeffs[:, mu] + q * active.unsqueeze(-1)
-                if not divergence:
-                    continue
-
-                for a in range(8):
-                    tangent = torch.zeros_like(cfgs)
-                    delta_u = 1j * torch.einsum("ij,b...jk->b...ik", generators[a], cfgs[:, mu])
-                    tangent[:, mu] = delta_u * active.unsqueeze(-1).unsqueeze(-1)
-                    _, dcoeff = torch.func.jvp(q_fn, (cfgs,), (tangent,))
-                    div = div + (dcoeff[..., a] * active).flatten(1).sum(1)
-
-        return coeffs, div
+            for color in range(self.mask_mod):
+                q_fn, _ = self._class_generator(cfgs, t, mu, color)
+                coeffs[:, mu] = coeffs[:, mu] + q_fn(cfgs)
+        if not divergence:
+            return coeffs, None
+        return coeffs, sum(term(cfgs) for term in self.divergence_terms(t))
 
     def drift(self, cfgs, t):
         """Return Lie-algebra coordinates with shape ``cfgs.shape[:-2] + (8,)``."""
@@ -225,8 +240,6 @@ class DefectHyperSmearingDrift(nn.Module):
     with unit delta, so the field is a velocity per unit boundary coupling.
     """
 
-    buffer = 2
-
     def __init__(self, flow_pars):
         super().__init__()
         if int(flow_pars.N) != 3 or int(flow_pars.D) != 4:
@@ -242,6 +255,7 @@ class DefectHyperSmearingDrift(nn.Module):
             raise ValueError("DefectHyperSmearingDrift requires the defect patch masks")
         self.D = 4
         self.defect = flow_pars.defect
+        self.buffer = int(getattr(flow_pars, "patch_buffer", 2))
         self.steps = int(flow_pars.smearing_steps_per_layer)
         self.smearing = Smearing(flow_pars, time=1.0)
         # Plain attributes: the link-selection cache is keyed on these exact tensors.
@@ -258,50 +272,168 @@ class DefectHyperSmearingDrift(nn.Module):
             raise ValueError(f"t has {t.numel()} values, expected 1 or {cfgs.shape[0]}")
         return hyper(beta=t, delta_beta=torch.ones_like(t)), True
 
-    def _field(self, cfgs, t, *, divergence):
+    def _validate(self, cfgs):
         if not torch.is_tensor(cfgs) or not torch.is_complex(cfgs) or cfgs.shape[-2:] != (3, 3):
             raise ValueError("cfgs must be a complex SU(3) link tensor ending in (3, 3)")
         if cfgs.dim() != self.D + 4 or cfgs.shape[1] != self.D:
             raise ValueError(f"cfgs must have shape (B, {self.D}, *lattice, 3, 3)")
+
+    def _class_generator(self, cfgs, t, m):
+        """Patch links, their flat indices in class m, and its generator coordinates as a function."""
         rho, batched = self._rho(t, cfgs)
         rho = rho.to(device=cfgs.device, dtype=cfgs.real.dtype)
         links = self.smearing._links_for_smearing_mask(self.small_mask, self.smeared_defect_mask)
         small = self.defect.cut_defect(cfgs, buffer=self.buffer)
         cfg_shape = tuple(small.shape)
-        flat = sun.flat_links(small, self.D)
         generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
-        coeffs = cfgs.real.new_zeros((*flat.shape[:2], 8))
-        div = cfgs.real.new_zeros(cfgs.shape[0])
+        index = links.links[m]
 
+        def q_fn(value):
+            U = value.index_select(1, index)
+            q = 0
+            # Every substep contributes its instantaneous generator at the same configuration.
+            for step in range(self.steps):
+                rho_step = rho[:, step, m] if batched else rho[step, m]
+                C = self.smearing._selected_stout_staples(value, cfg_shape, links, m, rho_step)
+                q = q + generate_Q(generate_omega(C, U), 3)
+            return _matrix_to_coordinates(q, generators)
+
+        return sun.flat_links(small, self.D), index, q_fn, cfg_shape
+
+    def _divergence_term(self, cfgs, t, m, a):
+        # Staples of a parity class never contain its own links, so perturbing the
+        # whole class at once leaves only the diagonal derivatives.
+        flat, index, q_fn, _ = self._class_generator(cfgs, t, m)
+        if index.numel() == 0:
+            return cfgs.real.new_zeros(cfgs.shape[0])
+        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
+        tangent = torch.zeros_like(flat).index_copy(1, index, 1j * (generator @ flat.index_select(1, index)))
+        _, dq = torch.func.jvp(q_fn, (flat,), (tangent,))
+        return dq[..., a].sum(1)
+
+    def divergence_terms(self, t):
+        """Callables cfgs -> (B,) summing to the divergence: one per (parity class, direction)."""
+        return [functools.partial(self._divergence_term, t=t, m=m, a=a) for m in range(2 * self.D) for a in range(8)]
+
+    def _field(self, cfgs, t, *, divergence):
+        self._validate(cfgs)
+        coeffs = None
         for m in range(2 * self.D):
-            index = links.links[m]
-            if index.numel() == 0:
-                continue
-
-            def q_fn(value, m=m, index=index):
-                U = value.index_select(1, index)
-                q = 0
-                # Every substep contributes its instantaneous generator at the same configuration.
-                for step in range(self.steps):
-                    rho_step = rho[:, step, m] if batched else rho[step, m]
-                    C = self.smearing._selected_stout_staples(value, cfg_shape, links, m, rho_step)
-                    q = q + generate_Q(generate_omega(C, U), 3)
-                return _matrix_to_coordinates(q, generators)
-
-            coeffs = coeffs.index_copy(1, index, q_fn(flat))
-            if not divergence:
-                continue
-            # Staples of a parity class never contain its own links, so perturbing the
-            # whole class at once leaves only the diagonal derivatives.
-            U = flat.index_select(1, index)
-            for a in range(8):
-                tangent = torch.zeros_like(flat).index_copy(1, index, 1j * (generators[a] @ U))
-                _, dq = torch.func.jvp(q_fn, (flat,), (tangent,))
-                div = div + dq[..., a].sum(1)
-
+            flat, index, q_fn, cfg_shape = self._class_generator(cfgs, t, m)
+            if coeffs is None:
+                coeffs = cfgs.real.new_zeros((*flat.shape[:2], 8))
+            if index.numel():
+                coeffs = coeffs.index_copy(1, index, q_fn(flat))
         coeffs = coeffs.reshape(*cfg_shape[:-2], 8)
         full = cfgs.real.new_zeros((*cfgs.shape[:-2], 8))
-        return self.defect.embedding(coeffs, full, buffer=self.buffer), div
+        F = self.defect.embedding(coeffs, full, buffer=self.buffer)
+        if not divergence:
+            return F, None
+        return F, sum(term(cfgs) for term in self.divergence_terms(t))
+
+    def drift(self, cfgs, t):
+        """Return Lie-algebra coordinates with shape ``cfgs.shape[:-2] + (8,)``."""
+        return self._field(cfgs, t, divergence=False)[0]
+
+    def forward(self, cfgs, t):
+        """Return ``(F, div F)`` for the Haar-measure Lie-algebra field."""
+        return self._field(cfgs, t, divergence=True)
+
+
+class DefectResidualDrift(nn.Module):
+    """The infinitesimal generator of the residual layer on the defect patch.
+
+    The residual generator (staples, optional frozen-link convolutions, quadratic loop
+    features) acts on the links the finite layer transforms in its cropped patch; every
+    other link has zero velocity. Coefficients are evaluated with unit delta, so the field
+    is a velocity per unit boundary coupling.
+    """
+
+    def __init__(self, flow_pars):
+        super().__init__()
+        if int(flow_pars.N) != 3 or int(flow_pars.D) != 4:
+            raise ValueError("DefectResidualDrift supports SU(3) in D=4")
+        if str(flow_pars.residual_parameterization) != "hyper":
+            raise ValueError("DefectResidualDrift requires the hyper residual parameterization")
+        if flow_pars.defect is None or not flow_pars.small_mask or not flow_pars.smeared_defect_mask:
+            raise ValueError("DefectResidualDrift requires the defect patch masks")
+        self.D = 4
+        self.defect = flow_pars.defect
+        self.residual = ResidualNormalizingFlows(flow_pars, time=1.0)
+        self.buffer = self.residual.patch_buffer
+        # Plain attributes: fixed masks of the patch, not state.
+        self.small_mask = flow_pars.small_mask[-1]
+        self.smeared_defect_mask = flow_pars.smeared_defect_mask[-1]
+        self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
+
+    def _validate(self, cfgs):
+        if not torch.is_tensor(cfgs) or not torch.is_complex(cfgs) or cfgs.shape[-2:] != (3, 3):
+            raise ValueError("cfgs must be a complex SU(3) link tensor ending in (3, 3)")
+        if cfgs.dim() != self.D + 4 or cfgs.shape[1] != self.D:
+            raise ValueError(f"cfgs must have shape (B, {self.D}, *lattice, 3, 3)")
+
+    def _class_generator(self, cfgs, t, mu, color):
+        """The patch, the transformed links of class (mu, color), and their generator coordinates."""
+        residual = self.residual
+        bs = int(cfgs.shape[0])
+        t = torch.as_tensor(t, dtype=torch.float64, device=cfgs.device).reshape(-1)
+        if t.numel() == 1:
+            t = t.expand(bs)
+        elif t.numel() != bs:
+            raise ValueError(f"t has {t.numel()} values, expected 1 or {bs}")
+        unit = torch.ones(bs, dtype=cfgs.real.dtype, device=cfgs.device)
+        lin_all, quad_all, _ = residual._coefficients(t, unit, bs, cfgs.real.dtype, cfgs.device)
+        small = self.defect.cut_defect(cfgs, buffer=self.buffer)
+        mask = residual._runtime_mask(self.small_mask, small, periodic=False)
+        dmask = self.smeared_defect_mask.to(device=cfgs.device, dtype=cfgs.real.dtype)
+        current_mask = mask[color + mu * residual.mask_mod, :] * dmask
+        active = current_mask[:, mu].squeeze(-1).squeeze(-1)  # (1, *patch)
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+
+        def q_fn(value):
+            q = 0
+            # Every substep contributes its instantaneous generator at the same configuration.
+            for step in range(residual.steps):
+                _, C = residual.staple_sum(value, mu, lin_all[:, step], quad_all[:, step], unit, step, current_mask)
+                q = q + generate_Q(generate_omega(C, value[:, mu]), 3)
+            return _matrix_to_coordinates(q, generators) * active.unsqueeze(-1)
+
+        return small, active, q_fn
+
+    def _divergence_term(self, cfgs, t, mu, color, a):
+        # The generator of an updated link never depends on another link of its class,
+        # so perturbing the whole class at once leaves only the diagonal derivatives.
+        small, active, q_fn = self._class_generator(cfgs, t, mu, color)
+        if not bool(active.any()):
+            return cfgs.real.new_zeros(cfgs.shape[0])
+        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
+        tangent = torch.zeros_like(small)
+        tangent[:, mu] = 1j * (generator @ small[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
+        _, dq = torch.func.jvp(q_fn, (small,), (tangent,))
+        return dq[..., a].flatten(1).sum(1)
+
+    def divergence_terms(self, t):
+        """Callables cfgs -> (B,) summing to the divergence: one per (link class, direction)."""
+        return [
+            functools.partial(self._divergence_term, t=t, mu=mu, color=color, a=a)
+            for mu in range(self.D) for color in range(self.residual.mask_mod) for a in range(8)
+        ]
+
+    def _field(self, cfgs, t, *, divergence):
+        self._validate(cfgs)
+        coeffs = None
+        for mu in range(self.D):
+            for color in range(self.residual.mask_mod):
+                small, active, q_fn = self._class_generator(cfgs, t, mu, color)
+                if coeffs is None:
+                    coeffs = cfgs.real.new_zeros((*small.shape[:-2], 8))
+                if bool(active.any()):
+                    coeffs[:, mu] = coeffs[:, mu] + q_fn(small)
+        full = cfgs.real.new_zeros((*cfgs.shape[:-2], 8))
+        F = self.defect.embedding(coeffs, full, buffer=self.buffer)
+        if not divergence:
+            return F, None
+        return F, sum(term(cfgs) for term in self.divergence_terms(t))
 
     def drift(self, cfgs, t):
         """Return Lie-algebra coordinates with shape ``cfgs.shape[:-2] + (8,)``."""
@@ -314,6 +446,9 @@ class DefectHyperSmearingDrift(nn.Module):
 
 def make_existing_drift(architecture, flow_pars, rho_init=1e-3):
     """Build the infinitesimal field associated with an existing SNF architecture."""
-    if str(architecture).lower() == "defect-hyper-smearing":
+    architecture = str(architecture).lower()
+    if architecture == "defect-hyper-smearing":
         return DefectHyperSmearingDrift(flow_pars)
+    if architecture == "defect-hyper-residual":
+        return DefectResidualDrift(flow_pars)
     return ExistingDrift(architecture, flow_pars, rho_init=rho_init)

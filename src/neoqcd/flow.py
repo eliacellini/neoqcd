@@ -362,7 +362,7 @@ class FlowPars():
                   residual_include_imag=True, residual_quadratic=True,
                  residual_coeff_init=1e-3, residual_coeff_max=0.0,
                  defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None,
-                 residual_n_pt=0, residual_mask_mod=2, explicit_backward=False,
+                 residual_n_pt=0, residual_mask_mod=2, explicit_backward=False, patch_buffer=2,
                  use_rho_functional=False, hidden_time_mlp=16):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -378,6 +378,7 @@ class FlowPars():
         self.smeared_defect_mask = smeared_defect_mask
         self.small_mask = small_mask
         self.small_defect_mask = small_defect_mask
+        self.patch_buffer = int(patch_buffer)
         self.rho_shape_type = rho_shape_type
 
         self.protocol = protocol
