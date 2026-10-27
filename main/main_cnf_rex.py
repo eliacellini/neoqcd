@@ -205,6 +205,11 @@ def _profiled_step(trainer, path):
         handle.write(averages.table(sort_by=f"self_{device}_time_total", row_limit=40))
         handle.write(f"\n# operators by total {device} time, including their children\n")
         handle.write(averages.table(sort_by=f"{device}_time_total", row_limit=40))
+        regions = [event for event in averages if event.key.startswith(("pg.", "rex.", "residual."))]
+        handle.write(f"\n# annotated regions: calls, cpu total ms, {device} total ms\n")
+        for event in sorted(regions, key=lambda e: -e.cpu_time_total):
+            gpu_ms = getattr(event, "cuda_time_total", 0) / 1e3 if on_gpu else 0.0
+            handle.write(f"{event.key:40s} {event.count:8d} {event.cpu_time_total / 1e3:12.1f} {gpu_ms:12.1f}\n")
     return metrics
 
 

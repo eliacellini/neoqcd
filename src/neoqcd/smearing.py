@@ -1,5 +1,6 @@
 import torch
 import torch.utils.checkpoint as checkpoint
+from torch.profiler import record_function
 import numpy as np
 import neoqcd.sun_utils as sun
 from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
@@ -908,15 +909,19 @@ class ResidualNormalizingFlows(torch.nn.Module):
         if self.n_pt:
             if current_mask is None:
                 raise ValueError("current_mask is required for residual_n_pt > 0")
-            values = (1.0 - current_mask) * cfgs
-            for point in range(self.n_pt):
-                values = self._frozen_convolution(values, step, point)
-            staples = self._oriented_staples(values, mu)
+            with record_function("residual.frozen_convolution"):
+                values = (1.0 - current_mask) * cfgs
+                for point in range(self.n_pt):
+                    values = self._frozen_convolution(values, step, point)
+            with record_function("residual.staples"):
+                staples = self._oriented_staples(values, mu)
         else:
-            staples = self._oriented_staples(cfgs, mu)
-        features = self._features(staples, U)
-        weights = self._feature_weights(features, lin, quad)
-        return staples, self._staple_sum(staples, weights, delta_v)
+            with record_function("residual.staples"):
+                staples = self._oriented_staples(cfgs, mu)
+        with record_function("residual.features_and_sum"):
+            features = self._features(staples, U)
+            weights = self._feature_weights(features, lin, quad)
+            return staples, self._staple_sum(staples, weights, delta_v)
 
     def _staples_and_generator(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
         U = cfgs[:, mu]

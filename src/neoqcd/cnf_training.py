@@ -5,6 +5,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 
 import neoqcd.sun_utils as sun
 from neoqcd.distributedPT import ParallelTempering, PTConfig
@@ -353,11 +354,8 @@ class DistributedCNFREXTrainer:
         shape = (self.batch_size, int(flow_pars.D), int(flow_pars.T),
                  *([int(flow_pars.L)] * (int(flow_pars.D) - 1)), int(flow_pars.N))
         self.x = sun.SUN_haar(shape, device=self.device, dtype=torch.cdouble)
-        self.updates = [
-            HBOR(flow_pars, beta=float(p), defect_par=1.0) if self.domain == "beta"
-            else HBOR(flow_pars, beta=self.beta, defect_par=float(p))
-            for p in self.parameters
-        ]
+        # One HBOR for all local chains, each at the parameter of its label (set every sweep).
+        self.update = HBOR(flow_pars, beta=self.beta, defect_par=1.0)
 
     def action(self, configs, parameter):
         """Wilson action along beta or defect parameter, differentiable in parameter."""
@@ -378,14 +376,18 @@ class DistributedCNFREXTrainer:
                 self.x[base] = sun.SUN_haar(self.x[base].shape[:-1], device=self.device, dtype=self.x.dtype)
             mask = self.flow_pars.mask.to(device=self.device)
             defect = None if self.defect_mask is None else self.defect_mask.to(device=self.device)
-            for k in torch.unique(labels).tolist():
-                chains = torch.nonzero(labels == k).squeeze(-1)
-                configs = self.x[chains]
+            with record_function("rex.hbor_sweep"):
+                # The chains of a rank carry different labels after swaps: a single update with a
+                # parameter per chain replaces one small update per label.
+                if self.domain == "beta":
+                    self.update.beta = self.pt.local_parameters
+                else:
+                    self.update.set_defect_parameter(self.pt.local_parameters)
                 for _ in range(self.updates_per_replica):
-                    configs = self.updates[k](configs, mask, defect)
-                self.x[chains] = configs
-            table = torch.stack([self.action(self.x, p) for p in self.parameters], dim=1)
-            return self.pt.step(local_actions=table)
+                    self.x = self.update(self.x, mask, defect)
+            with record_function("rex.swap"):
+                table = torch.stack([self.action(self.x, p) for p in self.parameters], dim=1)
+                return self.pt.step(local_actions=table)
 
     def warmup(self, sweeps=1):
         sweeps = int(sweeps)
@@ -399,12 +401,14 @@ class DistributedCNFREXTrainer:
         t = self.pt.local_parameters.to(dtype=self.x.real.dtype)
         result = path_gradient_loss(self.field, self.action, self.x, t, volume=self.volume, chunk_size=self.chunk_size,
                                     directions_per_term=self.directions_per_term)
-        (result["loss"].mean() / self.world_size).backward()
-        for parameter in self.field.parameters():
-            if parameter.requires_grad:
-                if parameter.grad is None:
-                    parameter.grad = torch.zeros_like(parameter)
-                dist.all_reduce(parameter.grad)
+        with record_function("pg.backward_to_weights"):
+            (result["loss"].mean() / self.world_size).backward()
+        with record_function("pg.allreduce"):
+            for parameter in self.field.parameters():
+                if parameter.requires_grad:
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                    dist.all_reduce(parameter.grad)
         return result
 
     def _gather(self, tensor):

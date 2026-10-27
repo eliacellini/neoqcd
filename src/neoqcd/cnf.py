@@ -15,6 +15,7 @@ from functools import lru_cache
 import torch
 from torch import nn
 from torch.func import functional_call
+from torch.profiler import record_function
 
 from . import sun_utils as sun
 from .smearing import _su3_generators
@@ -594,17 +595,20 @@ def _residual_and_gradient(model, action_fn, U, t, V, directions_per_term=1):
     """
     U = U.detach().requires_grad_(True)
     with _frozen_parameters(model):
-        velocity = lie_tangent(U, model.drift(U, t))
-        _, dSdt = torch.func.jvp(lambda time: action_fn(U, time), (t,), (torch.ones_like(t),))
-        if dSdt.shape != (U.shape[0],):
-            raise ValueError(f"action_fn must return one value per chain ({U.shape[0]},)")
-        _, FgradS = torch.func.jvp(lambda value: action_fn(value, t), (U,), (velocity,))
-        smooth = (dSdt + FgradS) / V
-        (gradient,) = torch.autograd.grad(smooth.sum(), U)
+        with record_function("pg.smooth_gradient"):
+            velocity = lie_tangent(U, model.drift(U, t))
+            _, dSdt = torch.func.jvp(lambda time: action_fn(U, time), (t,), (torch.ones_like(t),))
+            if dSdt.shape != (U.shape[0],):
+                raise ValueError(f"action_fn must return one value per chain ({U.shape[0]},)")
+            _, FgradS = torch.func.jvp(lambda value: action_fn(value, t), (U,), (velocity,))
+            smooth = (dSdt + FgradS) / V
+            (gradient,) = torch.autograd.grad(smooth.sum(), U)
         xi = smooth.detach()
         for term in model.divergence_terms(t, directions_per_term):
-            value = term(U) / V
-            (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
+            with record_function("pg.divergence_term"):
+                value = term(U) / V
+            with record_function("pg.divergence_term_gradient"):
+                (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
             if term_gradient is not None:
                 gradient = gradient - term_gradient
             xi = xi - value.detach()
@@ -622,8 +626,9 @@ def path_gradient_loss(model, action_fn, U, t, volume=None, chunk_size=None, dir
     """
     V = _volume(U, volume)
     t = _as_time(t, U)
-    coeff = model.drift(U, t)
-    velocity = lie_tangent(U, coeff)
+    with record_function("pg.drift"):
+        coeff = model.drift(U, t)
+        velocity = lie_tangent(U, coeff)
     if hasattr(model, "divergence_terms"):
         size = U.shape[0] if chunk_size is None else int(chunk_size)
         parts = [

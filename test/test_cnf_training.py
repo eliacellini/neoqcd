@@ -110,5 +110,36 @@ class CNFREXTrainerTest(unittest.TestCase):
         self.assertTrue(result["optimizer_updated"])
 
 
+class PerChainHBORTest(unittest.TestCase):
+    """One HBOR call with a parameter per chain equals one call per chain, on the same random numbers."""
+
+    def test_beta_and_defect_coupling_per_chain(self):
+        from neoqcd.cnf_io import build_cnf
+        from neoqcd.mcmc import HBOR
+
+        torch.manual_seed(3)
+        _, pars, defect = build_cnf(dict(
+            architecture="defect-hyper-smearing", domain="defect", D=4, T=4, L=6, beta=6.0, defect_size=1,
+            time_slice=2, space_slice=2, parameter_min=0.0, parameter_max=1.0, batch_size=3, hidden_dim=4,
+            depth=1, rho_init=1e-3, residual_n_pt=0, residual_mask_mod=2, orsteps=2,
+        ))
+        x = sun.SUN_haar((3, 4, 4, 6, 6, 6, 3), dtype=torch.cdouble)
+        rand = torch.rand((3, 18, 4, 4, 6, 6, 6), dtype=torch.double)
+        values = torch.tensor([0.2, 1.0, 0.6], dtype=torch.double)
+        for domain in ("beta", "defect"):
+            with self.subTest(domain=domain):
+                if domain == "beta":
+                    batched = HBOR(pars, beta=5.5 + values, defect_par=1.0)
+                    single = [HBOR(pars, beta=5.5 + float(v), defect_par=1.0) for v in values]
+                else:
+                    batched = HBOR(pars, beta=6.0, defect_par=1.0)
+                    batched.set_defect_parameter(values)
+                    single = [HBOR(pars, beta=6.0, defect_par=float(v)) for v in values]
+                out = batched(x, pars.mask, defect, rand=rand)
+                for i, update in enumerate(single):
+                    reference = update(x[i:i + 1], pars.mask, defect, rand=rand[i:i + 1])
+                    torch.testing.assert_close(out[i:i + 1], reference, rtol=0, atol=1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

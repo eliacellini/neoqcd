@@ -146,18 +146,9 @@ class ExistingDrift(nn.Module):
         mask = torch.zeros((1, self.D, *sites.shape, 1, 1), dtype=cfgs.real.dtype,
                            device=cfgs.device)
         mask[:, mu] = sites.to(dtype=cfgs.real.dtype).view(1, *sites.shape, 1, 1)
+        unit = torch.ones(bs, dtype=cfgs.real.dtype, device=cfgs.device)
         for step in range(self.steps):
-            if residual.n_pt:
-                values = (1.0 - mask) * cfgs
-                for point in range(residual.n_pt):
-                    values = residual._frozen_convolution(values, step, point)
-            else:
-                values = cfgs
-            staples = residual._oriented_staples(values, mu)
-            features = residual._features(staples, cfgs[:, mu])
-            weights = residual._feature_weights(features, lin_all[:, step], quad_all[:, step])
-            C = residual._staple_sum(staples, weights, torch.ones(bs, dtype=cfgs.real.dtype,
-                                                                   device=cfgs.device))
+            _, C = residual.staple_sum(cfgs, mu, lin_all[:, step], quad_all[:, step], unit, step, mask)
             q = q + generate_Q(generate_omega(C, cfgs[:, mu]), 3)
         return q
 
