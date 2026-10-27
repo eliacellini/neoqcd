@@ -653,9 +653,10 @@ def _write_observables(path: Path, trajectory: int, int_obs: torch.Tensor) -> in
 
 def _checkpoint_rng_state(device: torch.device) -> dict:
     numpy_state = np.random.get_state()
+    # The MT19937 key is uint32, which older torch cannot wrap; int64 holds it exactly.
     return {
         "python": random.getstate(),
-        "numpy": (numpy_state[0], torch.from_numpy(numpy_state[1].copy()), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])),
+        "numpy": (numpy_state[0], torch.from_numpy(numpy_state[1].astype(np.int64)), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])),
         **_capture_rng_state(device),
     }
 
@@ -663,7 +664,7 @@ def _checkpoint_rng_state(device: torch.device) -> dict:
 def _restore_checkpoint_rng_state(state: dict, device: torch.device) -> None:
     random.setstate(state["python"])
     numpy_state = state["numpy"]
-    np.random.set_state((numpy_state[0], numpy_state[1].cpu().numpy(), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
+    np.random.set_state((numpy_state[0], numpy_state[1].cpu().numpy().astype(np.uint32), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
     _restore_rng_state(state, device)
 
 
@@ -789,7 +790,7 @@ def _validate_resume_checkpoint(checkpoint: dict, args, local_batch: int, world_
             generator.set_state(rng["cpu"])
             if not isinstance(numpy_state, (tuple, list)) or len(numpy_state) != 5 or not torch.is_tensor(numpy_state[1]):
                 raise ValueError("invalid NumPy RNG state")
-            np.random.RandomState().set_state((numpy_state[0], numpy_state[1].cpu().numpy(), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
+            np.random.RandomState().set_state((numpy_state[0], numpy_state[1].cpu().numpy().astype(np.uint32), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
             random.Random().setstate(rng["python"])
         except Exception as exc:
             raise ValueError("resume checkpoint has an invalid RNG state") from exc
@@ -837,7 +838,7 @@ def _validate_checkpoint_prior(checkpoint: dict, args, local_batch: int, world_s
             numpy_state = rng["numpy"]
             if not isinstance(numpy_state, (tuple, list)) or len(numpy_state) != 5 or not torch.is_tensor(numpy_state[1]):
                 raise ValueError("missing NumPy RNG state")
-            np.random.RandomState().set_state((numpy_state[0], numpy_state[1].cpu().numpy(), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
+            np.random.RandomState().set_state((numpy_state[0], numpy_state[1].cpu().numpy().astype(np.uint32), int(numpy_state[2]), int(numpy_state[3]), float(numpy_state[4])))
             random.Random().setstate(rng["python"])
             if device.type == "cuda" and (
                 not isinstance(rng.get("cuda"), list)
