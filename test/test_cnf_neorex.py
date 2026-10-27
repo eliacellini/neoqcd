@@ -111,15 +111,24 @@ class CNFNEOREXTest(unittest.TestCase):
             self.assertIn(str(saved_path), run_meta["neorex_flow_checkpoint"]["saved_paths"])
 
     def test_multirank_gloo_swaps_every_link_without_training_the_field(self):
-        world_size, steps, batch_size = 3, 2, 2
+        self._run_multirank(dict(CONFIG), world_size=3)
+
+    def test_defect_clover_chair_runs_neorex_on_its_patch(self):
+        config = dict(CONFIG, architecture="defect-clover-chair", T=6, L=6, time_slice=3, space_slice=2,
+                      loop_max=1)
+        self._run_multirank(config, world_size=2)
+
+    def _run_multirank(self, config, world_size):
+        steps, batch_size = 2, 2
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = dict(CONFIG, batch_size=batch_size)
+            config = dict(config, batch_size=batch_size)
             torch.manual_seed(3)
             field, _, _ = build_cnf(config)
+            inner = getattr(field, "field", field)
             with torch.no_grad():
                 # A non-trivial but small drift, so the CNF actually moves the links.
-                for parameter in field.output_layer.parameters():
+                for parameter in inner.output_layer.parameters():
                     parameter.normal_(std=1e-3)
             cnf_checkpoint = root / "cnf.pt"
             save_cnf_checkpoint(cnf_checkpoint, field, config)
@@ -127,8 +136,9 @@ class CNFNEOREXTest(unittest.TestCase):
             argv = [
                 "--cpu", "--algorithm", "neorex", "--nf-layer-type", "cnf",
                 "--cnf-checkpoint", str(cnf_checkpoint), "--cnf-integration-steps", "1",
-                "--D", "4", "--T", "2", "--L", "2", "--N", "3",
-                "--defect-size", "1", "--time-slice", "1", "--space-slice", "1",
+                "--D", "4", "--T", str(config["T"]), "--L", str(config["L"]), "--N", "3",
+                "--defect-size", str(config["defect_size"]), "--time-slice", str(config["time_slice"]),
+                "--space-slice", str(config["space_slice"]),
                 "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
                 "--batch-size", str(batch_size), "--neorex-protocol-steps", "1",
                 "--thermal-steps", "1", "--steps", str(steps), "--orsteps", "0",
