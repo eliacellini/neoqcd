@@ -187,22 +187,24 @@ def _run_info(argv, world_size):
 
 
 def _profiled_step(trainer, path):
-    """One training step under the profiler: operators by device time and by memory."""
+    """One training step under the profiler: operators by device time.
+
+    Memory is not profiled: recording it for the thousands of small operators of the
+    loss exhausts the GPU. The per-epoch metrics already report the peak memory.
+    """
     activities = [torch.profiler.ProfilerActivity.CPU]
     on_gpu = torch.cuda.is_available() and str(trainer.flow_pars.device).startswith("cuda")
     if on_gpu:
         activities.append(torch.profiler.ProfilerActivity.CUDA)
-    with torch.profiler.profile(activities=activities, profile_memory=True, record_shapes=True) as profiler:
+    with torch.profiler.profile(activities=activities) as profiler:
         metrics = trainer.step()
     averages = profiler.key_averages()
     device = "cuda" if on_gpu else "cpu"
     with open(path, "w") as handle:
         handle.write(f"# operators by self {device} time\n")
         handle.write(averages.table(sort_by=f"self_{device}_time_total", row_limit=40))
-        handle.write(f"\n# operators by self {device} memory\n")
-        handle.write(averages.table(sort_by=f"self_{device}_memory_usage", row_limit=25))
-        handle.write("\n# by input shapes, self time\n")
-        handle.write(profiler.key_averages(group_by_input_shape=True).table(sort_by=f"self_{device}_time_total", row_limit=25))
+        handle.write(f"\n# operators by total {device} time, including their children\n")
+        handle.write(averages.table(sort_by=f"{device}_time_total", row_limit=40))
     return metrics
 
 
