@@ -46,6 +46,8 @@ def _fields():
     for architecture in ("defect-hyper-smearing", "defect-hyper-residual"):
         field, _, _ = build_cnf(_defect_config(architecture=architecture, batch_size=2))
         yield architecture, field, sun.SUN_haar((2, 4, 4, 6, 6, 6, 3), dtype=torch.cdouble), 4
+    field, _, _ = build_cnf(_defect_config(architecture="defect-hyper-residual", residual_mode="class", batch_size=2))
+    yield "defect-hyper-residual class", field, sun.SUN_haar((2, 4, 4, 6, 6, 6, 3), dtype=torch.cdouble), 4
 
 
 class TermByTermPathGradientTests(unittest.TestCase):

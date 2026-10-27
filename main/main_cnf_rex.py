@@ -48,6 +48,8 @@ def parse_args(argv=None):
     p.add_argument("--loop-max", type=int, default=2,
                    help="Largest rectangle side of the clover-chair loops (1: plaquettes and chairs only)")
     p.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2)
+    p.add_argument("--residual-mode", choices=("shared", "class"), default="shared",
+                   help="class: residual coefficients per defect class, unclassified links untransformed")
     p.add_argument("--orsteps", type=int, default=1)
     p.add_argument("--mcmc-steps", type=int, default=1)
     p.add_argument("--warmup", type=int, default=20)
@@ -108,6 +110,8 @@ def parse_args(argv=None):
         p.error("rho-functional requires architecture=smearing")
     if args.hyper_smearing_mode != "shared" and args.architecture not in {"hyper-smearing", "defect-hyper-smearing"}:
         p.error("hyper-smearing-mode requires a hyper-smearing architecture")
+    if args.residual_mode == "class" and args.architecture != "defect-hyper-residual":
+        p.error("residual-mode=class requires architecture=defect-hyper-residual")
     if args.hyper_smearing_mode in {"class", "per_site"} and args.architecture != "defect-hyper-smearing":
         p.error(f"hyper-smearing-mode={args.hyper_smearing_mode} requires architecture=defect-hyper-smearing")
     if args.architecture in DEFECT_PATCH_ARCHITECTURES:

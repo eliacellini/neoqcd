@@ -38,6 +38,7 @@ def build_cnf(config, device="cpu"):
         hyper_rho_init=c["rho_init"],
         residual_parameterization="static" if architecture == "residual" else "hyper",
         residual_n_pt=c["residual_n_pt"], residual_mask_mod=c["residual_mask_mod"],
+        residual_mode=c.get("residual_mode", "shared"),
         residual_coeff_init=c["rho_init"],
         **patch,
     )

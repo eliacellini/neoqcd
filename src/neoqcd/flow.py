@@ -363,6 +363,7 @@ class FlowPars():
                  residual_coeff_init=1e-3, residual_coeff_max=0.0,
                  defect=None, smeared_defect_mask=None, small_mask=None, small_defect_mask=None,
                  residual_n_pt=0, residual_mask_mod=2, explicit_backward=False, patch_buffer=2,
+                 residual_mode="shared",
                  use_rho_functional=False, hidden_time_mlp=16):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -415,6 +416,7 @@ class FlowPars():
                 "residual_parameterization must be 'hyper' or 'static', "
                 f"got {self.residual_parameterization!r}"
             )
+        self.residual_mode = str(residual_mode)
         self.residual_include_imag = bool(residual_include_imag)
         self.residual_quadratic = bool(residual_quadratic)
         self.residual_coeff_init = float(residual_coeff_init)

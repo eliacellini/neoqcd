@@ -149,6 +149,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Residual-only coloring; MCMC keeps its checkerboard mask.",
     )
     parser.add_argument(
+        "--residual-mode", choices=("shared", "class"), default="shared",
+        help="class (defect hyper-residual): coefficients per defect class, unclassified links untransformed.",
+    )
+    parser.add_argument(
         "--smearing-rho-init", type=float, default=1e-3,
         help="Strictly positive initial rho for non-hyper standard smearing.",
     )
@@ -371,6 +375,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rho-functional training requires --training-mode full")
     if args.residual_n_pt < 0:
         raise ValueError("residual-n-pt must be non-negative")
+    if args.residual_mode == "class" and (args.domain != "defect" or args.nf_architecture != "hyper-residual"):
+        raise ValueError("residual-mode=class is supported only for the defect hyper-residual SNF")
     if args.residual_n_pt or args.residual_mask_mod != 2:
         if args.algorithm != "snf" or args.nf_architecture not in {"residual", "hyper-residual"}:
             raise ValueError("residual-n-pt and residual-mask-mod require a residual SNF architecture")
@@ -1154,6 +1160,7 @@ def _build_flow_pars(args, device: torch.device, protocol: list[float], local_ba
         residual_coeff_max=args.residual_coeff_max,
         residual_n_pt=args.residual_n_pt,
         residual_mask_mod=args.residual_mask_mod,
+        residual_mode=args.residual_mode,
         explicit_backward=args.explicit_backward,
         use_rho_functional=args.rho_functional,
         rho_scale_fac=args.rho_functional_scale,
@@ -1673,6 +1680,8 @@ def _checkpoint_semantics(args, protocol: list[float]) -> dict:
         semantics["hyper_class_unclassified_links"] = "frozen"
     if args.residual_n_pt or args.residual_mask_mod != 2:
         semantics.update(residual_n_pt=args.residual_n_pt, residual_mask_mod=args.residual_mask_mod)
+    if args.residual_mode != "shared":
+        semantics.update(residual_mode=args.residual_mode)
     if args.nf_architecture == "cnf":
         payload = torch.load(args.cnf_checkpoint, map_location="cpu", weights_only=True)
         semantics.update(cnf_config=payload["config"], cnf_integration_steps=args.cnf_integration_steps,

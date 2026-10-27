@@ -298,6 +298,32 @@ class _ConstantSpline:
         return self.value
 
 
+DEFECT_CLASS_NAMES = ("t1b", "t1e", "t1c", "t2", "t2b", "t2e", "t2c", "sp", "ex")
+_DEFECT_CLASS_MASKS = {}
+
+
+def defect_class_masks(rho_shape, defect_mask) -> torch.Tensor:
+    """(classes, m, pl, *site) 0/1 masks of the staples in each defect class, on CPU.
+
+    The classification loops over the patch in Python, so masks are cached by geometry.
+    """
+    defect_mask = defect_mask.detach().cpu()
+    key = (tuple(int(n) for n in rho_shape), tuple(defect_mask.shape), defect_mask.numpy().tobytes())
+    if key not in _DEFECT_CLASS_MASKS:
+        masks = []
+        # set_defect_rho_from_fits puts a 1e-4 baseline everywhere: activating one class at a
+        # time with rho 1 separates the entries of that class.
+        for class_idx in range(len(DEFECT_CLASS_NAMES)):
+            splines = [_ConstantSpline(0.0) for _ in DEFECT_CLASS_NAMES]
+            splines[class_idx] = _ConstantSpline(1.0)
+            rho_class = set_defect_rho_from_fits(
+                xval=0.0, nstep=1, rhofitpars=splines, rho_shape=key[0], defect_mask=defect_mask, D=4,
+            )
+            masks.append((rho_class > 1e-3).to(dtype=torch.float64)[0])  # remove the smearing-step axis
+        _DEFECT_CLASS_MASKS[key] = torch.stack(masks, dim=0)
+    return _DEFECT_CLASS_MASKS[key].clone()
+
+
 
 class HyperSmearing(torch.nn.Module):
     """
@@ -314,7 +340,7 @@ class HyperSmearing(torch.nn.Module):
       left untransformed, as in class mode.
     """
 
-    CLASS_NAMES = ("t1b", "t1e", "t1c", "t2", "t2b", "t2e", "t2c", "sp", "ex")
+    CLASS_NAMES = DEFECT_CLASS_NAMES
 
     def __init__(self, flow_pars, time):
         super().__init__()
@@ -443,27 +469,9 @@ class HyperSmearing(torch.nn.Module):
     def _build_class_masks(self, flow_pars) -> torch.Tensor:
         if flow_pars.small_defect_mask is None or len(flow_pars.small_defect_mask) == 0:
             raise ValueError(
-                "hyper_smearing_mode='class' requires flow_pars.small_defect_mask[-1]"
+                f"hyper_smearing_mode={self.mode!r} requires flow_pars.small_defect_mask[-1]"
             )
-
-        defect_mask_cpu = flow_pars.small_defect_mask[-1].detach().cpu()
-        masks = []
-        # set_defect_rho_from_fits initializes rho with 1e-4 baseline;
-        # here we extract only class-active entries by activating one class at a time.
-        for class_idx in range(len(self.CLASS_NAMES)):
-            class_spl = [_ConstantSpline(0.0) for _ in range(len(self.CLASS_NAMES))]
-            class_spl[class_idx] = _ConstantSpline(float(self.nstep))
-            rho_class = set_defect_rho_from_fits(
-                xval=self.time,
-                nstep=self.nstep,
-                rhofitpars=class_spl,
-                rho_shape=self.rho_shape,
-                defect_mask=defect_mask_cpu,
-                D=self.D,
-            )
-            active = (rho_class > 1e-3).to(dtype=torch.float64)
-            masks.append(active[0])  # remove smearing-step dimension
-        return torch.stack(masks, dim=0).to(device=flow_pars.device)
+        return defect_class_masks(self.rho_shape, flow_pars.small_defect_mask[-1]).to(device=flow_pars.device)
 
     def _expand_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
         # coeffs shape: (smearing_steps, coeffs_per_step) or (batch, smearing_steps, coeffs_per_step)
@@ -632,6 +640,10 @@ class ResidualNormalizingFlows(torch.nn.Module):
     beta, while delta_beta multiplies the exponential generator.
     Optional frozen-link convolutions extend the plaquette paths without
     introducing dependence on other active links.
+
+    residual_mode "class" (defect patch only): the hypernetwork gives lin and H for each defect
+    class, and every staple takes those of its class, as in the class mode of hyper-smearing.
+    Links with no classified staple are not transformed.
     """
 
     def __init__(self, flow_pars, time=1.0):
@@ -663,12 +675,22 @@ class ResidualNormalizingFlows(torch.nn.Module):
         if self.mask_mod not in (2, 4):
             raise ValueError("residual_mask_mod must be 2 or 4")
         self.patch_buffer = int(getattr(flow_pars, "patch_buffer", 2))
+        self.mode = str(getattr(flow_pars, "residual_mode", "shared"))
+        if self.mode not in {"shared", "class"}:
+            raise ValueError(f"residual_mode must be 'shared' or 'class', got {self.mode!r}")
 
         self.n_oriented_plaquettes = 2 * (self.D - 1)
         self.n_features = self.n_oriented_plaquettes * (2 if self.include_imag else 1)
-        self.coeffs_per_step = self.n_features
+        self.coeffs_per_class = self.n_features
         if self.use_quadratic:
-            self.coeffs_per_step += self.n_features * self.n_features
+            self.coeffs_per_class += self.n_features * self.n_features
+        self.n_classes = 1
+        if self.mode == "class":
+            if self.parameterization != "hyper" or not getattr(flow_pars, "small_defect_mask", None):
+                raise ValueError("residual_mode='class' needs the hyper parameterization on a defect patch")
+            self.register_buffer("class_staple_masks", self._class_staple_masks(flow_pars))
+            self.n_classes = int(self.class_staple_masks.shape[0])
+        self.coeffs_per_step = self.n_classes * self.coeffs_per_class
 
         # Keep this constant out of buffers: NCCL DDP cannot broadcast ComplexDouble buffers.
         self.generators = _su3_generators(dtype=torch.cdouble, device=torch.device("cpu"))
@@ -729,7 +751,45 @@ class ResidualNormalizingFlows(torch.nn.Module):
             with torch.no_grad():
                 self.mlp[-1].weight.zero_()
                 self.mlp[-1].bias.zero_()
-                self.mlp[-1].bias.view(self.steps, self.coeffs_per_step)[:, : self.n_features].fill_(coeff_init)
+                self.mlp[-1].bias.view(self.steps, self.n_classes, self.coeffs_per_class)[..., : self.n_features].fill_(coeff_init)
+
+    def _class_staple_masks(self, flow_pars):
+        """(classes, D, oriented staple, *site) masks, staples in _oriented_staples order."""
+        sites = tuple(flow_pars.small_mask[-1].shape[3:3 + self.D])
+        rho_shape = (1, 2 * self.D, self.n_oriented_plaquettes, *sites)
+        masks = defect_class_masks(rho_shape, flow_pars.small_defect_mask[-1])
+        by_direction = []
+        for mu in range(self.D):
+            # The two link parities of a direction are disjoint sites of one class mask.
+            parity_sum = masks[:, 2 * mu] + masks[:, 2 * mu + 1]
+            slots = []
+            for nu in range(self.D):
+                if nu != mu:
+                    pidx = 2 * sun.plaq_index(self.D, mu, nu)
+                    slots.extend((parity_sum[:, pidx], parity_sum[:, pidx + 1]))
+            by_direction.append(torch.stack(slots, dim=1))
+        return torch.stack(by_direction, dim=1).to(device=flow_pars.device)
+
+    def classified_links(self) -> torch.Tensor:
+        """Class mode: (D, *site) mask of the links with at least one classified staple."""
+        return self.class_staple_masks.sum(dim=(0, 2)) > 0
+
+    def _site_coefficients(self, lin, quad, mu):
+        """Class mode: per-class (b, C, i[, j]) coefficients -> per-staple (b, i[, j], *site) ones."""
+        if self.mode != "class" or lin.dim() != 3:
+            return lin, quad
+        masks = self.class_staple_masks[:, mu].to(dtype=lin.dtype)
+        if self.include_imag:
+            masks = torch.cat((masks, masks), dim=1)  # real then imaginary parts of the same staples
+        return (torch.einsum("bci,ci...->bi...", lin, masks),
+                torch.einsum("bcij,ci...->bij...", quad, masks))
+
+    def _active_mask(self, current_mask):
+        """Class mode: leave the links with no classified staple untransformed."""
+        if self.mode != "class":
+            return current_mask
+        classified = self.classified_links().to(dtype=current_mask.dtype)
+        return current_mask * classified.view((1, self.D) + classified.shape[1:] + (1, 1))
 
     def _fourier(self, beta):
         arg = beta.unsqueeze(-1) * self.freqs.unsqueeze(0)
@@ -762,20 +822,21 @@ class ResidualNormalizingFlows(torch.nn.Module):
             ),
             dim=-1,
         )
-        raw = self.mlp(emb).view(batch_size, self.steps, self.coeffs_per_step)
+        classes = (self.n_classes,) if self.mode == "class" else ()
+        raw = self.mlp(emb).view(batch_size, self.steps, *classes, self.coeffs_per_class)
         if self.coeff_max > 0.0:
             raw = self.coeff_max * torch.tanh(raw / self.coeff_max)
 
         lin = raw[..., : self.n_features].to(device=device, dtype=dtype)
         if self.use_quadratic:
             quad = raw[..., self.n_features :].view(
-                batch_size, self.steps, self.n_features, self.n_features
+                batch_size, self.steps, *classes, self.n_features, self.n_features
             )
             quad = 0.5 * (quad + quad.transpose(-1, -2))
             quad = quad.to(device=device, dtype=dtype)
         else:
             quad = torch.zeros(
-                (batch_size, self.steps, self.n_features, self.n_features),
+                (batch_size, self.steps, *classes, self.n_features, self.n_features),
                 dtype=dtype,
                 device=device,
             )
@@ -816,12 +877,13 @@ class ResidualNormalizingFlows(torch.nn.Module):
         return tr.real
 
     def _feature_weights(self, features, lin, quad):
-        lin_view = lin.view(lin.shape + (1,) * (features.dim() - 2))
-        return lin_view + torch.einsum(
-            "bij,bj...->bi...",
-            quad,
-            features,
-        )
+        lin_view = lin.view(lin.shape + (1,) * (features.dim() - lin.dim()))
+        return lin_view + self._quadratic_term(quad, features)
+
+    @staticmethod
+    def _quadratic_term(quad, features):
+        # Per-staple coefficients carry the site axes too (class mode).
+        return torch.einsum("bij...,bj...->bi..." if quad.dim() > 3 else "bij,bj...->bi...", quad, features)
 
     def _complex_coefficients_from_weights(self, weights, delta_beta):
         npl = self.n_oriented_plaquettes
@@ -871,7 +933,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
             Tb = gens[b].view(view)
             delta_U = 1.j * sun.SUN_mul(Tb, U)
             delta_features = self._delta_features(staples, delta_U)
-            delta_weights = torch.einsum("bij,bj...->bi...", quad, delta_features)
+            delta_weights = self._quadratic_term(quad, delta_features)
             delta_C = self._staple_sum(staples, delta_weights, delta_beta)
             delta_Udag = -1.j * sun.SUN_mul(Udag, Tb)
             delta_omega = sun.SUN_mul(delta_C, Udag) + sun.SUN_mul(C, delta_Udag)
@@ -946,6 +1008,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
         update. With frozen-link convolutions, current_mask marks the links being updated:
         they are removed before the convolution, so C never depends on another updated link.
         """
+        lin, quad = self._site_coefficients(lin, quad, mu)
         U = cfgs[:, mu]
         if self.n_pt:
             if current_mask is None:
@@ -986,6 +1049,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
     def residual_update_mu(self, cfgs, mu, beta=None, delta_beta=None, step=0, current_mask=None):
         real_dtype = cfgs.real.dtype
         lin, quad, delta_v = self._step_coefficients(cfgs, beta, delta_beta, step)
+        lin, quad = self._site_coefficients(lin, quad, mu)
 
         U = cfgs[:, mu]
         if bool(torch.all(delta_v == 0.0).item()):
@@ -1023,9 +1087,9 @@ class ResidualNormalizingFlows(torch.nn.Module):
             for mu in range(self.D):
                 for eo in range(self.mask_mod):
                     if dmasking:
-                        current_mask = mask[eo + mu * self.mask_mod, :] * dmask
+                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask)
                     else:
-                        current_mask = mask[eo + mu * self.mask_mod, :]
+                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :])
 
                     U_new, jac, _ = self.residual_update_mu(
                         cfgs,
@@ -1074,9 +1138,9 @@ class ResidualNormalizingFlows(torch.nn.Module):
             for mu in reversed(range(self.D)):
                 for eo in reversed(range(self.mask_mod)):
                     if dmasking:
-                        current_mask = mask[eo + mu * self.mask_mod, :] * dmask
+                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask)
                     else:
-                        current_mask = mask[eo + mu * self.mask_mod, :]
+                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :])
                     active_mu = current_mask[:, mu]
                     frozen = cfgs
 

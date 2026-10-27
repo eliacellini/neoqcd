@@ -127,6 +127,7 @@ class ExistingDriftTests(unittest.TestCase):
 class DefectResidualDriftTests(unittest.TestCase):
     """The defect residual field, with rectangles (one frozen convolution, mod 4) and without."""
 
+    MODE = "shared"
     CASES = {"plaquettes": dict(residual_n_pt=0, residual_mask_mod=2, T=4, L=6, time_slice=2, space_slice=2),
              "rectangles": dict(residual_n_pt=1, residual_mask_mod=4, T=6, L=8, time_slice=3, space_slice=3)}
 
@@ -134,7 +135,7 @@ class DefectResidualDriftTests(unittest.TestCase):
         from neoqcd.cnf_io import build_cnf
 
         torch.manual_seed(9)
-        config = _defect_config(architecture="defect-hyper-residual", **self.CASES[case])
+        config = _defect_config(architecture="defect-hyper-residual", residual_mode=self.MODE, **self.CASES[case])
         field, pars, _ = build_cnf(config)
         with torch.no_grad():
             for parameter in field.residual.parameters():
@@ -148,7 +149,10 @@ class DefectResidualDriftTests(unittest.TestCase):
                 field, pars, cfgs = self._field(case)
                 self.assertEqual(field.buffer, 2 + self.CASES[case]["residual_n_pt"])
                 active = field.drift(cfgs, 0.4).abs().sum(-1) > 0
-                self.assertEqual(int(active.sum()), 75)
+                self.assertEqual(int(active.sum()), self._moving_links(field, cfgs))
+
+    def _moving_links(self, field, cfgs):
+        return 75
 
     def test_a_link_never_moves_the_velocity_of_its_own_class(self):
         # The divergence perturbs a whole class at once; that is exact only if no link of a
@@ -159,6 +163,7 @@ class DefectResidualDriftTests(unittest.TestCase):
         small = defect.cut_defect(cfgs, buffer=buffer)
         # (classes, 1, D, *patch, 1, 1) -> the links of each class, on the full lattice
         mask = residual._runtime_mask(field.small_mask, small, periodic=False) * field.smeared_defect_mask
+        mask = torch.stack([residual._active_mask(m) for m in mask])  # the links each class updates
         zero = torch.zeros((1, *cfgs.shape[1:-2], 1), dtype=torch.double)
         generators = field.generators
         with torch.no_grad():
@@ -232,6 +237,45 @@ class DefectResidualDriftTests(unittest.TestCase):
         self.assertTrue(grads)
         self.assertTrue(all(torch.isfinite(g).all() for g in grads))
         self.assertIsNotNone(field.residual.conv_eta.grad)
+
+
+class DefectResidualClassModeTests(DefectResidualDriftTests):
+    """Residual coefficients per defect class: the shared-mode guarantees, on the classified links."""
+
+    MODE = "class"
+
+    def _moving_links(self, field, cfgs):
+        smeared = field.smeared_defect_mask[0, ..., 0, 0] > 0
+        moving = int((field.residual.classified_links() & smeared).sum())
+        self.assertGreater(moving, 0)
+        self.assertLess(moving, 75)
+        return moving
+
+    def test_finite_layer_moves_only_classified_links_and_inverts(self):
+        from neoqcd.smearing import ResidualNormalizingFlows
+
+        for case in self.CASES:
+            with self.subTest(case=case):
+                field, pars, cfgs = self._field(case)
+                layer = ResidualNormalizingFlows(pars)
+                layer.load_state_dict(field.residual.state_dict())
+                small = pars.defect.cut_defect(cfgs, buffer=field.buffer)
+                kwargs = dict(dmasking=True, dmask=pars.smeared_defect_mask[-1],
+                              beta=torch.tensor([0.35], dtype=torch.double), delta_beta=torch.tensor([0.2], dtype=torch.double))
+                with torch.no_grad():
+                    out, _, logdet = layer(small, pars.small_mask[-1], **kwargs)
+                    back, _, logdet_inverse = layer.inverse(out, pars.small_mask[-1], **kwargs)
+                moved = ((out - small).abs().amax((-1, -2)) > 0)[0]
+                smeared = pars.smeared_defect_mask[-1][0, ..., 0, 0] > 0
+                self.assertTrue(torch.equal(moved, layer.classified_links() & smeared))
+                torch.testing.assert_close(back, small, rtol=0, atol=1e-11)
+                torch.testing.assert_close(logdet_inverse, -logdet, rtol=0, atol=1e-10)
+
+    def test_coefficients_differ_between_classes(self):
+        field, _, _ = self._field("plaquettes")
+        lin, quad, _ = field.residual._coefficients(torch.tensor([0.4]), torch.ones(1), 1, torch.double, "cpu")
+        self.assertEqual(tuple(lin.shape), (1, 1, field.residual.n_classes, field.residual.n_features))
+        self.assertGreater(float((lin[0, 0, 0] - lin[0, 0, 1]).abs().max()), 0.0)
 
 
 if __name__ == "__main__":

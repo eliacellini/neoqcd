@@ -30,7 +30,9 @@ from neoqcd.utils import Defect, create_mask
 ROOT = Path(__file__).resolve().parents[1]
 DEFECT_GEOMETRY = ("defect_size", "time_slice", "space_slice")
 # CNF architecture -> (domain, standalone --nf-architecture, settings that must match the field)
-RESIDUAL_SETTINGS = ("residual_n_pt", "residual_mask_mod")
+RESIDUAL_SETTINGS = ("residual_n_pt", "residual_mask_mod", "residual_mode")
+# Settings added after some fields were trained, with the value those fields used.
+SETTING_DEFAULTS = {"residual_mode": "shared"}
 SNF_TWINS = {
     "defect-hyper-smearing": ("defect", "hyper-smearing", ("hyper_smearing_mode",)),
     "defect-hyper-residual": ("defect", "hyper-residual", RESIDUAL_SETTINGS),
@@ -75,8 +77,9 @@ def _trained_network(cnf_checkpoint, args, architectures, settings, beta=None, i
     if beta is not None:
         expected.append(("beta", beta))
     for key, value in expected:
-        if config[key] != value:
-            raise ValueError(f"{key}: CNF field has {config[key]!r}, evaluation flags have {value!r}")
+        saved = config.get(key, SETTING_DEFAULTS.get(key))
+        if saved != value:
+            raise ValueError(f"{key}: CNF field has {saved!r}, evaluation flags have {value!r}")
     if interval is not None:
         low, high = sorted(interval)
         if low < config["parameter_min"] or high > config["parameter_max"]:

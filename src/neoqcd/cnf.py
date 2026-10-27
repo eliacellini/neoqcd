@@ -615,10 +615,11 @@ def _residual_and_gradient(model, action_fn, U, t, V, directions_per_term=1):
         for term in model.divergence_terms(t, directions_per_term):
             with record_function("pg.divergence_term"):
                 value = term(U) / V
-            with record_function("pg.divergence_term_gradient"):
-                (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
-            if term_gradient is not None:
-                gradient = gradient - term_gradient
+            if value.requires_grad:  # a term over links that never move is a constant zero
+                with record_function("pg.divergence_term_gradient"):
+                    (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
+                if term_gradient is not None:
+                    gradient = gradient - term_gradient
             xi = xi - value.detach()
     return xi, gradient
 

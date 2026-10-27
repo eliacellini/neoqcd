@@ -381,7 +381,8 @@ class DefectResidualDrift(nn.Module):
         small = self.defect.cut_defect(cfgs, buffer=self.buffer)
         mask = residual._runtime_mask(self.small_mask, small, periodic=False)
         dmask = self.smeared_defect_mask.to(device=cfgs.device, dtype=cfgs.real.dtype)
-        current_mask = mask[color + mu * residual.mask_mod, :] * dmask
+        # As in the finite layer: in class mode the unclassified links are not updated.
+        current_mask = residual._active_mask(mask[color + mu * residual.mask_mod, :] * dmask)
         active = current_mask[:, mu].squeeze(-1).squeeze(-1)  # (1, *patch)
         generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
 

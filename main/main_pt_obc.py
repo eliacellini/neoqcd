@@ -478,6 +478,8 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
             "n_features": int(residual.n_features),
             "coeffs_per_step": int(residual.coeffs_per_step),
         }
+        if residual.mode != "shared":  # absent from flows saved before the class mode
+            semantics["mode"] = residual.mode
         if residual.parameterization == "hyper":
             semantics.update(
                 time_embedding_dim=2 * int(residual.freqs.numel()),
@@ -562,6 +564,7 @@ def _build_neorex_flow_pars(
         residual_coeff_max=args.residual_coeff_max,
         residual_n_pt=args.residual_n_pt,
         residual_mask_mod=args.residual_mask_mod,
+        residual_mode=args.residual_mode,
         defect=defect,
         **patch,
     )
@@ -656,6 +659,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-n-pt", type=int, default=0,
                         help="Frozen-link convolutions (rectangles and chairs); widens the defect patch buffer to 2 + n")
     parser.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--residual-mode", choices=("shared", "class"), default="shared",
+                        help="class: residual coefficients per defect class, unclassified links untransformed")
 
     # Run control
     parser.add_argument("--thermal-steps", type=int, default=10)
