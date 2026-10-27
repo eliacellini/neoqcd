@@ -1002,14 +1002,8 @@ class ResidualNormalizingFlows(torch.nn.Module):
             values_next.append(links[mu] + sun.SUN_dagger(update))
         return torch.stack(values_next, dim=1)
 
-    def staple_sum(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
-        """
-        The weighted staple sum C of the links in direction mu, with exp(iQ(C U^dagger)) their
-        update. With frozen-link convolutions, current_mask marks the links being updated:
-        they are removed before the convolution, so C never depends on another updated link.
-        """
-        lin, quad = self._site_coefficients(lin, quad, mu)
-        U = cfgs[:, mu]
+    def _mask_staples(self, cfgs, mu, step, current_mask):
+        """Oriented staples (B, 2(D-1), *site, N, N) of direction mu; none contains a link of current_mask."""
         if self.n_pt:
             if current_mask is None:
                 raise ValueError("current_mask is required for residual_n_pt > 0")
@@ -1018,14 +1012,69 @@ class ResidualNormalizingFlows(torch.nn.Module):
                 for point in range(self.n_pt):
                     values = self._frozen_convolution(values, step, point)
             with record_function("residual.staples"):
-                staples = self._oriented_staples(values, mu)
-        else:
-            with record_function("residual.staples"):
-                staples = self._oriented_staples(cfgs, mu)
+                return self._oriented_staples(values, mu)
+        with record_function("residual.staples"):
+            return self._oriented_staples(cfgs, mu)
+
+    def staple_sum(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
+        """
+        The weighted staple sum C of the links in direction mu, with exp(iQ(C U^dagger)) their
+        update. With frozen-link convolutions, current_mask marks the links being updated:
+        they are removed before the convolution, so C never depends on another updated link.
+        """
+        lin, quad = self._site_coefficients(lin, quad, mu)
+        U = cfgs[:, mu]
+        staples = self._mask_staples(cfgs, mu, step, current_mask)
         with record_function("residual.features_and_sum"):
             features = self._features(staples, U)
             weights = self._feature_weights(features, lin, quad)
             return staples, self._staple_sum(staples, weights, delta_v)
+
+    def _generator(self, staples, U, lin, quad, delta_v):
+        """C, exp(iQ) and the exponential terms of links U with fixed staples."""
+        with record_function("residual.features_and_sum"):
+            features = self._features(staples, U)
+            C = self._staple_sum(staples, self._feature_weights(features, lin, quad), delta_v)
+        eye = sun.SUN_identity(U.shape[:-1], dtype=U.dtype, device=U.device)
+        Q = generate_Q(generate_omega(C, U), self.N)
+        Q2 = sun.SUN_mul(Q, Q)
+        oidid = otimes(eye, eye)
+        oidQ = otimes(eye, Q) + otimes(Q, eye)
+        f0, f1, f2, B1, B2, _ = generate_coefficients(Q, Q2, eye, oidid, oidQ, self.device, backward=False)
+        expQ = generate_expQ(Q, Q2, eye, f0, f1, f2)
+        return C, expQ, (Q, Q2, B1, B2, f1, f2, eye, oidid, oidQ)
+
+    def _update_mask(self, cfgs, mu, lin, quad, delta_v, step, current_mask, inverse=False, tol=1e-12, max_iter=100):
+        """Update (or undo) the links of current_mask in direction mu; returns (cfgs, logdet per chain).
+
+        Staples hold only links the mask leaves fixed: they are built once, and the per-link
+        algebra (features, exponential, local Jacobian, fixed-point inverse) runs on the moving
+        links alone. The inverse returns the logdet of the inverse map.
+        """
+        sites = torch.nonzero(current_mask[0, mu, ..., 0, 0].flatten()).squeeze(1)
+        logdet = cfgs.real.new_zeros(cfgs.shape[0])
+        if sites.numel() == 0:
+            return cfgs, logdet, 0, 0.0
+        lin, quad = self._site_coefficients(lin, quad, mu)
+        if lin.dim() > 2:  # per-staple coefficients carry the site axes
+            lin = lin.flatten(2).index_select(2, sites)
+            quad = quad.flatten(3).index_select(3, sites)
+        staples = self._mask_staples(cfgs, mu, step, current_mask).flatten(2, self.D + 1).index_select(2, sites)
+        links = cfgs[:, mu].flatten(1, self.D)
+        U = links.index_select(1, sites)
+        iterations, residual = 0, 0.0
+        if inverse:
+            U, iterations, residual = sun.invert_left_update(
+                lambda value: self._generator(staples, value, lin, quad, delta_v)[1], U,
+                tol=tol, max_iter=max_iter, check_every=4,
+            )
+        C, expQ, terms = self._generator(staples, U, lin, quad, delta_v)
+        U_out = sun.SUN_mul(expQ, U)
+        jac = self._local_tangent_jacobian(staples, U, C, generate_dexpQ_dQ(*terms), expQ, U_out, quad, delta_v)
+        logdet = torch.log(torch.clamp(torch.linalg.det(jac).abs(), min=1e-12)).sum(1)
+        cfgs = cfgs.clone()
+        cfgs[:, mu] = links.index_copy(1, sites, U if inverse else U_out).view_as(cfgs[:, mu])
+        return cfgs, (-logdet if inverse else logdet), iterations, residual
 
     def _staples_and_generator(self, cfgs, mu, lin, quad, delta_v, step, current_mask):
         U = cfgs[:, mu]
@@ -1074,41 +1123,23 @@ class ResidualNormalizingFlows(torch.nn.Module):
             )
         real_dtype = cfgs.real.dtype
         mask = self._runtime_mask(mask, cfgs, periodic=not dmasking)
-        ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
         if cfgs.shape[0] == 0:
             # Inactive DDP ranks must accumulate zero gradients for every parameter.
             for parameter in self.parameters():
                 dlogJ = dlogJ + parameter.sum() * 0.0
             return cfgs, 0, dlogJ
-        dims = tuple(np.arange(1, self.D + 2))
 
         for sm in range(self.steps):
+            lin, quad, delta_v = self._step_coefficients(cfgs, beta, delta_beta, sm)
+            if bool(torch.all(delta_v == 0.0).item()):
+                continue
             for mu in range(self.D):
                 for eo in range(self.mask_mod):
-                    if dmasking:
-                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask)
-                    else:
-                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :])
-
-                    U_new, jac, _ = self.residual_update_mu(
-                        cfgs,
-                        mu,
-                        beta=beta,
-                        delta_beta=delta_beta,
-                        step=sm,
-                        current_mask=current_mask,
-                    )
-                    cfgs_new = cfgs.clone()
-                    cfgs_new[:, mu] = U_new
-                    cfgs = current_mask * cfgs_new + (1 - current_mask) * cfgs
-
-                    active = current_mask.squeeze(-1).squeeze(-1)
-                    masked_jac = active * jac.unsqueeze(1) + (1 - active) * ones
-                    dlogJ = dlogJ + torch.sum(
-                        torch.log(torch.clamp(masked_jac, min=1e-12)),
-                        dims,
-                    )
+                    current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask if dmasking
+                                                     else mask[eo + mu * self.mask_mod, :])
+                    cfgs, logdet, _, _ = self._update_mask(cfgs, mu, lin, quad, delta_v, sm, current_mask)
+                    dlogJ = dlogJ + logdet
         return cfgs, 0, dlogJ
 
     def inverse(self, cfgs, mask, dmasking=False, dmask=None, beta=None, delta_beta=None, tol=1e-12, max_iter=100):
@@ -1126,9 +1157,7 @@ class ResidualNormalizingFlows(torch.nn.Module):
             )
         real_dtype = cfgs.real.dtype
         mask = self._runtime_mask(mask, cfgs, periodic=not dmasking)
-        ones = torch.ones(mask[0].shape, dtype=real_dtype, device=cfgs.device).squeeze(-1).squeeze(-1)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=real_dtype, device=cfgs.device)
-        dims = tuple(np.arange(1, self.D + 2))
         stats = {"iterations": [], "residual": 0.0}
 
         for sm in reversed(range(self.steps)):
@@ -1137,36 +1166,17 @@ class ResidualNormalizingFlows(torch.nn.Module):
                 continue
             for mu in reversed(range(self.D)):
                 for eo in reversed(range(self.mask_mod)):
-                    if dmasking:
-                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask)
-                    else:
-                        current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :])
-                    active_mu = current_mask[:, mu]
-                    frozen = cfgs
-
-                    def left_factor(U_mu, mu=mu, current_mask=current_mask, active_mu=active_mu, frozen=frozen):
-                        trial = frozen.clone()
-                        trial[:, mu] = U_mu
-                        _, _, expQ, _ = self._staples_and_generator(trial, mu, lin, quad, delta_v, sm, current_mask)
-                        eye = torch.eye(self.N, dtype=expQ.dtype, device=expQ.device)
-                        return active_mu * expQ + (1 - active_mu) * eye
-
-                    U_mu, iterations, residual = sun.invert_left_update(
-                        left_factor, cfgs[:, mu], tol=tol, max_iter=max_iter
+                    current_mask = self._active_mask(mask[eo + mu * self.mask_mod, :] * dmask if dmasking
+                                                     else mask[eo + mu * self.mask_mod, :])
+                    cfgs, logdet, iterations, residual = self._update_mask(
+                        cfgs, mu, lin, quad, delta_v, sm, current_mask, inverse=True, tol=tol, max_iter=max_iter
                     )
                     if not residual <= tol:
                         raise RuntimeError(
                             f"residual-flow inverse did not converge for mask {eo + mu * self.mask_mod}: "
                             f"residual {float(residual):.3e} after {iterations} iterations"
                         )
-                    cfgs = cfgs.clone()
-                    cfgs[:, mu] = U_mu
-                    _, jac, _ = self.residual_update_mu(
-                        cfgs, mu, beta=beta, delta_beta=delta_beta, step=sm, current_mask=current_mask
-                    )
-                    active = current_mask.squeeze(-1).squeeze(-1)
-                    masked_jac = active * jac.unsqueeze(1) + (1 - active) * ones
-                    dlogJ = dlogJ - torch.sum(torch.log(torch.clamp(masked_jac, min=1e-12)), dims)
+                    dlogJ = dlogJ + logdet
                     stats["iterations"].append(iterations)
                     stats["residual"] = max(stats["residual"], float(residual))
         self.last_inverse_stats = stats

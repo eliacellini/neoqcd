@@ -1,7 +1,8 @@
-"""Time and profile the finite defect smearing layer of NEO-REX on one GPU.
+"""Time and profile the finite defect flow layer of NEO-REX on one GPU.
 
-Loads a PG-trained defect-hyper-smearing field, copies its network into the finite layer
-and times, per batch size: the layer forward, its inverse and one HBOR sweep of the whole
+Loads a PG-trained defect-hyper-smearing or defect-hyper-residual field, copies its network
+into the finite layer and times, per batch size: the layer forward, its inverse and one HBOR
+sweep of the whole
 lattice (the MCMC update the layer is paired with in a protocol step). Thermalization is not
 needed for timing, so the links are Haar random.
 """
@@ -14,7 +15,27 @@ import torch
 import neoqcd.sun_utils as sun
 from neoqcd.cnf_io import load_cnf_checkpoint
 from neoqcd.mcmc import HBOR
-from neoqcd.smearing import DefectCouplingLayer
+from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
+
+
+class _PatchResidual(torch.nn.Module):
+    """The finite residual layer on the defect patch, with the call convention of DefectCouplingLayer."""
+
+    def __init__(self, residual, pars):
+        super().__init__()
+        self.residual, self.pars = residual, pars
+
+    def _run(self, method, cfgs, beta, delta_beta):
+        pars, buffer = self.pars, self.pars.patch_buffer
+        small, _, logdet = method(pars.defect.cut_defect(cfgs, buffer=buffer), pars.small_mask[-1], dmasking=True,
+                                  dmask=pars.smeared_defect_mask[-1], beta=beta, delta_beta=delta_beta)
+        return pars.defect.embedding(small, cfgs, buffer=buffer), 0, logdet
+
+    def forward(self, cfgs, pars, rho, beta=None, delta_beta=None):
+        return self._run(self.residual, cfgs, beta, delta_beta)
+
+    def inverse(self, cfgs, pars, rho, beta=None, delta_beta=None):
+        return self._run(self.residual.inverse, cfgs, beta, delta_beta)
 
 
 def clock():
@@ -43,8 +64,13 @@ def main():
 
     device = torch.device(args.device)
     field, pars, defect_mask, payload = load_cnf_checkpoint(args.checkpoint, device)
-    layer = DefectCouplingLayer(pars, torch.zeros(pars.rho_shape, dtype=torch.double, device=device), time=1.0)
-    layer.smearing.hyper_smearing.load_state_dict(field.smearing.hyper_smearing.state_dict())
+    if hasattr(field, "residual"):
+        residual = ResidualNormalizingFlows(pars)
+        residual.load_state_dict(field.residual.state_dict())
+        layer = _PatchResidual(residual, pars)
+    else:
+        layer = DefectCouplingLayer(pars, torch.zeros(pars.rho_shape, dtype=torch.double, device=device), time=1.0)
+        layer.smearing.hyper_smearing.load_state_dict(field.smearing.hyper_smearing.state_dict())
     layer = layer.to(device)
     D, T, L = int(pars.D), int(pars.T), int(pars.L)
     for batch in args.batch:
