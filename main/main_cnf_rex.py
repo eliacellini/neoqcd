@@ -7,13 +7,18 @@ reports numerical integration diagnostics; its Haar logdet is approximate.
 import argparse
 import json
 import math
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 from neoqcd.cnf import CNFProtocolLayer, integrate_flow
 from neoqcd.cnf_io import DEFECT_PATCH_ARCHITECTURES, build_cnf, defect_patch_buffer, load_cnf_checkpoint, save_cnf_checkpoint
-from neoqcd.cnf_training import CNFREXTrainer
+from neoqcd.cnf_training import CNFREXTrainer, DistributedCNFREXTrainer
 from neoqcd.distributedPT import NEOREXProtocolWrapper
 from neoqcd.mcmc import HBOR
 
@@ -143,54 +148,123 @@ def evaluate(field, trainer, args):
     }
 
 
+def _distributed(args):
+    """(rank, world_size, device) under torchrun, with one replica per rank; None otherwise."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return None
+    if args.phase != "train":
+        raise SystemExit("distributed runs train only; evaluate with a single process")
+    if args.device == "cuda":
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    dist.init_process_group("nccl" if args.device == "cuda" else "gloo")
+    return dist.get_rank(), dist.get_world_size(), device
+
+
+def _run_info(argv, world_size):
+    """Code version and launch of this run, rewritten at every (re)start."""
+    def git(*command):
+        try:
+            return subprocess.run(["git", *command], cwd=Path(__file__).resolve().parents[1],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+    return {
+        "commit": git("rev-parse", "HEAD"),
+        "uncommitted_changes": git("status", "--porcelain", "--untracked-files=no"),
+        "argv": list(sys.argv[1:] if argv is None else argv),
+        "world_size": world_size,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _shard_path(checkpoint, rank):
+    return checkpoint.with_name(f"{checkpoint.stem}.rank{rank}{checkpoint.suffix}")
+
+
 def main(argv=None):
     args = parse_args(argv)
+    distributed = _distributed(args)
+    rank, world_size, device = distributed if distributed else (0, 1, args.device)
     torch.manual_seed(args.seed)
     if args.checkpoint:
-        field, pars, mask, payload = load_cnf_checkpoint(args.checkpoint, args.device)
+        field, pars, mask, payload = load_cnf_checkpoint(args.checkpoint, device)
         config = payload["config"]
     else:
         config = {key: value for key, value in vars(args).items() if not isinstance(value, Path)}
         config["time_normalization"] = "unit_interval"
-        field, pars, mask = build_cnf(config, args.device)
+        field, pars, mask = build_cnf(config, device)
         payload = None
-    ladder = torch.linspace(config["parameter_min"], config["parameter_max"], config["replicas"], dtype=torch.float64, device=args.device)
+    if distributed and config["replicas"] != world_size:
+        raise SystemExit(f"one replica per rank: --replicas {config['replicas']} on {world_size} ranks")
+    # Independent Markov chains on every rank; the field itself is broadcast from rank 0.
+    torch.manual_seed(args.seed + rank)
+    ladder = torch.linspace(config["parameter_min"], config["parameter_max"], config["replicas"], dtype=torch.float64, device=device)
     optimizer = torch.optim.Adam(field.parameters(), lr=config["lr"])
-    trainer = CNFREXTrainer(field, pars, ladder, optimizer, domain=config["domain"], beta=config["beta"],
-                           defect_mask=mask, batch_size=config["batch_size"], updates_per_replica=config["mcmc_steps"],
-                           grad_clip_norm=config["grad_clip_norm"], chunk_size=args.pg_chunk_size or None)
+    options = dict(domain=config["domain"], beta=config["beta"], defect_mask=mask, batch_size=config["batch_size"],
+                   updates_per_replica=config["mcmc_steps"], grad_clip_norm=config["grad_clip_norm"],
+                   chunk_size=args.pg_chunk_size or None)
+    if distributed:
+        trainer = DistributedCNFREXTrainer(field, pars, ladder, optimizer, rank=rank, world_size=world_size, **options)
+    else:
+        trainer = CNFREXTrainer(field, pars, ladder, optimizer, **options)
     start = 0
     if payload and "trainer" in payload:
-        trainer.load_state_dict(payload["trainer"])
-        torch.set_rng_state(payload["rng"])
-        if args.device == "cuda" and "cuda_rng" in payload:
-            torch.cuda.set_rng_state_all(payload["cuda_rng"])
+        if distributed:
+            trainer.load_state_dict(payload["trainer"], torch.load(_shard_path(args.checkpoint, rank), weights_only=False))
+        else:
+            trainer.load_state_dict(payload["trainer"])
+            torch.set_rng_state(payload["rng"])
+            if args.device == "cuda" and "cuda_rng" in payload:
+                torch.cuda.set_rng_state_all(payload["cuda_rng"])
         start = payload["epoch"]
     else:
         trainer.warmup(config["warmup"])
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.phase == "evaluate":
         result = evaluate(field, trainer, args)
         (args.output_dir / "evaluation.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
         return
     metrics_path = args.output_dir / "metrics.jsonl"
-    if metrics_path.exists() and metrics_path.stat().st_size:
+    if rank == 0 and metrics_path.exists() and metrics_path.stat().st_size:
         if not args.checkpoint or args.checkpoint.resolve().parent != args.output_dir.resolve():
             raise FileExistsError(f"Refusing to append to another training run: {args.output_dir}")
         last = json.loads(metrics_path.read_text().splitlines()[-1])
         if last["epoch"] != start:
             raise ValueError("Metrics and checkpoint progress differ; resume into a new output directory")
-    (args.output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    with metrics_path.open("a") as output:
+    if rank == 0:
+        (args.output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        (args.output_dir / "run_info.json").write_text(json.dumps(_run_info(argv, world_size), indent=2) + "\n")
+    output = metrics_path.open("a") if rank == 0 else None
+    try:
         for epoch in range(start, args.epochs):
-            metrics = {"epoch": epoch + 1, **trainer.step()}
-            line = json.dumps(metrics)
-            output.write(line + "\n")
-            output.flush()
-            print(line, flush=True)
+            start_time = time.perf_counter()
+            metrics = {"epoch": epoch + 1, **trainer.step(), "epoch_s": round(time.perf_counter() - start_time, 3)}
+            if rank == 0:
+                line = json.dumps(metrics)
+                output.write(line + "\n")
+                output.flush()
+                print(line, flush=True)
             if (epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs:
-                save_cnf_checkpoint(args.output_dir / "cnf_checkpoint.pt", field, config, epoch=epoch + 1, trainer=trainer)
+                checkpoint = args.output_dir / "cnf_checkpoint.pt"
+                if distributed:
+                    # Shards first, then the main checkpoint that refers to them.
+                    torch.save(trainer.shard_state_dict(), _shard_path(checkpoint, rank))
+                    dist.barrier()
+                if rank == 0:
+                    save_cnf_checkpoint(checkpoint, field, config, epoch=epoch + 1, trainer=trainer)
+    finally:
+        if output is not None:
+            output.close()
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -93,7 +93,18 @@ Replace `--architecture` to train another field. For a defect ladder add
 the defect's size and location. REX uses HBOR and adjacent exchanges with full
 cross-actions. The derivative of the defect action is retained at BC=1.
 
-The output contains `metrics.jsonl`, `config.json` and `cnf_checkpoint.pt`.
+Launched with `torchrun`, training is distributed with one replica per rank,
+as the distributed PT: `--replicas` must equal the number of ranks. Each rank
+keeps `--batch-size` chains whose ladder labels move between ranks through
+exact full-action swaps; a rank sweeps its chains with the HBOR of their labels
+and evaluates the PG loss there, and parameter gradients are summed over ranks.
+Rank 0 writes the metrics (with the slowest rank's sweep and loss time and the
+largest peak GPU memory) and the checkpoint; every rank saves its chains to
+`cnf_checkpoint.rank<r>.pt`. `job/debug_pg_distributed.sh` runs it on 2 nodes of
+Leonardo. Evaluation is single-process.
+
+The output contains `metrics.jsonl`, `config.json`, `run_info.json` (commit,
+uncommitted changes and command line of each launch) and `cnf_checkpoint.pt`.
 The checkpoint stores model, optimizer, ladder chains, swap parity and RNG.
 `--epochs` is the total requested count on resume. Saved model/sampler settings
 are authoritative; other training CLI settings do not override a checkpoint.
