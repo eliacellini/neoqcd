@@ -16,7 +16,7 @@
 # training (chains from the job/thermalize_defect.sh cache). Every swap runs K protocol
 # steps, each with one MCMC update (1 HB + 4 OR) and, for NEO-REX, the flow layer.
 # Smearing and residual fields are copied into their finite layer; CloverChair is a CNF.
-# Usage: METHODS="orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh
+# Usage: METHODS="orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
 
 set -euo pipefail
 
@@ -61,7 +61,7 @@ for entry in ${METHODS:?set METHODS}; do
     ALG+=(--neorex-load-flow "$OUT/${name}_neorex.pt" --neorex-eval-flow)
   fi
   MASTER_PORT=$((29500 + (SLURM_JOB_ID + ${#name}) % 1000))
-  ARGS=("${COMMON[@]}" "${ALG[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${K}")
+  ARGS=("${COMMON[@]}" "${ALG[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${K}" "$@")
   # SLURM_NODEID must expand on each node, not on the batch host.
   srun bash -c "python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
     --nproc_per_node=4 --rdzv_id=${SLURM_JOB_ID}_${name} --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
