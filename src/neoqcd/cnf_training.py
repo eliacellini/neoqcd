@@ -95,6 +95,7 @@ class CNFREXTrainer:
         grad_clip_norm=0.0,
         initial_cfgs=None,
         chunk_size=None,
+        directions_per_term=1,
     ):
         self.field = field
         self.flow_pars = flow_pars
@@ -107,6 +108,7 @@ class CNFREXTrainer:
         self.grad_clip_norm = float(grad_clip_norm)
         # Chains per path-gradient chunk (None: all chains of a rung at once); memory only.
         self.chunk_size = None if chunk_size is None else int(chunk_size)
+        self.directions_per_term = int(directions_per_term)
         device = torch.device(flow_pars.device)
         self.parameters = torch.as_tensor(parameters, dtype=torch.float64, device=device).reshape(-1)
         if self.domain not in {"beta", "defect"}:
@@ -207,6 +209,7 @@ class CNFREXTrainer:
                 parameter,
                 volume=self.volume,
                 chunk_size=self.chunk_size,
+                directions_per_term=self.directions_per_term,
             )
             loss = result["loss"]
             xi = result["xi"]
@@ -300,6 +303,7 @@ class DistributedCNFREXTrainer:
         updates_per_replica=1,
         grad_clip_norm=0.0,
         chunk_size=None,
+        directions_per_term=1,
         swap_parity="alternating",
     ):
         self.field = field
@@ -313,6 +317,7 @@ class DistributedCNFREXTrainer:
         self.updates_per_replica = int(updates_per_replica)
         self.grad_clip_norm = float(grad_clip_norm)
         self.chunk_size = None if chunk_size is None else int(chunk_size)
+        self.directions_per_term = int(directions_per_term)
         self.device = torch.device(flow_pars.device)
         self.parameters = torch.as_tensor(parameters, dtype=torch.float64, device=self.device).reshape(-1)
         if self.domain not in {"beta", "defect"}:
@@ -392,7 +397,8 @@ class DistributedCNFREXTrainer:
     def _backward(self):
         """PG loss of the local chains at their labels, gradients summed over ranks."""
         t = self.pt.local_parameters.to(dtype=self.x.real.dtype)
-        result = path_gradient_loss(self.field, self.action, self.x, t, volume=self.volume, chunk_size=self.chunk_size)
+        result = path_gradient_loss(self.field, self.action, self.x, t, volume=self.volume, chunk_size=self.chunk_size,
+                                    directions_per_term=self.directions_per_term)
         (result["loss"].mean() / self.world_size).backward()
         for parameter in self.field.parameters():
             if parameter.requires_grad:

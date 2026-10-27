@@ -14,6 +14,7 @@ from neoqcd.smearing import (
     generate_omega,
 )
 from neoqcd.nn import HyperTimeScalar, time_embedding
+from neoqcd.cnf import diagonal_derivative, direction_groups
 
 
 def _matrix_to_coordinates(matrix, generators):
@@ -196,20 +197,22 @@ class ExistingDrift(nn.Module):
         ) * active.unsqueeze(-1)
         return q_fn, active
 
-    def _divergence_term(self, cfgs, t, mu, color, a):
+    def _divergence_term(self, cfgs, t, mu, color, directions):
         # A class never enters its own generator, so perturbing it at once leaves the diagonal.
         q_fn, active = self._class_generator(cfgs, t, mu, color)
-        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
-        tangent = torch.zeros_like(cfgs)
-        tangent[:, mu] = 1j * torch.einsum("ij,b...jk->b...ik", generator, cfgs[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
-        _, dcoeff = torch.func.jvp(q_fn, (cfgs,), (tangent,))
-        return dcoeff[..., a].flatten(1).sum(1)
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+        tangents = []
+        for a in directions:
+            tangent = torch.zeros_like(cfgs)
+            tangent[:, mu] = 1j * torch.einsum("ij,b...jk->b...ik", generators[a], cfgs[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
+            tangents.append(tangent)
+        return diagonal_derivative(q_fn, cfgs, tangents, directions).flatten(1).sum(1)
 
-    def divergence_terms(self, t):
-        """Callables cfgs -> (B,) summing to the divergence: one per (link class, direction)."""
+    def divergence_terms(self, t, directions_per_term=1):
+        """Callables cfgs -> (B,) summing to the divergence: one per link class and direction group."""
         return [
-            functools.partial(self._divergence_term, t=t, mu=mu, color=color, a=a)
-            for mu in range(self.D) for color in range(self.mask_mod) for a in range(8)
+            functools.partial(self._divergence_term, t=t, mu=mu, color=color, directions=group)
+            for mu in range(self.D) for color in range(self.mask_mod) for group in direction_groups(directions_per_term)
         ]
 
     def _field(self, cfgs, t, *, divergence):
@@ -300,20 +303,21 @@ class DefectHyperSmearingDrift(nn.Module):
 
         return sun.flat_links(small, self.D), index, q_fn, cfg_shape
 
-    def _divergence_term(self, cfgs, t, m, a):
+    def _divergence_term(self, cfgs, t, m, directions):
         # Staples of a parity class never contain its own links, so perturbing the
         # whole class at once leaves only the diagonal derivatives.
         flat, index, q_fn, _ = self._class_generator(cfgs, t, m)
         if index.numel() == 0:
             return cfgs.real.new_zeros(cfgs.shape[0])
-        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
-        tangent = torch.zeros_like(flat).index_copy(1, index, 1j * (generator @ flat.index_select(1, index)))
-        _, dq = torch.func.jvp(q_fn, (flat,), (tangent,))
-        return dq[..., a].sum(1)
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+        links = flat.index_select(1, index)
+        tangents = [torch.zeros_like(flat).index_copy(1, index, 1j * (generators[a] @ links)) for a in directions]
+        return diagonal_derivative(q_fn, flat, tangents, directions).sum(1)
 
-    def divergence_terms(self, t):
-        """Callables cfgs -> (B,) summing to the divergence: one per (parity class, direction)."""
-        return [functools.partial(self._divergence_term, t=t, m=m, a=a) for m in range(2 * self.D) for a in range(8)]
+    def divergence_terms(self, t, directions_per_term=1):
+        """Callables cfgs -> (B,) summing to the divergence: one per parity class and direction group."""
+        return [functools.partial(self._divergence_term, t=t, m=m, directions=group)
+                for m in range(2 * self.D) for group in direction_groups(directions_per_term)]
 
     def _field(self, cfgs, t, *, divergence):
         self._validate(cfgs)
@@ -400,23 +404,26 @@ class DefectResidualDrift(nn.Module):
 
         return small, active, q_fn
 
-    def _divergence_term(self, cfgs, t, mu, color, a):
+    def _divergence_term(self, cfgs, t, mu, color, directions):
         # The generator of an updated link never depends on another link of its class,
         # so perturbing the whole class at once leaves only the diagonal derivatives.
         small, active, q_fn = self._class_generator(cfgs, t, mu, color)
         if not bool(active.any()):
             return cfgs.real.new_zeros(cfgs.shape[0])
-        generator = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)[a]
-        tangent = torch.zeros_like(small)
-        tangent[:, mu] = 1j * (generator @ small[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
-        _, dq = torch.func.jvp(q_fn, (small,), (tangent,))
-        return dq[..., a].flatten(1).sum(1)
+        generators = self.generators.to(device=cfgs.device, dtype=cfgs.dtype)
+        tangents = []
+        for a in directions:
+            tangent = torch.zeros_like(small)
+            tangent[:, mu] = 1j * (generators[a] @ small[:, mu]) * active.unsqueeze(-1).unsqueeze(-1)
+            tangents.append(tangent)
+        return diagonal_derivative(q_fn, small, tangents, directions).flatten(1).sum(1)
 
-    def divergence_terms(self, t):
-        """Callables cfgs -> (B,) summing to the divergence: one per (link class, direction)."""
+    def divergence_terms(self, t, directions_per_term=1):
+        """Callables cfgs -> (B,) summing to the divergence: one per link class and direction group."""
         return [
-            functools.partial(self._divergence_term, t=t, mu=mu, color=color, a=a)
-            for mu in range(self.D) for color in range(self.residual.mask_mod) for a in range(8)
+            functools.partial(self._divergence_term, t=t, mu=mu, color=color, directions=group)
+            for mu in range(self.D) for color in range(self.residual.mask_mod)
+            for group in direction_groups(directions_per_term)
         ]
 
     def _field(self, cfgs, t, *, divergence):

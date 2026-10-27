@@ -61,9 +61,10 @@ class TermByTermPathGradientTests(unittest.TestCase):
                 loss_ref.sum().backward()
                 grads_ref = [p.grad.clone() for p in field.parameters()]
 
-                for chunk_size in (None, 1):
+                for chunk_size, directions in ((None, 1), (1, 1), (None, 8), (1, 2)):
                     field.zero_grad()
-                    result = path_gradient_loss(field, action, U, t, chunk_size=chunk_size)
+                    result = path_gradient_loss(field, action, U, t, chunk_size=chunk_size,
+                                                directions_per_term=directions)
                     result["loss"].sum().backward()
                     torch.testing.assert_close(result["xi"], xi_ref.detach(), rtol=1e-10, atol=1e-12)
                     torch.testing.assert_close(result["loss"].detach(), loss_ref.detach(), rtol=1e-9, atol=1e-12)
@@ -77,8 +78,11 @@ class TermByTermPathGradientTests(unittest.TestCase):
             with self.subTest(field=name), torch.no_grad():
                 _perturb(field)
                 _, divergence = field(U, t)
-                total = sum(term(U) for term in field.divergence_terms(t))
-                torch.testing.assert_close(total, divergence, rtol=1e-12, atol=1e-12)
+                for directions in (1, 2, 4, 8):
+                    terms = field.divergence_terms(t, directions)
+                    total = sum(term(U) for term in terms)
+                    torch.testing.assert_close(total, divergence, rtol=1e-12, atol=1e-12)
+                self.assertEqual(len(field.divergence_terms(t, 8)) * 8, len(field.divergence_terms(t, 1)))
 
 
 if __name__ == "__main__":

@@ -118,6 +118,27 @@ def _chair_paths(dimension, mu):
     return tuple(tuple(path) for path in paths)
 
 
+def direction_groups(size):
+    """The eight generator directions in groups of `size`; each group is one divergence term."""
+    size = int(size)
+    if size not in (1, 2, 4, 8):
+        raise ValueError(f"directions per divergence term must be 1, 2, 4 or 8, got {size}")
+    return [tuple(range(a, a + size)) for a in range(0, 8, size)]
+
+
+def diagonal_derivative(f, value, tangents, directions):
+    """sum over a in directions of the a-th output coordinate of the derivative of f along tangents[a].
+
+    One direction is a single forward derivative; several are batched with vmap, which launches
+    fewer, larger kernels at the cost of one forward-derivative intermediate per direction.
+    """
+    if len(directions) == 1:
+        _, derivative = torch.func.jvp(f, (value,), (tangents[0],))
+        return derivative[..., directions[0]]
+    _, derivative = torch.func.vmap(lambda tangent: torch.func.jvp(f, (value,), (tangent,)))(torch.stack(tangents))
+    return sum(derivative[i, ..., a] for i, a in enumerate(directions))
+
+
 class _LayerNorm(nn.Module):
     """Elementary LayerNorm supports the higher derivatives in the PG loss."""
 
@@ -353,19 +374,20 @@ class CloverChairLinkDrift(nn.Module):
         divergence = sum(dF[a, ..., a] for a in range(8)).flatten(1).sum(1)
         return F[0], divergence
 
-    def _divergence_term(self, U, t, a):
-        # The derivative along generator a of every link, with the open staples held fixed.
+    def _divergence_term(self, U, t, directions):
+        # The derivative along each generator direction of every link, with the open staples held fixed.
         self._validate_U(U)
         t = self._time(t, U)
         generators, structure = self._basis(U)
         S, C = self._staples(U), self._leaves(U)
         f = lambda value: self._drift_given(value, S, C, t, generators, structure)
-        _, dF = torch.func.jvp(f, (U,), (1j * generators[a] @ U,))
-        return dF[..., a].flatten(1).sum(1)
+        tangents = [1j * generators[a] @ U for a in directions]
+        return diagonal_derivative(f, U, tangents, directions).flatten(1).sum(1)
 
-    def divergence_terms(self, t):
-        """Callables U -> (B,) summing to the divergence: one per generator direction."""
-        return [functools.partial(self._divergence_term, t=t, a=a) for a in range(8)]
+    def divergence_terms(self, t, directions_per_term=1):
+        """Callables U -> (B,) summing to the divergence: one per group of generator directions."""
+        return [functools.partial(self._divergence_term, t=t, directions=group)
+                for group in direction_groups(directions_per_term)]
 
     @property
     def checkpoint_semantics(self):
@@ -442,15 +464,16 @@ class DefectCloverChairDrift(nn.Module):
         small, _, f = self._patch(cfgs, t)
         return self._embed(f(small), cfgs, small)
 
-    def _divergence_term(self, cfgs, t, a):
-        # The derivative along generator a of each transformed link, with its loops held fixed.
+    def _divergence_term(self, cfgs, t, directions):
+        # The derivative along each generator direction of each transformed link, loops held fixed.
         small, generators, f = self._patch(cfgs, t)
-        _, dF = torch.func.jvp(f, (small,), (1j * generators[a] @ small,))
-        return (dF[..., a].flatten(2) * self._valid).flatten(1).sum(1)
+        tangents = [1j * generators[a] @ small for a in directions]
+        return (diagonal_derivative(f, small, tangents, directions).flatten(2) * self._valid).flatten(1).sum(1)
 
-    def divergence_terms(self, t):
-        """Callables cfgs -> (B,) summing to the divergence: one per generator direction."""
-        return [functools.partial(self._divergence_term, t=t, a=a) for a in range(8)]
+    def divergence_terms(self, t, directions_per_term=1):
+        """Callables cfgs -> (B,) summing to the divergence: one per group of generator directions."""
+        return [functools.partial(self._divergence_term, t=t, directions=group)
+                for group in direction_groups(directions_per_term)]
 
     def forward(self, cfgs, t):
         """Return ``(F, div F)`` for the Haar-measure Lie-algebra field."""
@@ -562,7 +585,7 @@ def _frozen_parameters(model):
             parameter.requires_grad_(flag)
 
 
-def _residual_and_gradient(model, action_fn, U, t, V):
+def _residual_and_gradient(model, action_fn, U, t, V, directions_per_term=1):
     """xi and its link gradient at frozen parameters, one divergence term at a time.
 
     The divergence is a sum of terms (one per link class and generator direction); each is
@@ -579,7 +602,7 @@ def _residual_and_gradient(model, action_fn, U, t, V):
         smooth = (dSdt + FgradS) / V
         (gradient,) = torch.autograd.grad(smooth.sum(), U)
         xi = smooth.detach()
-        for term in model.divergence_terms(t):
+        for term in model.divergence_terms(t, directions_per_term):
             value = term(U) / V
             (term_gradient,) = torch.autograd.grad(value.sum(), U, allow_unused=True)
             if term_gradient is not None:
@@ -588,12 +611,14 @@ def _residual_and_gradient(model, action_fn, U, t, V):
     return xi, gradient
 
 
-def path_gradient_loss(model, action_fn, U, t, volume=None, chunk_size=None):
+def path_gradient_loss(model, action_fn, U, t, volume=None, chunk_size=None, directions_per_term=1):
     """Path-gradient training loss and the same-rung PINN residual variance.
 
     loss = F_theta . grad xi, with xi at frozen parameters. Fields that expose
     divergence_terms(t) get grad xi one divergence term (and one chunk of chains) at a time,
-    which bounds memory; the others use a forward derivative of xi along F_theta.
+    which bounds memory; the others use a forward derivative of xi along F_theta. A term
+    covers directions_per_term generator directions of a link class: more directions mean
+    fewer, larger kernels and more memory per term.
     """
     V = _volume(U, volume)
     t = _as_time(t, U)
@@ -602,7 +627,8 @@ def path_gradient_loss(model, action_fn, U, t, volume=None, chunk_size=None):
     if hasattr(model, "divergence_terms"):
         size = U.shape[0] if chunk_size is None else int(chunk_size)
         parts = [
-            _residual_and_gradient(model, action_fn, U[start:start + size], t[start:start + size], V)
+            _residual_and_gradient(model, action_fn, U[start:start + size], t[start:start + size], V,
+                                   directions_per_term)
             for start in range(0, U.shape[0], size)
         ]
         xi = torch.cat([part[0] for part in parts])
@@ -696,6 +722,6 @@ class CNFProtocolLayer(nn.Module):
 
 
 __all__ = [
-    "CloverChairLinkDrift", "CNFProtocolLayer", "DefectCloverChairDrift", "apply_velocity", "coeff_to_matrix",
+    "CloverChairLinkDrift", "CNFProtocolLayer", "DefectCloverChairDrift", "diagonal_derivative", "direction_groups", "apply_velocity", "coeff_to_matrix",
     "integrate_flow", "lie_tangent", "path_gradient_loss", "path_gradient_residual",
 ]

@@ -92,7 +92,7 @@ class CNFREXTrainerTest(unittest.TestCase):
         trainer = CNFREXTrainer(field, pars, [0.2, 0.8], optimizer, batch_size=2)
         zeros = torch.zeros(1, dtype=torch.float64)
 
-        def loss(model, action_fn, configs, parameter, volume=None, chunk_size=None):
+        def loss(model, action_fn, configs, parameter, volume=None, chunk_size=None, directions_per_term=1):
             coeff = model.output_layer.weight[0, 0]
             return {
                 "loss": coeff.expand(configs.shape[0]),

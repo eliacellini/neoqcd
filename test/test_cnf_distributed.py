@@ -90,8 +90,10 @@ class DistributedPathGradientTest(unittest.TestCase):
                     "--replicas", "3", "--batch-size", "2", "--residual-n-pt", "1", "--residual-mask-mod", "4",
                     "--hidden-dim", "4", "--depth", "1", "--warmup", "1", "--save-every", "1",
                     "--output-dir", str(out)]
-            mp.spawn(_main_worker, args=(3, _free_port(), [*base, "--epochs", "1"]), nprocs=3, join=True)
+            mp.spawn(_main_worker, args=(3, _free_port(), [*base, "--epochs", "1", "--profile-epoch", "1",
+                                                           "--pg-direction-batch", "8"]), nprocs=3, join=True)
             self.assertTrue(all((out / f"cnf_checkpoint.rank{r}.pt").exists() for r in range(3)))
+            self.assertIn("operators by self", (out / "profile_epoch1.txt").read_text())
             mp.spawn(_main_worker, args=(3, _free_port(), [*base, "--epochs", "2",
                                                            "--checkpoint", str(out / "cnf_checkpoint.pt")]),
                      nprocs=3, join=True)

@@ -56,6 +56,10 @@ def parse_args(argv=None):
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--pg-chunk-size", type=int, default=0,
                    help="Chains per path-gradient chunk to bound memory (0: all chains of a rung at once)")
+    p.add_argument("--pg-direction-batch", type=int, choices=(1, 2, 4, 8), default=1,
+                   help="Generator directions per divergence term: more is faster and uses more memory")
+    p.add_argument("--profile-epoch", type=int, default=0,
+                   help="Profile this epoch on rank 0 into OUTPUT_DIR/profile_epoch<N>.txt (0: never)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -182,6 +186,26 @@ def _run_info(argv, world_size):
     }
 
 
+def _profiled_step(trainer, path):
+    """One training step under the profiler: operators by device time and by memory."""
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    on_gpu = torch.cuda.is_available() and str(trainer.flow_pars.device).startswith("cuda")
+    if on_gpu:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    with torch.profiler.profile(activities=activities, profile_memory=True, record_shapes=True) as profiler:
+        metrics = trainer.step()
+    averages = profiler.key_averages()
+    device = "cuda" if on_gpu else "cpu"
+    with open(path, "w") as handle:
+        handle.write(f"# operators by self {device} time\n")
+        handle.write(averages.table(sort_by=f"self_{device}_time_total", row_limit=40))
+        handle.write(f"\n# operators by self {device} memory\n")
+        handle.write(averages.table(sort_by=f"self_{device}_memory_usage", row_limit=25))
+        handle.write("\n# by input shapes, self time\n")
+        handle.write(profiler.key_averages(group_by_input_shape=True).table(sort_by=f"self_{device}_time_total", row_limit=25))
+    return metrics
+
+
 def _shard_path(checkpoint, rank):
     return checkpoint.with_name(f"{checkpoint.stem}.rank{rank}{checkpoint.suffix}")
 
@@ -207,7 +231,7 @@ def main(argv=None):
     optimizer = torch.optim.Adam(field.parameters(), lr=config["lr"])
     options = dict(domain=config["domain"], beta=config["beta"], defect_mask=mask, batch_size=config["batch_size"],
                    updates_per_replica=config["mcmc_steps"], grad_clip_norm=config["grad_clip_norm"],
-                   chunk_size=args.pg_chunk_size or None)
+                   chunk_size=args.pg_chunk_size or None, directions_per_term=args.pg_direction_batch)
     if distributed:
         trainer = DistributedCNFREXTrainer(field, pars, ladder, optimizer, rank=rank, world_size=world_size, **options)
     else:
@@ -245,7 +269,11 @@ def main(argv=None):
     try:
         for epoch in range(start, args.epochs):
             start_time = time.perf_counter()
-            metrics = {"epoch": epoch + 1, **trainer.step(), "epoch_s": round(time.perf_counter() - start_time, 3)}
+            if rank == 0 and epoch + 1 == args.profile_epoch:
+                metrics = _profiled_step(trainer, args.output_dir / f"profile_epoch{epoch + 1}.txt")
+            else:
+                metrics = trainer.step()
+            metrics = {"epoch": epoch + 1, **metrics, "epoch_s": round(time.perf_counter() - start_time, 3)}
             if rank == 0:
                 line = json.dumps(metrics)
                 output.write(line + "\n")
