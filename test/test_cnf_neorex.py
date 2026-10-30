@@ -111,6 +111,45 @@ class CNFNEOREXTest(unittest.TestCase):
             run_meta = json.loads((output_dir / "run_meta.json").read_text(encoding="utf-8"))
             self.assertIn(str(saved_path), run_meta["neorex_flow_checkpoint"]["saved_paths"])
 
+    def test_replica_history_failure_is_recorded_not_raised(self):
+        # A broken analysis must leave run_meta.json complete; the error lands in replica_history.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(CONFIG)
+            field, _, _ = build_cnf(config)
+            cnf_checkpoint = root / "cnf.pt"
+            save_cnf_checkpoint(cnf_checkpoint, field, config)
+            output_dir = root / "run"
+            argv = [
+                "--cpu", "--algorithm", "neorex", "--nf-layer-type", "cnf",
+                "--cnf-checkpoint", str(cnf_checkpoint), "--cnf-integration-steps", "1",
+                "--D", "4", "--T", "2", "--L", "2", "--N", "3",
+                "--defect-size", "1", "--time-slice", "1", "--space-slice", "1",
+                "--beta", "6", "--parameter-min", "0", "--parameter-max", "1",
+                "--batch-size", "2", "--neorex-protocol-steps", "1",
+                "--thermal-steps", "0", "--steps", "2", "--orsteps", "0",
+                "--no-cfg-cache", "--output-dir", str(output_dir), "--main-dir", str(root),
+            ]
+            with mock.patch.object(sys, "argv", ["main_pt_obc", *argv]):
+                args = MAIN.parse_args()
+            init_file = root / "gloo_init"
+            init_file.touch()
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if os.uname().sysname == "Darwin" else "lo")
+            dist.init_process_group(
+                backend="gloo", init_method=f"file://{init_file}", rank=0, world_size=1
+            )
+            try:
+                with mock.patch.object(MAIN, "summarize_history", side_effect=RuntimeError("gamma broke")):
+                    MAIN.main(args)
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            meta = json.loads((output_dir / "run_meta.json").read_text(encoding="utf-8"))
+            self.assertIn("swap", meta)
+            self.assertIn("work", meta)
+            self.assertEqual(meta["replica_history"]["error"], "RuntimeError: gamma broke")
+            self.assertTrue((output_dir / "replica_history.npz").exists())
+
     def test_multirank_gloo_swaps_every_link_without_training_the_field(self):
         self._run_multirank(dict(CONFIG), world_size=3)
 

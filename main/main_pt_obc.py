@@ -1685,26 +1685,32 @@ def main(args: argparse.Namespace) -> None:
                 flush=True,
             )
         if history_labels:
-            save_replica_history()
-            history = summarize_history(
-                np.stack(history_labels, axis=0), np.stack(history_plaquette, axis=0), world_size
-            )
-            history["path"] = str(history_path)
+            # The history is a diagnostic: a failure here must not lose the final statistics
+            # of the run, so it is recorded in run_meta.json instead of raised.
+            try:
+                save_replica_history()
+                history = summarize_history(
+                    np.stack(history_labels, axis=0), np.stack(history_plaquette, axis=0), world_size
+                )
+                history["path"] = str(history_path)
+                top = history["plaquette_top"]
+                print(
+                    f"round_trips={history['round_trips']}  "
+                    f"round_trip_steps={history['round_trip_steps']:.2f}+-{history['round_trip_steps_sem']:.2f}  "
+                    f"round_trips_per_walker_step={history['round_trips_per_walker_step']:.3e}  "
+                    f"flux_fraction_json={json.dumps([round(v, 3) for v in history['flux_fraction']])}",
+                    flush=True,
+                )
+                print(
+                    f"plaquette_top={top['value']:.6f}+-{top['error']:.1e}  "
+                    f"plaquette_top_tau_int={top['tau_int']:.2f}+-{top['tau_int_error']:.2f}  "
+                    f"gamma_status={top['status']}  replica_history_path={history_path}",
+                    flush=True,
+                )
+            except Exception as err:  # noqa: BLE001 - diagnostics must not fail the run
+                history = {"path": str(history_path), "error": f"{type(err).__name__}: {err}"}
+                print(f"replica_history_error={history['error']}", flush=True)
             meta["replica_history"] = history
-            top = history["plaquette_top"]
-            print(
-                f"round_trips={history['round_trips']}  "
-                f"round_trip_steps={history['round_trip_steps']:.2f}+-{history['round_trip_steps_sem']:.2f}  "
-                f"round_trips_per_walker_step={history['round_trips_per_walker_step']:.3e}  "
-                f"flux_fraction_json={json.dumps([round(v, 3) for v in history['flux_fraction']])}",
-                flush=True,
-            )
-            print(
-                f"plaquette_top={top['value']:.6f}+-{top['error']:.1e}  "
-                f"plaquette_top_tau_int={top['tau_int']:.2f}+-{top['tau_int_error']:.2f}  "
-                f"gamma_status={top['status']}  replica_history_path={history_path}",
-                flush=True,
-            )
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
         if wandb_run is not None:
