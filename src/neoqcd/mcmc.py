@@ -152,6 +152,7 @@ class HBOR():
         self._masked_links_cache = sun.masked_links_cache_for(flow_pars)
 
         self.beta = beta
+        self._subgroup_order = (0, 1, 2)  # SU(2) subgroups of each SU(3) link update
 
         if self.N==2:
             self.hb_update=self._su2_selected_hb
@@ -182,7 +183,14 @@ class HBOR():
             self.heatbath = self.heatbath_standard
 
 
-    def __call__(self, cfgs, mask, defect, rand=None):
+    def __call__(self, cfgs, mask, defect, rand=None, reverse=False):
+        """One HB sweep followed by `orsteps` OR sweeps over the links selected by `mask`.
+
+        With reverse=True the same elementary updates run in the opposite order (OR sweeps, then
+        HB, each over the checkerboard blocks backwards). Every elementary update is self-adjoint,
+        so this is the adjoint kernel of the plain sweep: choosing either with probability 1/2
+        gives a self-adjoint update, as the detailed balance of the O-REX swap requires.
+        """
 
         if rand is None:
             rn_shape = list(cfgs.shape[:-2])
@@ -196,22 +204,35 @@ class HBOR():
 
         links = mask if isinstance(mask, sun.MaskedLinks) else self._links_for_mask(mask)
         flat = sun.flat_links(cfgs, self.D)
-
-        # Heat bath: gather only selected links and the links needed by their staples.
-        for mu in range(self.D):
-            for eo in range(2):
-                m = eo + mu * 2
-                rand_m = rand[:, :, mu].flatten(2).index_select(2, links.sites[m])
-                flat = flat.index_copy(1, links.links[m], self.hb_update(flat, links, m, rand_m, defect, cfgs))
-
-        #overrelaxation
-        for o in range(self.orsteps):
-            for mu in range(self.D):
-                for eo in range(2):
-                    m = eo + mu * 2
-                    flat = flat.index_copy(1, links.links[m], self.over_update(flat, links, m, defect, cfgs))
+        blocks = list(range(2 * self.D))
+        if reverse:
+            # Blocks and, inside each SU(3) link update, the SU(2) subgroups run backwards.
+            blocks.reverse()
+            self._subgroup_order = (2, 1, 0)
+            try:
+                flat = self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
+                flat = self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
+            finally:
+                self._subgroup_order = (0, 1, 2)
+        else:
+            flat = self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
+            flat = self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
         cfgs = flat.reshape(cfgs.shape)
         return sun.SU3_unitarize(cfgs) if self.N == 3 else cfgs
+
+    def _heatbath_sweep(self, flat, links, blocks, rand, defect, cfgs):
+        # Gather only the selected links and the links needed by their staples.
+        for m in blocks:
+            mu = m // 2
+            rand_m = rand[:, :, mu].flatten(2).index_select(2, links.sites[m])
+            flat = flat.index_copy(1, links.links[m], self.hb_update(flat, links, m, rand_m, defect, cfgs))
+        return flat
+
+    def _overrelaxation_sweeps(self, flat, links, blocks, defect, cfgs):
+        for _ in range(self.orsteps):
+            for m in blocks:
+                flat = flat.index_copy(1, links.links[m], self.over_update(flat, links, m, defect, cfgs))
+        return flat
 
     def _links_for_mask(self, mask):
         return self._masked_links_cache.get(mask, self.D)
@@ -332,7 +353,7 @@ class HBOR():
         staple = self._gathered_staples(cfgs, flat, links, m, defect)
         new = flat.index_select(1, links.links[m])
         colors = torch.arange(3, device=cfgs.device)
-        for phb in range(3):
+        for phb in self._subgroup_order:
             Rk = SU3_compute_RK(new, staple, colors, phb)
             subgroup, acc = self.heatbath(Rk, rand[:, 6 * phb:6 * (phb + 1)], self.N / 2.0)
             proposal = SU2_left_multiply_SU3(new, subgroup, phb)
@@ -343,7 +364,7 @@ class HBOR():
         staple = self._gathered_staples(cfgs, flat, links, m, defect)
         new = flat.index_select(1, links.links[m])
         colors = torch.arange(3, device=cfgs.device)
-        for phb in range(3):
+        for phb in self._subgroup_order:
             Rk = SU3_compute_RK(new, staple, colors, phb)
             k = torch.sqrt(sun.SUN_determinant(Rk).abs())
             good = k > 0
@@ -538,6 +559,11 @@ class DefectMCMCAdapter:
     - set_parameter(parameter, parameter_name=...)
     - action(x, parameter, parameter_name=...)
     - __call__(x, nsteps=..., ...)
+
+    `patch_mask` (Defect.protocol_patch_mask) restricts the HB+OR updates to a box around the
+    defect; `symmetric_updates` applies the sweep or its reverse with probability 1/2 (one coin
+    per sweep, shared by the batch), so that each update kernel is self-adjoint. Both follow the
+    protocol updates of the O-REX paper; the equilibrium sweeps between swaps are not affected.
     """
 
     def __init__(
@@ -548,12 +574,22 @@ class DefectMCMCAdapter:
         batch_size: int,
         parameter_name: str = "bc",
         default_parameter: float = 1.0,
+        patch_mask: Optional[torch.Tensor] = None,
+        symmetric_updates: bool = False,
     ):
         self.flow_pars = flow_pars
         self.beta = float(beta)
         self.defect_mask = defect_mask
         self.batch_size = int(batch_size)
         self.parameter_name = str(parameter_name)
+        self.symmetric_updates = bool(symmetric_updates)
+        self.patch_mask = patch_mask
+        # One tensor, kept for the whole run, so the masked-link index cache hits on its identity.
+        self._update_mask = (
+            self.flow_pars.mask
+            if patch_mask is None
+            else (self.flow_pars.mask * patch_mask.to(device=self.flow_pars.mask.device)).contiguous()
+        )
         self._current_parameter: Optional[torch.Tensor] = torch.full(
             (self.batch_size,),
             float(default_parameter),
@@ -759,9 +795,10 @@ class DefectMCMCAdapter:
             expected_batch_size=int(x.shape[0]),
         )
         out = x
-        mask = self.flow_pars.mask.to(device=x.device)
+        mask = self._update_mask.to(device=x.device)
         defect_mask = self.defect_mask.to(device=x.device)
         for _ in range(int(nsteps)):
             self._batch_hbor.set_defect_parameter(p)
-            out = self._batch_hbor(out, mask, defect_mask)
+            reverse = self.symmetric_updates and bool(torch.rand((), device=x.device) < 0.5)
+            out = self._batch_hbor(out, mask, defect_mask, reverse=reverse)
         return out

@@ -310,6 +310,30 @@ class Defect():
             directions.append(inside)
         return torch.stack(directions)[None, ..., None, None]
 
+    def protocol_patch_mask(self, half_size, device=None):
+        """Links updated along O-REX/NEO-REX protocols: a box around the defect, as in arXiv O-REX.
+
+        With half_size = 0 the box is the smallest one holding every link of the plaquettes whose
+        weight depends on the defect coupling: time slices time_slice and time_slice + 1, spatial
+        coordinates space_slice - 1 ... space_slice + dsize (all links at those sites are updated,
+        not only the plaquette members). Every unit of half_size extends it by one site in each
+        direction; indices wrap around the periodic lattice. Returns an int mask of shape
+        (1, D, T, L, ..., 1, 1) that multiplies the checkerboard link mask of create_mask.
+        """
+        half = int(half_size)
+        if half < 0:
+            raise ValueError(f"half_size must be >= 0, got {half}")
+        time_sel = ((torch.arange(self.T, device=device) - (self.time_slice - half)) % self.T) < 2 * half + 2
+        space_sel = ((torch.arange(self.L, device=device) - (self.space_slice - 1 - half)) % self.L) < self.dsize + 2 * half + 2
+        sites = time_sel.reshape((self.T,) + (1,) * (self.D - 1))
+        for d in range(1, self.D):
+            shape = [1] * self.D
+            shape[d] = self.L
+            sites = sites & space_sel.reshape(shape)
+        return sites.to(torch.int64).unsqueeze(0).expand((self.D,) + sites.shape).reshape(
+            (1, self.D) + sites.shape + (1, 1)
+        ).contiguous()
+
     def embedding(self, small_cfgs, cfgs, buffer=2):
         t = self.time_slice
         s = self.space_slice

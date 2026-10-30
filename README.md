@@ -58,6 +58,17 @@ Gamma-method `tau_int` of the plaquette on the bottom and top rungs. `neoqcd.rep
 holds the analysis; `main/summarize_neorex_validation.py` prints the round trips per wall-clock
 hour and the seconds per independent plaquette sample (`s/step x tau_int`) as cost measures.
 
+## Local updates along the O-REX/NEO-REX protocols
+
+Between swaps every replica is updated with one HB and `--orsteps` OR sweeps over the whole
+lattice. Along the protocols `main/main_pt_obc.py` can instead follow the O-REX paper:
+`--protocol-patch-halfsize h` restricts the HB+OR sweeps to a box around the defect
+(`Defect.protocol_patch_mask`; h = 0 is the smallest box holding every link of the plaquettes
+whose weight depends on bc, each unit adds one site in every direction) and
+`--protocol-symmetric-updates` applies each sweep or its reverse (OR sweeps, then HB, blocks and
+SU(2) subgroups backwards) with probability 1/2, which makes every protocol kernel self-adjoint.
+Both default off; the swap work and acceptance remain exact in either case.
+
 ## Classic SU(3) smearing Jacobian
 
 Classic SU(3) smearing now uses the exact full-Haar log determinant. The old

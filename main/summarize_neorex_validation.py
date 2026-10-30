@@ -8,7 +8,7 @@ and prints one row per run:
   protocol the work falls as 1/K while the cost grows as K, so a smaller product beats it at
   equal cost;
 - with --save-link-work-values, <exp(-W)> per pair, which detailed balance fixes to 1, and its
-  largest deviation in standard errors (errors ignore the correlation of successive swaps);
+  largest deviation in standard errors (block errors over 20 REX steps);
 - from replica_history.npz (--save-replica-history, on by default): the mean round-trip time
   bc 0 -> 1 -> 0 of a chain slot in REX steps (rt), the round trips completed per wall-clock hour by
   the whole job (rt/h, higher is better at equal GPUs), the Gamma-method tau_int of the plaquette on
@@ -44,8 +44,13 @@ def _method(args):
     return f"cnf/{args.get('cnf_integration_steps', '?')}cf4"
 
 
-def _crooks(path):
-    """Per pair: (<W>, <exp(-W)>, its standard error), or None without saved works."""
+def _crooks(path, block=20):
+    """Per pair: (<W>, <exp(-W)>, its standard error), or None without saved works.
+
+    The error is the standard error of block means over `block` consecutive REX steps (all chains of
+    a block pooled), so that the correlation of successive swaps of a pair is accounted for; with
+    fewer than 8 blocks it falls back to the naive standard error.
+    """
     try:
         import numpy as np
     except ImportError:
@@ -57,10 +62,17 @@ def _crooks(path):
                    key=lambda key: int(key[5:]))
     rows = []
     for key in pairs:
-        w = values[key].reshape(-1)
-        w = w[np.isfinite(w)]
-        e = np.exp(-w)
-        rows.append((float(w.mean()), float(e.mean()), float(e.std(ddof=1) / math.sqrt(len(w)))))
+        w = values[key]  # (steps, batch)
+        e = np.exp(np.where(np.isfinite(w), -w, 0.0))
+        finite = np.isfinite(w)
+        mean = float(e[finite].mean())
+        n_blocks = w.shape[0] // block
+        if n_blocks >= 8:
+            blocks = e[: n_blocks * block].reshape(n_blocks, -1).mean(axis=1)
+            sem = float(blocks.std(ddof=1) / math.sqrt(n_blocks))
+        else:
+            sem = float(e[finite].std(ddof=1) / math.sqrt(finite.sum()))
+        rows.append((float(w[finite].mean()), mean, sem))
     return rows
 
 

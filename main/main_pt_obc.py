@@ -610,6 +610,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orex-protocol-steps", type=int, default=8)
     parser.add_argument("--orex-mcmc-steps-per-step", type=int, default=1)
     parser.add_argument("--orex-schedule", type=str, default="even_odd", choices=["even_odd", "alternating", "even", "odd"])
+    parser.add_argument(
+        "--protocol-patch-halfsize",
+        type=int,
+        default=None,
+        help="Restrict the HB+OR updates along the O-REX/NEO-REX protocols to the links of a box around the "
+        "defect: 0 is the smallest box holding every link of the plaquettes that depend on bc (time slices "
+        "time-slice..time-slice+1, spatial range space-slice-1..space-slice+defect-size), each unit extends "
+        "it by one site in every direction. Default: the whole lattice. The equilibrium sweeps between "
+        "swaps always cover the whole lattice.",
+    )
+    parser.add_argument(
+        "--protocol-symmetric-updates",
+        action="store_true",
+        help="Along the protocols apply the HB+OR sweep or its reverse (OR sweeps then HB, blocks backwards) "
+        "with probability 1/2, so every update kernel is self-adjoint as the swap's detailed balance requires.",
+    )
     parser.add_argument("--neorex-protocol-steps", type=int, default=0)
     parser.add_argument("--neorex-heatbath-steps-per-step", type=int, default=0)
     parser.add_argument(
@@ -1009,6 +1025,17 @@ def main(args: argparse.Namespace) -> None:
         defect=defect,
     )
 
+    protocol_patch = None
+    if args.protocol_patch_halfsize is not None:
+        protocol_patch = defect.protocol_patch_mask(args.protocol_patch_halfsize, device=device)
+        if rank == 0:
+            print(
+                f"protocol_patch_halfsize={int(args.protocol_patch_halfsize)}  "
+                f"protocol_patch_links={int((mask * protocol_patch).sum().item())}/{int(mask.sum().item())}",
+                flush=True,
+            )
+    protocol_updates = dict(patch_mask=protocol_patch, symmetric_updates=bool(args.protocol_symmetric_updates))
+
     if args.algorithm == "orex":
         pt_cfg = OREXPTConfig(
             batch_size=args.batch_size,
@@ -1030,6 +1057,7 @@ def main(args: argparse.Namespace) -> None:
             defect_mask=defect_mask,
             batch_size=args.batch_size,
             parameter_name="bc",
+            **protocol_updates,
         )
     elif args.algorithm == "neorex":
         if int(args.neorex_protocol_steps) <= 0:
@@ -1063,6 +1091,7 @@ def main(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             parameter_name="bc",
             default_parameter=parameter_min,
+            **protocol_updates,
         )
         neorex_flow = NEOREXProtocolWrapper(
             nf_layer=nf_layer,

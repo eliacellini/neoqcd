@@ -12,9 +12,13 @@
    - inversa: graph di un blocco di 4 iterazioni del punto fisso, rilanciato fino a convergenza;
    - test su GPU: replay contro esecuzione normale a 1e-15.
 
-2. **HBOR solo sulla regione del difetto**, come un defect coupling layer, invece dello sweep
-   dell'intero reticolo (in CP(N-1) batte il PT standard). Punto di partenza: gli aggiornamenti
-   su scatole annidate di `main_nemcmc_snf.py` (`DefectBox`, `--hierarchical-*`).
+2. **HBOR solo sulla regione del difetto** lungo i protocolli, come nel paper O-REX
+   (arXiv:2510.25704): fatto con `--protocol-patch-halfsize h` (scatola attorno al difetto,
+   h = 0 è la più piccola che contiene i link delle plaquette che dipendono da bc) e
+   `--protocol-symmetric-updates` (sweep HB+OR o il suo inverso con probabilità 1/2, kernel
+   autoaggiunto). Gli sweep di equilibrio restano sull'intero reticolo. Resta da fare lo scan di
+   h (0, 1, 2, intero reticolo) su 8^4 per O-REX e NEO-REX, con round trip e tau_int come metrica:
+   su GPU il costo di uno sweep non scala con il volume della patch (lanci di kernel, vedi punto 1).
 
 3. **Scala delle repliche ottimale** invertendo la lunghezza termodinamica: dal lavoro di scambio
    per coppia di repliche di O-REX/NEO-REX si costruisce L(lambda) e si mettono i gradini a
