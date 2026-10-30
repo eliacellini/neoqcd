@@ -30,9 +30,11 @@
    - autocorrelazione di Q lungo la catena REX, come misura di merito contro O-REX e il PT.
    (Rob pensaci tu)
 
-5. **Storia delle etichette delle repliche e tempo di round trip.** `main/main_pt_obc.py` salva
-   accettazione e lavoro per coppia di repliche, ma non quale configurazione sta su quale
-   replica a ogni step. Salvare le etichette (array di interi step x repliche x batch) e
-   ricavarne il tempo di round trip bc = 0 -> bc = 1 -> bc = 0: limita il tau_int di Q sulla
-   replica periodica ed è misurabile già su 8^4, prima di avere cooling e carica topologica.
-   Da portare su Leonardo solo dopo che le run di produzione in coda sono partite.
+5. **Pulizia del codice quando sarà assestato.** Finché le produzioni in coda girano, ogni modifica
+   deve restare compatibile con i job già sottomessi (stesse flag, stessi default, stessi file di
+   output). Una volta fissato il codice finale: togliere gli script e le flag non più usati
+   (`job/*_array.sh` con `--chdir` su `/leonardo_scratch`, le modalità di smearing scartate),
+   unificare i raccoglitori `main/collect_*` con `main/summarize_neorex_validation.py`, far scrivere
+   il commit anche a `main/main_pt_obc.py` (oggi lo fa solo `main_cnf_rex.py`) e chiudere la nota
+   `notes/neorex_class_smearing_issue.txt`.
+

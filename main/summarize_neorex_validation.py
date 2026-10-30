@@ -8,10 +8,17 @@ and prints one row per run:
   protocol the work falls as 1/K while the cost grows as K, so a smaller product beats it at
   equal cost;
 - with --save-link-work-values, <exp(-W)> per pair, which detailed balance fixes to 1, and its
-  largest deviation in standard errors (errors ignore the correlation of successive swaps).
+  largest deviation in standard errors (errors ignore the correlation of successive swaps);
+- from replica_history.npz (--save-replica-history, on by default): the mean round-trip time
+  bc 0 -> 1 -> 0 of a chain slot in REX steps (rt), the round trips completed per wall-clock hour by
+  the whole job (rt/h, higher is better at equal GPUs), the Gamma-method tau_int of the plaquette on
+  the periodic replica bc = 1 in REX steps (tau_P1), and the seconds per independent plaquette
+  sample of one chain, s/step x tau_P1 (s*tau, lower is better). These replace work x s as the
+  cost measure: the work only bounds the swap acceptance, not how fast configurations travel.
 
 Runs stopped by the time limit have no final statistics in run_meta.json: their acceptance comes
-from the last row of pt_metrics.csv and is marked "partial".
+from the last row of pt_metrics.csv and is marked "partial"; their history is the one saved at the
+last --log-every step.
 
     python main/summarize_neorex_validation.py reports/neorex_eval_* [--csv out.csv]
 """
@@ -21,6 +28,9 @@ import csv
 import json
 import math
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 def _method(args):
@@ -52,6 +62,23 @@ def _crooks(path):
         e = np.exp(-w)
         rows.append((float(w.mean()), float(e.mean()), float(e.std(ddof=1) / math.sqrt(len(w)))))
     return rows
+
+
+def _history(run_dir):
+    """Round trips and plaquette tau_int recomputed from replica_history.npz, or None without it."""
+    path = run_dir / "replica_history.npz"
+    if not path.exists():
+        return None
+    try:
+        import numpy as np
+        from neoqcd.replica_history import summarize_history
+    except ImportError:
+        return None
+    data = np.load(path)
+    labels = data["labels"].astype(np.int64)
+    if labels.shape[0] == 0:
+        return None
+    return summarize_history(labels, data["plaquette"], int(labels.shape[1]))
 
 
 def _partial(run_dir):
@@ -95,6 +122,19 @@ def summarize(run_dir):
     row.update(run=str(run_dir), method=_method(args) if args else name, K=int(K), batch=args.get("batch_size"),
                steps=steps)
     row["work_x_s"] = row["work"] * row["s_per_step"]
+    history = _history(run_dir)
+    row.update(round_trip_steps=float("nan"), round_trips=0, round_trips_per_hour=float("nan"),
+               tau_plaquette_top=float("nan"), tau_plaquette_top_error=float("nan"), s_x_tau=float("nan"))
+    if history:
+        rt = history["round_trip_steps"]
+        row["round_trip_steps"] = rt
+        row["round_trips"] = history["round_trips"]
+        row["round_trips_per_hour"] = history["round_trips"] / (history["steps"] * row["s_per_step"]) * 3600.0
+        top = history["plaquette_top"]
+        row["tau_plaquette_top"] = top["tau_int"]
+        row["tau_plaquette_top_error"] = top["tau_int_error"]
+        row["s_x_tau"] = top["tau_int"] * row["s_per_step"]
+        row["flux_fraction"] = [round(f, 3) for f in history["flux_fraction"]]
     crooks = _crooks(run_dir / "link_work_values.npz")
     if crooks:
         row["exp_minus_w"] = [round(e, 4) for _, e, _ in crooks]
@@ -115,13 +155,21 @@ def main():
                 rows.append(row)
     rows.sort(key=lambda r: (r["batch"] or 0, r["method"] != "O-REX", r["method"], r["K"]))
     header = f"{'method':20s} {'K':>3s} {'batch':>5s} {'steps':>5s} {'acc':>6s} {'work':>14s} {'s/step':>7s} " \
-             f"{'work*s':>7s} {'crooks':>7s}  status  pairs"
+             f"{'work*s':>7s} {'rt':>7s} {'rt/h':>7s} {'tau_P1':>11s} {'s*tau':>7s} {'crooks':>7s}  status  pairs"
     print(header)
+
+    def num(value, fmt):
+        return format(value, fmt) if math.isfinite(value) else "-"
+
     for r in rows:
         work = f"{r['work']:.3f}+-{r['work_sem']:.3f}" if math.isfinite(r["work"]) else "-"
         crooks = f"{r['crooks_max_sigma']:.1f}sig" if "crooks_max_sigma" in r else "-"
+        tau = (f"{r['tau_plaquette_top']:.1f}+-{r['tau_plaquette_top_error']:.1f}"
+               if math.isfinite(r["tau_plaquette_top"]) else "-")
         print(f"{r['method']:20s} {r['K']:3d} {str(r['batch']):>5s} {r['steps']:5d} {r['acceptance']:6.3f} {work:>14s} "
-              f"{r['s_per_step']:7.2f} {r['work_x_s']:7.3f} {crooks:>7s}  {r['status']:7s} "
+              f"{r['s_per_step']:7.2f} {r['work_x_s']:7.3f} {num(r['round_trip_steps'], '7.1f'):>7s} "
+              f"{num(r['round_trips_per_hour'], '7.1f'):>7s} {tau:>11s} {num(r['s_x_tau'], '7.2f'):>7s} "
+              f"{crooks:>7s}  {r['status']:7s} "
               + " ".join(f"{a:.2f}" for a in r["pairs"]))
     if args.csv:
         with args.csv.open("w", newline="") as handle:

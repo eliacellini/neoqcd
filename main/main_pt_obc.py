@@ -25,8 +25,10 @@ from neoqcd.distributedPT import (
 )
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR
+from neoqcd.replica_history import rung_indices, summarize_history
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
 from neoqcd.smearing_jacobian import LOGDET_VERSION
+from neoqcd.sun_utils import plaquette_SUN
 from neoqcd.theory import Wilson_action
 from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer
 
@@ -676,6 +678,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For O-REX/NEO-REX, save every proposed swap work by ladder link to link_work_values.npz.",
     )
+    parser.add_argument(
+        "--save-replica-history",
+        dest="save_replica_history",
+        action="store_true",
+        default=True,
+        help="Save the rung of every chain slot and its plaquette after each step to replica_history.npz "
+        "(rewritten every --log-every steps), and report round trips and the plaquette tau_int in run_meta.json.",
+    )
+    parser.add_argument("--no-save-replica-history", dest="save_replica_history", action="store_false")
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")
     parser.add_argument("--output-dir", type=str, default=None, help="If set, use this directory for logs")
     parser.add_argument("--run-name", type=str, default="")
@@ -1229,6 +1240,20 @@ def main(args: argparse.Namespace) -> None:
     total_link_work_sum_sq = [0.0] * n_links
     total_link_work_count = [0] * n_links
     saved_link_work_values = [[] for _ in range(n_links)]
+    history_labels = []  # rank 0: (world_size, batch) rung index of every chain slot after each step
+    history_plaquette = []  # rank 0: (world_size, batch) plaquette of every chain slot after each step
+    history_path = out_dir / "replica_history.npz"
+
+    def save_replica_history():
+        """Rank 0 writes the history so far; a run stopped by the time limit keeps its round trips."""
+        np.savez_compressed(
+            history_path,
+            labels=np.stack(history_labels, axis=0).astype(np.int8),
+            plaquette=np.stack(history_plaquette, axis=0),
+            parameter_ladder=parameter_ladder.detach().cpu().numpy().astype(np.float64),
+            swap_every=np.asarray(int(args.swap_every)),
+        )
+
     last_log_elapsed = 0.0
     for step in range(args.steps):
         for _ in range(args.sweeps_per_step):
@@ -1300,6 +1325,18 @@ def main(args: argparse.Namespace) -> None:
                         total_flow_loss_count += flow_loss_count
                     total_flow_applied_updates += int(stats.get("applied_updates", 0))
                     total_flow_skipped_updates += int(stats.get("skipped_nan_grad_updates", 0))
+
+        if bool(args.save_replica_history):
+            # The plaquette of each local chain (whole lattice, Re Tr / N), gathered to rank 0 and
+            # stored with the rung its slot carries now, so the carrier of any rung can be followed.
+            local_plaquette = plaquette_SUN(cfgs, args.D, args.N).to(dtype=torch.float64)
+            gather_list = (
+                [torch.zeros_like(local_plaquette) for _ in range(world_size)] if rank == 0 else None
+            )
+            dist.gather(local_plaquette, gather_list=gather_list, dst=0)
+            if rank == 0:
+                history_labels.append(rung_indices(pt.parameter_matrix, parameter_ladder).cpu().numpy())
+                history_plaquette.append(torch.stack(gather_list, dim=0).cpu().numpy())
 
         link_accepted_step = _normalize_metric_list(stats.get("link_accepted"), n_links, 0)
         link_proposed_step = _normalize_metric_list(stats.get("link_proposed"), n_links, 0)
@@ -1473,6 +1510,8 @@ def main(args: argparse.Namespace) -> None:
                         float(gpu_memory.get("gpu_memory/total_gb", float("nan"))),
                     ]
                 )
+            if history_labels:
+                save_replica_history()
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []
@@ -1643,6 +1682,27 @@ def main(args: argparse.Namespace) -> None:
                 f"flow_loss_count={total_flow_loss_count}  "
                 f"flow_applied_updates={total_flow_applied_updates}  "
                 f"flow_skipped_nan_grad_updates={total_flow_skipped_updates}",
+                flush=True,
+            )
+        if history_labels:
+            save_replica_history()
+            history = summarize_history(
+                np.stack(history_labels, axis=0), np.stack(history_plaquette, axis=0), world_size
+            )
+            history["path"] = str(history_path)
+            meta["replica_history"] = history
+            top = history["plaquette_top"]
+            print(
+                f"round_trips={history['round_trips']}  "
+                f"round_trip_steps={history['round_trip_steps']:.2f}+-{history['round_trip_steps_sem']:.2f}  "
+                f"round_trips_per_walker_step={history['round_trips_per_walker_step']:.3e}  "
+                f"flux_fraction_json={json.dumps([round(v, 3) for v in history['flux_fraction']])}",
+                flush=True,
+            )
+            print(
+                f"plaquette_top={top['value']:.6f}+-{top['error']:.1e}  "
+                f"plaquette_top_tau_int={top['tau_int']:.2f}+-{top['tau_int_error']:.2f}  "
+                f"gamma_status={top['status']}  replica_history_path={history_path}",
                 flush=True,
             )
         with open(meta_path, "w", encoding="utf-8") as f:

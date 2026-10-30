@@ -47,6 +47,17 @@ The whole suite (including a three-rank Gloo NEO-REX run) is discovered with:
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 .sunenv/bin/python -m unittest discover -s test -t .
 ```
 
+## Replica history of REX runs
+
+`main/main_pt_obc.py` records, after every step, the ladder rung of each chain slot and its
+plaquette (`replica_history.npz`, keys `labels` and `plaquette` of shape steps x ranks x batch,
+rewritten every `--log-every` steps; `--no-save-replica-history` disables it). `run_meta.json`
+then reports the round trips bc = 0 -> 1 -> 0 completed by the chain slots, their mean duration in
+REX steps, the per-rung flux fraction (share of walkers that last visited bc = 0) and the
+Gamma-method `tau_int` of the plaquette on the bottom and top rungs. `neoqcd.replica_history`
+holds the analysis; `main/summarize_neorex_validation.py` prints the round trips per wall-clock
+hour and the seconds per independent plaquette sample (`s/step x tau_int`) as cost measures.
+
 ## Classic SU(3) smearing Jacobian
 
 Classic SU(3) smearing now uses the exact full-Haar log determinant. The old

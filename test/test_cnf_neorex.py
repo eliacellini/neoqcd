@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -159,6 +160,18 @@ class CNFNEOREXTest(unittest.TestCase):
             self.assertEqual(swap["total_proposed"], sum(swap["link_proposed"]))
             self.assertLessEqual(swap["total_accepted"], swap["total_proposed"])
             self.assertTrue(all(0.0 <= rate <= 1.0 for rate in swap["link_acceptance"]))
+
+            # Replica history: one rung per rank for every step and chain, plaquettes finite, summary present.
+            history = np.load(output_dir / "replica_history.npz")
+            self.assertEqual(history["labels"].shape, (steps, world_size, batch_size))
+            self.assertEqual(history["plaquette"].shape, (steps, world_size, batch_size))
+            for step in range(steps):
+                for chain in range(batch_size):
+                    self.assertEqual(sorted(history["labels"][step, :, chain].tolist()), list(range(world_size)))
+            self.assertTrue(np.all(np.isfinite(history["plaquette"])))
+            self.assertEqual(meta["replica_history"]["steps"], steps)
+            self.assertEqual(len(meta["replica_history"]["flux_fraction"]), world_size)
+            self.assertEqual(meta["replica_history"]["plaquette_top"]["status"], "insufficient_statistics")
 
             work = meta["work"]
             self.assertEqual(work["count"], swap["total_proposed"])
