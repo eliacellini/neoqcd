@@ -1,10 +1,10 @@
 """Time and profile the finite defect flow layer of NEO-REX on one GPU.
 
 Loads a PG-trained defect-hyper-smearing or defect-hyper-residual field, copies its network
-into the finite layer and times, per batch size: the layer forward, its inverse and one HBOR
-sweep of the whole
-lattice (the MCMC update the layer is paired with in a protocol step). Thermalization is not
-needed for timing, so the links are Haar random.
+into the finite layer and times, per batch size: the layer forward, its inverse (with the
+fixed-point iteration counts per block) and one HBOR sweep of the whole lattice, of the protocol
+patches h = 0 and h = 1 and of the reversed patch sweep (the MCMC updates the layer is paired with
+in a protocol step). Thermalization is not needed for timing, so the links are Haar random.
 """
 
 import argparse
@@ -78,13 +78,20 @@ def main():
         bc = torch.full((batch,), 0.5, dtype=torch.double, device=device)
         step = torch.full_like(bc, args.delta)
         update = HBOR(pars, beta=6.0, defect_par=0.5)
+        patches = {h: (pars.mask * pars.defect.protocol_patch_mask(h, device=device)).contiguous() for h in (0, 1)}
         with torch.no_grad():
             out = layer(U, pars, None, beta=bc, delta_beta=step)[0]
             forward = timed(lambda: layer(U, pars, None, beta=bc, delta_beta=step), args.repeats)
             inverse = timed(lambda: layer.inverse(out, pars, None, beta=bc, delta_beta=step), args.repeats)
+            stats = getattr(getattr(layer, "smearing", getattr(layer, "residual", None)), "last_inverse_stats", {})
             sweep = timed(lambda: update(U, pars.mask, defect_mask), args.repeats)
+            patch_sweeps = {h: timed(lambda m=m: update(U, m, defect_mask), args.repeats) for h, m in patches.items()}
+            reversed_sweep = timed(lambda: update(U, patches[1], defect_mask, reverse=True), args.repeats)
         print(f"batch {batch}: forward {forward * 1e3:.1f} ms  inverse {inverse * 1e3:.1f} ms  "
-              f"HBOR sweep {sweep * 1e3:.1f} ms", flush=True)
+              f"HBOR sweep {sweep * 1e3:.1f} ms  patch h=0 {patch_sweeps[0] * 1e3:.1f} ms  "
+              f"patch h=1 {patch_sweeps[1] * 1e3:.1f} ms  patch h=1 reversed {reversed_sweep * 1e3:.1f} ms", flush=True)
+        print(f"batch {batch}: inverse iterations per block {stats.get('iterations')}  "
+              f"largest residual {stats.get('residual')}", flush=True)
         if args.profile and batch == args.batch[-1]:
             with torch.no_grad(), torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU]
