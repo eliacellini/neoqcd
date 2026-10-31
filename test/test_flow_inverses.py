@@ -349,3 +349,23 @@ class DeferredChecksTests(unittest.TestCase):
         # max_iter caps the fixed count too, so an impossible budget still raises through the fallback.
         with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "did not converge"):
             self.layer.inverse(forward, self.pars, None, beta=self.bc, delta_beta=self.delta, max_iter=1)
+
+
+class LULogdetTests(unittest.TestCase):
+    def test_tensor_only_lu_matches_slogdet(self):
+        from neoqcd.smearing_jacobian import logabsdet_lu, lu_logdet, smearing_step
+        import neoqcd.smearing_jacobian as sj
+        torch.manual_seed(3)
+        M = torch.randn(4, 50, 9, 9, dtype=torch.cdouble)
+        torch.testing.assert_close(logabsdet_lu(M), torch.linalg.slogdet(M).logabsdet, rtol=1e-12, atol=1e-12)
+        J = torch.eye(9, dtype=torch.cdouble) + 0.05 * torch.randn(300, 9, 9, dtype=torch.cdouble)
+        torch.testing.assert_close(logabsdet_lu(J), torch.linalg.slogdet(J).logabsdet, rtol=0, atol=1e-13)
+        # The stout step gives the same log-Jacobian either way.
+        U = sun.SUN_haar((2, 40, 3), dtype=torch.cdouble)
+        C = 0.1 * torch.randn(2, 40, 3, 3, dtype=torch.cdouble)
+        _, plain = smearing_step(U, C)
+        with lu_logdet():
+            self.assertTrue(sj.LOGDET_BY_LU)
+            _, lu = smearing_step(U, C)
+        self.assertFalse(sj.LOGDET_BY_LU)
+        torch.testing.assert_close(lu, plain, rtol=0, atol=1e-13)

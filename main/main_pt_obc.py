@@ -428,7 +428,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         """Replay the CUDA graph of the patch map, capturing it on first use; the deferred checks
         (c1 of every block, inverse residual) are read once after the replay and a failed check
         repeats the call eagerly. Returns None when graphs are unavailable."""
-        from neoqcd.smearing_jacobian import DeferredChecks
+        from neoqcd.smearing_jacobian import DeferredChecks, lu_logdet
         bs = int(x.shape[0])
         key = (kind, tuple(x.shape), str(x.dtype))
         if not hasattr(self, "_graphs"):
@@ -441,17 +441,20 @@ class DefectSNFProtocolLayer(torch.nn.Module):
                 static_bc, static_delta = bc.clone(), delta_bc.clone()
                 old_jac_shape = self._set_local_jac_shape(bs)
                 try:
-                    stream = torch.cuda.Stream(device=x.device)
-                    stream.wait_stream(torch.cuda.current_stream(device=x.device))
-                    with torch.cuda.stream(stream):
-                        for _ in range(2):
-                            with DeferredChecks():
-                                self._run_blocks(kind, static_small, static_bc, static_delta)
-                    torch.cuda.current_stream(device=x.device).wait_stream(stream)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        with DeferredChecks() as checks:
-                            static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
+                    # The Jacobian determinants go through the tensor-only LU inside the graph:
+                    # cuSOLVER is not reliably capturable and a failed capture breaks the CUDA RNG.
+                    with lu_logdet():
+                        stream = torch.cuda.Stream(device=x.device)
+                        stream.wait_stream(torch.cuda.current_stream(device=x.device))
+                        with torch.cuda.stream(stream):
+                            for _ in range(2):
+                                with DeferredChecks():
+                                    self._run_blocks(kind, static_small, static_bc, static_delta)
+                        torch.cuda.current_stream(device=x.device).wait_stream(stream)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            with DeferredChecks() as checks:
+                                static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
                 finally:
                     self.layer.smearing.jac_shape = old_jac_shape
             except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on

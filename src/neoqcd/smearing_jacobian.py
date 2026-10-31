@@ -376,12 +376,65 @@ class StepQuantities():
                                       + otimes(self.QOm, self.I) + otimes(self.Om, self.UdQU))
         return J
 
+# torch.linalg.slogdet goes through cuSOLVER/MAGMA, which a CUDA graph capture may not accept, and a
+# failed capture leaves the CUDA random generator unusable; inside `with lu_logdet():` the
+# hand-written LU below (partial pivoting, pure tensor operations) is used instead.
+LOGDET_BY_LU = False
+
+
+class lu_logdet:
+    """Context manager: compute log|det| of the stout Jacobians by the tensor-only LU."""
+
+    def __enter__(self):
+        global LOGDET_BY_LU
+        self._previous = LOGDET_BY_LU
+        LOGDET_BY_LU = True
+        return self
+
+    def __exit__(self, *exc):
+        global LOGDET_BY_LU
+        LOGDET_BY_LU = self._previous
+
+
+def logabsdet_lu(M):
+    """log|det M| of a batch of small square matrices by LU with partial pivoting, in tensor ops only.
+
+    Every step picks the pivot row by argmax of |column| (gather/scatter, no host sync) and
+    eliminates below it; log|det| is the sum of log|pivots|. Agrees with torch.linalg.slogdet to
+    rounding for the 9x9 stout Jacobians. Capturable in a CUDA graph.
+    """
+    n = M.shape[-1]
+    A = M.clone()
+    batch_shape = A.shape[:-2]
+    logdet = torch.zeros(batch_shape, dtype=A.real.dtype, device=A.device)
+    rows = torch.arange(n, device=A.device)
+    for k in range(n):
+        column = A[..., k:, k].abs()
+        pivot = column.argmax(dim=-1) + k  # (...,)
+        # swap rows k and pivot through a permutation gathered per matrix
+        perm = rows.expand(batch_shape + (n,)).clone()
+        perm_k = perm.gather(-1, pivot.unsqueeze(-1))
+        perm.scatter_(-1, pivot.unsqueeze(-1), perm[..., k:k + 1].clone())
+        perm[..., k:k + 1] = perm_k
+        A = A.gather(-2, perm.unsqueeze(-1).expand(A.shape))
+        piv = A[..., k, k]
+        safe = torch.where(piv.abs() > 0, piv, torch.ones_like(piv))
+        logdet = logdet + torch.log(piv.abs().clamp_min(torch.finfo(logdet.dtype).tiny))
+        factors = A[..., k + 1:, k] / safe.unsqueeze(-1)
+        A[..., k + 1:, :] = A[..., k + 1:, :] - factors.unsqueeze(-1) * A[..., k:k + 1, :]
+    return logdet
+
+
+def _logabsdet(M):
+    return logabsdet_lu(M) if LOGDET_BY_LU else torch.linalg.slogdet(M).logabsdet
+
+
 def smearing_step(U, C):
     # Stout step of a batch of links U (..., 3, 3) with staple sums C: returns U' = exp(iQ) U and
     # log|det dU'/dU| (...,). Differentiable by autograd; SmearingStep gives the same outputs with an
     # explicit backward.
     stepq = StepQuantities(U, C)
-    logdet = torch.linalg.slogdet(jacobian_matrix(stepq.jacobian())).logabsdet
+    logdet = _logabsdet(jacobian_matrix(stepq.jacobian()))
     return stepq.Up, logdet
 
 def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100, check_every=4, fixed_iterations=None):
