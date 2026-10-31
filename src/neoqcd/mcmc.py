@@ -188,6 +188,7 @@ class HBOR():
 
         self.beta = beta
         self._subgroup_order = (0, 1, 2)  # SU(2) subgroups of each SU(3) link update
+        self._kappa_cache = None  # plaquette-weight table of the sweep in progress
         # CUDA graphs of whole sweeps, keyed by shapes, mask, branch and sweep direction: see
         # _graphed_sweep. Off by default; main_pt_obc.py turns it on with --cuda-graphs.
         self.use_cuda_graphs = False
@@ -318,36 +319,54 @@ class HBOR():
 
     def _sweep(self, cfgs, mask, defect, rand, reverse):
         links = mask if isinstance(mask, sun.MaskedLinks) else self._links_for_mask(mask)
-        flat = sun.flat_links(cfgs, self.D)
+        # One copy of the lattice per sweep: the block updates are written in place (each block
+        # reads only links it does not write), instead of one whole-lattice copy per block.
+        flat = sun.flat_links(cfgs, self.D).clone()
         blocks = list(range(2 * self.D))
-        if reverse:
-            # Blocks and, inside each SU(3) link update, the SU(2) subgroups run backwards.
-            blocks.reverse()
-            self._subgroup_order = (2, 1, 0)
-            try:
-                flat = self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
-                flat = self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
-            finally:
-                self._subgroup_order = (0, 1, 2)
-        else:
-            flat = self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
-            flat = self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
-        cfgs = flat.reshape(cfgs.shape)
-        return sun.SU3_unitarize(cfgs) if self.N == 3 else cfgs
+        self._kappa_cache = self._sweep_kappa(cfgs, defect)
+        try:
+            if reverse:
+                # Blocks and, inside each SU(3) link update, the SU(2) subgroups run backwards.
+                blocks.reverse()
+                self._subgroup_order = (2, 1, 0)
+                try:
+                    self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
+                    self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
+                finally:
+                    self._subgroup_order = (0, 1, 2)
+            else:
+                self._heatbath_sweep(flat, links, blocks, rand, defect, cfgs)
+                self._overrelaxation_sweeps(flat, links, blocks, defect, cfgs)
+        finally:
+            self._kappa_cache = None
+        if self.N == 3:
+            # Re-unitarize the updated links only (all of them on a whole-lattice sweep).
+            updated = links.all_links
+            if int(updated.numel()) == int(flat.shape[1]):
+                flat = sun.SU3_unitarize(flat)
+            else:
+                flat.index_copy_(1, updated, sun.SU3_unitarize(flat.index_select(1, updated)))
+        return flat.reshape(cfgs.shape)
+
+    def _sweep_kappa(self, cfgs, defect):
+        # The plaquette weights depend only on the defect and the coupling, constant within a sweep:
+        # the (batch, D * V) table is built once per sweep instead of once per block.
+        if defect is None or not self._defect_parameter_uses_defect():
+            return None
+        kappa = self._batch_kappa(cfgs, defect)
+        return kappa.reshape(1, -1) if kappa.dim() == self.D + 1 else kappa.flatten(1)
 
     def _heatbath_sweep(self, flat, links, blocks, rand, defect, cfgs):
         # Gather only the selected links and the links needed by their staples.
         for m in blocks:
             mu = m // 2
             rand_m = rand[:, :, mu].flatten(2).index_select(2, links.sites[m])
-            flat = flat.index_copy(1, links.links[m], self.hb_update(flat, links, m, rand_m, defect, cfgs))
-        return flat
+            flat.index_copy_(1, links.links[m], self.hb_update(flat, links, m, rand_m, defect, cfgs))
 
     def _overrelaxation_sweeps(self, flat, links, blocks, defect, cfgs):
         for _ in range(self.orsteps):
             for m in blocks:
-                flat = flat.index_copy(1, links.links[m], self.over_update(flat, links, m, defect, cfgs))
-        return flat
+                flat.index_copy_(1, links.links[m], self.over_update(flat, links, m, defect, cfgs))
 
     def _links_for_mask(self, mask):
         return self._masked_links_cache.get(mask, self.D)
@@ -430,11 +449,9 @@ class HBOR():
         staples = torch.zeros((batch, n, self.N, self.N), dtype=cfgs.dtype, device=cfgs.device)
         use_defect = defect is not None and self._defect_parameter_uses_defect()
         if use_defect:
-            kappa = self._batch_kappa(cfgs, defect)
-            if kappa.dim() == self.D + 1:
-                kappa = kappa.reshape(1, -1)
-            else:
-                kappa = kappa.flatten(1)
+            kappa = getattr(self, "_kappa_cache", None)
+            if kappa is None:
+                kappa = self._sweep_kappa(cfgs, defect)
 
             def kappa_at(position):
                 values = kappa.index_select(-1, position)

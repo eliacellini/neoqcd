@@ -146,6 +146,15 @@ def flat_links(cfgs, D):
 class MaskedLinks:
     """Precomputed flat indices for selected links and the six links in each staple pair."""
 
+    @property
+    def all_links(self):
+        """Flat indices of every selected link, all blocks together (cached)."""
+        cached = self.__dict__.get("_all_links")
+        if cached is None:
+            cached = torch.cat(self.links)
+            self.__dict__["_all_links"] = cached
+        return cached
+
     def __init__(self, mask, D):
         self.D = int(D)
         lattice = tuple(mask.shape[3:3 + self.D])
