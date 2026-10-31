@@ -69,6 +69,13 @@ whose weight depends on bc, each unit adds one site in every direction) and
 SU(2) subgroups backwards) with probability 1/2, which makes every protocol kernel self-adjoint.
 Both default off; the swap work and acceptance remain exact in either case.
 
+The REX step is dispatch-bound on the GPU (about 120k kernel launches per step at 8^4, batch 64).
+`--cuda-graphs` captures and replays CUDA graphs of the HBOR sweeps (equilibrium and protocol)
+and of the defect smearing layer's map and inverse; a failed capture falls back to eager
+execution with a warning, and `test/test_cuda_graphs.py` (GPU only, `job/debug_gpu_tests.sh`)
+compares replay with eager execution. `--profile-steps N` writes a torch.profiler table of N
+whole steps, split by phase, to `step_profile.txt` in the output directory.
+
 ## Classic SU(3) smearing Jacobian
 
 Classic SU(3) smearing now uses the exact full-Haar log determinant. The old

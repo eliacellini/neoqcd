@@ -3,14 +3,12 @@
 1. **CUDA graph per i layer di flow in valutazione** (NEO-REX e SNF, senza gradienti).
    I layer finiti sono limitati dai lanci di kernel: costano quasi uguale a batch 8 e 64
    (residual a classi, commit 8a2af0e: forward/inversa circa 196/337 ms a batch 8 e 199/385 ms
-   a batch 64; smearing 22/60 ms; uno sweep HBOR 128/373 ms). Da fare:
-   - buffer statici per configurazioni, bc e passo;
-   - siti delle maschere e tabelle delle convoluzioni calcolati prima della cattura;
-   - il controllo `delta == 0` fuori dal graph;
-   - `exp_coefficients` sceglie tra serie e formule chiuse di Morningstar-Peardon secondo c1:
-     catturare il ramo della serie e controllare c1 dopo il replay, con ripiego senza graph;
-   - inversa: graph di un blocco di 4 iterazioni del punto fisso, rilanciato fino a convergenza;
-   - test su GPU: replay contro esecuzione normale a 1e-15.
+   a batch 64; smearing 22/60 ms; uno sweep HBOR 128/373 ms). Fatto sul branch `cuda-graphs`
+   (31/10): `--cuda-graphs` cattura gli sweep HBOR e la mappa/inversa dello smearing con buffer
+   statici, serie di exp(iQ) con controllo di c1 dopo il replay (`DeferredChecks`), inversa a 10
+   iterazioni fisse con controllo finale e ripiego senza graph; test su GPU in
+   `test/test_cuda_graphs.py`. Resta il residual: prima vanno tolte le copie dell'intero reticolo
+   per chiamata (192 memcpy nel profilo del 30/10), poi il controllo `delta == 0` va fuori dal graph.
 
 2. **HBOR solo sulla regione del difetto** lungo i protocolli, come nel paper O-REX
    (arXiv:2510.25704): fatto con `--protocol-patch-halfsize h` (scatola attorno al difetto,
