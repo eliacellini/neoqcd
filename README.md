@@ -71,9 +71,13 @@ Both default off; the swap work and acceptance remain exact in either case.
 
 The REX step is dispatch-bound on the GPU (about 120k kernel launches per step at 8^4, batch 64).
 `--cuda-graphs` captures and replays CUDA graphs of the HBOR sweeps (equilibrium and protocol)
-and of the defect smearing layer's map and inverse; a failed capture falls back to eager
-execution with a warning, and `test/test_cuda_graphs.py` (GPU only, `job/debug_gpu_tests.sh`)
-compares replay with eager execution. `--profile-steps N` writes a torch.profiler table of N
+and of the defect smearing layer's map and inverse; `test/test_cuda_graphs.py` (GPU only,
+`job/debug_gpu_tests.sh`) compares replay with eager execution. A failed capture leaves the
+CUDA random generator unusable, so the captured code must be sync-free by construction; with
+NCCL, export `NCCL_ASYNC_ERROR_HANDLING=0` (job/debug_neorex_eval.sh does it when the flag is
+passed), because NCCL's cleanup thread polling its events during a capture aborts the process.
+The replays gain on the smearing layer (map 22 to 5 ms, inverse 83 to 17 ms on an A100) but not
+on the HBOR sweep, which is bound by GPU kernel latency rather than by dispatch. `--profile-steps N` writes a torch.profiler table of N
 whole steps, split by phase, to `step_profile.txt` in the output directory.
 
 ## Classic SU(3) smearing Jacobian

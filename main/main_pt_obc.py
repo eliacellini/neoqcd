@@ -25,7 +25,7 @@ from neoqcd.distributedPT import (
     ParallelTempering,
 )
 from neoqcd.flow import FlowPars
-from neoqcd.mcmc import DefectMCMCAdapter, HBOR
+from neoqcd.mcmc import DefectMCMCAdapter, HBOR, quiesce_for_capture
 from neoqcd.replica_history import rung_indices, summarize_history
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
 from neoqcd.smearing_jacobian import LOGDET_VERSION
@@ -447,6 +447,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
                     # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
                     # failed capture leaves the CUDA random generator unusable.
                     with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
+                        quiesce_for_capture(x.device)
                         stream = torch.cuda.Stream(device=x.device)
                         stream.wait_stream(torch.cuda.current_stream(device=x.device))
                         with torch.cuda.stream(stream):
@@ -1310,6 +1311,13 @@ def main(args: argparse.Namespace) -> None:
         nf_layer.graph_logdet = str(args.graph_logdet)
     if rank == 0 and bool(args.cuda_graphs):
         print("cuda_graphs=on", flush=True)
+        if world_size > 1 and os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1") != "0":
+            print(
+                "WARNING: --cuda-graphs with NCCL: export NCCL_ASYNC_ERROR_HANDLING=0 in the job, otherwise the "
+                "NCCL cleanup thread can abort the process during a graph capture (torch 2.0 has no thread-local "
+                "capture mode); the captures also wait 1.5 s for that thread's queue to drain.",
+                flush=True,
+            )
 
     cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0
     cache_mode = "disabled"

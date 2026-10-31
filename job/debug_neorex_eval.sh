@@ -25,6 +25,9 @@ module load cineca-ai/
 source .sunenv/bin/activate
 export OMP_NUM_THREADS=1
 export NCCL_SHM_DISABLE=1
+# CUDA graph captures abort if NCCL's cleanup thread polls its events meanwhile (torch 2.0):
+# with --cuda-graphs that thread is not started.
+case " $* " in *" --cuda-graphs "*) export NCCL_ASYNC_ERROR_HANDLING=0 ;; esac
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 K="${K:-4}"

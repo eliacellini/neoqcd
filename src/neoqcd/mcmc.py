@@ -13,6 +13,26 @@ from neoqcd.utils import Defect, DefectBox
 _CONSTANTS = {}
 
 
+def quiesce_for_capture(device):
+    """Make a CUDA graph capture safe next to NCCL.
+
+    torch.cuda.graph captures in global mode, where any CUDA call from another thread aborts the
+    process. ProcessGroupNCCL's cleanup thread polls the events of pending collectives about once
+    a second (torch 2.0 has no thread-local capture mode), so the device is synchronized and the
+    thread given time to find its queue empty. Jobs should also export
+    NCCL_ASYNC_ERROR_HANDLING=0, which keeps that thread from being started.
+    """
+    import time
+    torch.cuda.synchronize(device)
+    try:
+        import torch.distributed as dist
+        distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    except Exception:  # noqa: BLE001
+        distributed = False
+    if distributed:
+        time.sleep(1.5)
+
+
 def _constant(key, build):
     """A small device tensor built once per (key, device, dtype): a tensor made from Python data
     inside a CUDA graph capture is a synchronous host-to-device copy, which the capture forbids,
@@ -281,6 +301,7 @@ class HBOR():
             self.defect_par = static_par  # the captured kernels read this buffer
         try:
             # Warm-up on a side stream, as the CUDA graph documentation prescribes, then capture.
+            quiesce_for_capture(cfgs.device)
             stream = torch.cuda.Stream(device=cfgs.device)
             stream.wait_stream(torch.cuda.current_stream(device=cfgs.device))
             with torch.cuda.stream(stream):
