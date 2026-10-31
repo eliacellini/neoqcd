@@ -189,3 +189,49 @@ class AdapterPatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EquilibriumSweepAndWorkTest(unittest.TestCase):
+    """The batched equilibrium sweep and the local action difference reproduce the per-label and
+    full-lattice reference implementations exactly."""
+
+    def test_batched_sweep_equals_the_per_label_sweep_with_the_same_random_numbers(self):
+        import importlib.util
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("main_pt_obc_sweep", root / "main" / "main_pt_obc.py")
+        main = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(main)
+        torch.manual_seed(3)
+        D, T, L = 4, 4, 4
+        pars = SimpleNamespace(N=3, D=D, orsteps=2, device=torch.device("cpu"), mask=create_mask(D, T, L), defect=None)
+        defect_mask = Defect(D, T, L, dsize=1, time_slice=1, space_slice=1).create_defect_mask()
+        ladder = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+        hbor_by_idx = [HBOR(pars, beta=6.0, defect_par=float(lam)) for lam in ladder]
+        hbor = HBOR(pars, beta=6.0, defect_par=0.0)
+        local = ladder[torch.tensor([2, 0, 3, 2, 1])]  # five chains, repeated and unsorted labels
+        cfgs = sun.SUN_haar((5, D, T, L, L, L, 3), dtype=torch.cdouble)
+        rand = torch.rand((5, 18, D, T, L, L, L), dtype=torch.float64)
+        per_label = main.local_hbor_sweep(cfgs, local, ladder, hbor_by_idx, pars.mask, defect_mask, rand=rand)
+        batched = main.local_hbor_sweep(cfgs, local, ladder, hbor_by_idx, pars.mask, defect_mask, hbor=hbor, rand=rand)
+        self.assertGreater((per_label - cfgs).abs().max().item(), 1e-3)
+        self.assertLess((batched - per_label).abs().max().item(), 1e-13)
+
+    def test_local_action_difference_equals_the_full_lattice_one(self):
+        torch.manual_seed(4)
+        D, T, L = 4, 6, 6
+        pars = SimpleNamespace(N=3, D=D, orsteps=1, device=torch.device("cpu"), mask=create_mask(D, T, L), defect=None)
+        for dsize, time_slice, space_slice in ((1, 2, 2), (2, 0, 3)):
+            defect = Defect(D, T, L, dsize=dsize, time_slice=time_slice, space_slice=space_slice)
+            adapter = DefectMCMCAdapter(pars, beta=6.0, defect_mask=defect.create_defect_mask(), batch_size=3)
+            x = sun.SUN_haar((3, D, T, L, L, L, 3), dtype=torch.cdouble)
+            p_old = torch.tensor([0.0, 0.4, 1.0], dtype=torch.float64)
+            p_new = torch.tensor([0.25, 0.4, 0.7], dtype=torch.float64)
+            local = adapter.action_difference(x, p_old, p_new)
+            full = adapter.action_difference(x, p_old, p_new, full_lattice=True)
+            self.assertGreater(local.abs().max().item(), 1e-3)
+            self.assertEqual(local[1].item(), 0.0)
+            torch.testing.assert_close(local, full, rtol=1e-12, atol=1e-10)
+            tables = adapter._defect_plaquette_tables(x.device)
+            # Every bc-dependent plaquette holds a defect link: 3 orientations (0, nu) x (cube + the face behind it).
+            self.assertEqual(sum(t.shape[1] for _, _, t in tables), 3 * (dsize ** 3 + dsize ** 2))

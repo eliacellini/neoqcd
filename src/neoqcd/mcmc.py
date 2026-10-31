@@ -609,6 +609,29 @@ class DefectMCMCAdapter:
                 self.defect_mask,
                 device=self.flow_pars.device,
             )
+        self._defect_plaquettes = None  # built on first use: see _defect_plaquette_tables
+
+    def _defect_plaquette_tables(self, device):
+        """Flat link indices of the plaquettes whose weight depends on bc: one (4, n) table per
+        orientation (mu, nu), rows U_mu(x), U_nu(x+mu), U_mu(x+nu), U_nu(x), x+mu = roll(+1) as in
+        pstaple. Only these plaquettes contribute to S(x; bc') - S(x; bc)."""
+        if self._defect_plaquettes is not None and self._defect_plaquettes[0] == str(device):
+            return self._defect_plaquettes[1]
+        D = int(self.flow_pars.D)
+        defect = self.defect_mask.to(device=device)[1].to(torch.bool)  # (D, T, L, ...): links with kappa < 1
+        lattice = tuple(defect.shape[1:])
+        V = int(defect[0].numel())
+        ids = torch.arange(V, device=device).reshape(lattice)
+        shift = lambda axis: torch.roll(ids, 1, dims=axis).flatten()
+        tables = []
+        for nu in range(1, D):
+            for mu in range(0, nu):
+                depends = (defect[mu] | torch.roll(defect[nu], 1, dims=mu) | torch.roll(defect[mu], 1, dims=nu) | defect[nu])
+                sites = depends.flatten().nonzero().squeeze(-1)
+                table = torch.stack((mu * V + sites, nu * V + shift(mu)[sites], mu * V + shift(nu)[sites], nu * V + sites))
+                tables.append((mu, nu, table))
+        self._defect_plaquettes = (str(device), tables)
+        return tables
 
     def _normalize_parameter(
         self,
@@ -697,7 +720,11 @@ class DefectMCMCAdapter:
         parameter_old: torch.Tensor,
         parameter_new: torch.Tensor,
         parameter_name: str = "bc",
+        full_lattice: bool = False,
     ) -> torch.Tensor:
+        """S(x; parameter_new) - S(x; parameter_old) per chain. By default only the plaquettes whose
+        weight depends on bc are evaluated (exact: the others cancel); full_lattice=True multiplies
+        every plaquette, the reference implementation."""
         if str(parameter_name) != self.parameter_name:
             raise ValueError(
                 f"Unsupported parameter_name={parameter_name!r}, expected {self.parameter_name!r}"
@@ -718,6 +745,23 @@ class DefectMCMCAdapter:
         defect_mask = self.defect_mask.to(device=x.device, dtype=work_dtype)
         kappa_old = self._kappa_for_parameter(p_old, defect_mask)
         kappa_new = self._kappa_for_parameter(p_new, defect_mask)
+        if not full_lattice:
+            # Only the plaquettes with a defect link change weight: gather their four links and
+            # the four couplings per chain instead of multiplying every plaquette of the lattice.
+            flat = sun.flat_links(x, self.flow_pars.D)
+            dk = (kappa_old - kappa_new).flatten(1)  # (B, D * V)
+            delta = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
+            for mu, nu, table in self._defect_plaquette_tables(x.device):
+                if table.shape[1] == 0:
+                    continue
+                U = flat.index_select(1, table.flatten()).unflatten(1, table.shape)
+                U_mu, U_nu_xpmu, U_mu_xpnu, U_nu = U.unbind(1)
+                plaq = sun.SUN_mul(sun.SUN_mul(U_mu, U_nu_xpmu), sun.SUN_dagger(sun.SUN_mul(U_nu, U_mu_xpnu)))
+                k_old = kappa_old.flatten(1).index_select(1, table.flatten()).unflatten(1, table.shape).prod(dim=1)
+                k_new = kappa_new.flatten(1).index_select(1, table.flatten()).unflatten(1, table.shape).prod(dim=1)
+                delta = delta + ((k_old - k_new) * sun.SUN_trace(plaq).real / float(self.flow_pars.N)).sum(dim=1)
+            del dk
+            return delta * float(self.beta)
         delta = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
         dims = tuple(range(1, self.flow_pars.D + 1))
 

@@ -835,14 +835,26 @@ def local_hbor_sweep(
     hbor_by_idx: list,
     mask: torch.Tensor,
     defect_mask: torch.Tensor,
+    hbor=None,
+    rand=None,
 ) -> torch.Tensor:
+    """One HB + OR sweep of every local chain at its own bc.
+
+    With `hbor` (one HBOR object) the whole batch is swept in one call with a per-chain defect
+    coupling; without it each ladder label is swept separately with hbor_by_idx (the historical
+    path: with up to one sub-batch per rung it costs up to world_size dispatch-bound sweeps).
+    `rand` (whole-batch heat-bath random numbers) lets the two paths be compared exactly.
+    """
+    if hbor is not None:
+        hbor.set_defect_parameter(local_parameters.to(dtype=torch.float64))
+        return hbor(cfgs, mask, defect_mask, rand=rand)
     idx = _parameter_indices(local_parameters, parameter_ladder)
     out = cfgs
     for k in torch.unique(idx):
         k_int = int(k.item())
         sel = torch.nonzero(idx == k_int, as_tuple=False).squeeze(-1)
         batch_k = out.index_select(0, sel)
-        batch_k = hbor_by_idx[k_int](batch_k, mask, defect_mask)
+        batch_k = hbor_by_idx[k_int](batch_k, mask, defect_mask, rand=None if rand is None else rand.index_select(0, sel))
         out = out.clone()
         out[sel] = batch_k
     return out
@@ -1193,6 +1205,8 @@ def main(args: argparse.Namespace) -> None:
         lam_f = float(lam.item())
         hbor_by_idx.append(HBOR(flow_pars, beta=args.beta, defect_par=lam_f))
         action_by_idx.append(Wilson_action(flow_pars, beta=args.beta, defect_par=lam_f))
+    # The equilibrium sweep runs on the whole local batch at once, with the bc of each chain.
+    hbor_batched = HBOR(flow_pars, beta=args.beta, defect_par=float(parameter_min))
 
     cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0
     cache_mode = "disabled"
@@ -1232,6 +1246,7 @@ def main(args: argparse.Namespace) -> None:
                 hbor_by_idx=hbor_by_idx,
                 mask=mask,
                 defect_mask=defect_mask,
+                hbor=hbor_batched,
             )
         if cache_enabled:
             _save_cached_cfgs(
@@ -1322,6 +1337,7 @@ def main(args: argparse.Namespace) -> None:
                 hbor_by_idx=hbor_by_idx,
                 mask=mask,
                 defect_mask=defect_mask,
+                hbor=hbor_batched,
             )
         if region is not None:
             region.__exit__(None, None, None)
