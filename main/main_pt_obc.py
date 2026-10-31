@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import csv
 import hashlib
 import json
@@ -326,6 +327,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
     # that subclasses with their own __init__ (the residual layer) inherit the eager default.
     use_cuda_graphs = False
     inverse_fixed_iterations = 10
+    graph_logdet = "slogdet"  # or "lu": the tensor-only LU, if cuSOLVER cannot be captured
 
     def __init__(self, flow_pars: FlowPars):
         super().__init__()
@@ -441,9 +443,10 @@ class DefectSNFProtocolLayer(torch.nn.Module):
                 static_bc, static_delta = bc.clone(), delta_bc.clone()
                 old_jac_shape = self._set_local_jac_shape(bs)
                 try:
-                    # The Jacobian determinants go through the tensor-only LU inside the graph:
-                    # cuSOLVER is not reliably capturable and a failed capture breaks the CUDA RNG.
-                    with lu_logdet():
+                    # torch.linalg.slogdet captured fine on Leonardo (torch 2.0, CUDA 12.1); the
+                    # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
+                    # failed capture leaves the CUDA random generator unusable.
+                    with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
                         stream = torch.cuda.Stream(device=x.device)
                         stream.wait_stream(torch.cuda.current_stream(device=x.device))
                         with torch.cuda.stream(stream):
@@ -704,6 +707,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replay CUDA graphs of the HBOR sweeps (equilibrium and protocol) and of the defect smearing "
         "layer, captured on first use; eager execution is the fallback when a capture fails.",
+    )
+    parser.add_argument(
+        "--graph-logdet",
+        choices=("slogdet", "lu"),
+        default="slogdet",
+        help="How the captured smearing layer computes log|det| of the stout Jacobians: torch.linalg.slogdet "
+        "or the tensor-only LU (for a CUDA/cuSOLVER that cannot be captured).",
     )
     parser.add_argument(
         "--protocol-symmetric-updates",
@@ -1297,6 +1307,7 @@ def main(args: argparse.Namespace) -> None:
         orex_mcmc._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
     if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
         nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
+        nf_layer.graph_logdet = str(args.graph_logdet)
     if rank == 0 and bool(args.cuda_graphs):
         print("cuda_graphs=on", flush=True)
 
