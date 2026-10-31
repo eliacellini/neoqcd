@@ -10,8 +10,23 @@ from typing import Optional
 from neoqcd.utils import Defect, DefectBox
 
 
+_CONSTANTS = {}
+
+
+def _constant(key, build):
+    """A small device tensor built once per (key, device, dtype): a tensor made from Python data
+    inside a CUDA graph capture is a synchronous host-to-device copy, which the capture forbids,
+    so the constants of the sweep are created before it (the warm-up runs fill this cache)."""
+    value = _CONSTANTS.get(key)
+    if value is None:
+        value = build()
+        _CONSTANTS[key] = value
+    return value
+
+
 def _su2_sign(view_ndim, device, dtype):
-    return torch.tensor([1, -1], device=device, dtype=dtype).view([1] * view_ndim + [2])
+    sign = _constant(("su2_sign", str(device), dtype), lambda: torch.tensor([1, -1], device=device, dtype=dtype))
+    return sign.view([1] * view_ndim + [2])
 
 
 def _su2_haar_from_uniform(rand):
@@ -170,6 +185,11 @@ class HBOR():
         self.set_defect_parameter(defect_par)
 
     def _defect_parameter_uses_defect(self) -> bool:
+        # Decided on the host in set_defect_parameter and cached: inside a CUDA graph capture a
+        # device read is not allowed, and the branch is part of the graph key anyway.
+        return self._uses_defect
+
+    def _compute_uses_defect(self) -> bool:
         if torch.is_tensor(self.defect_par):
             return bool((self.defect_par < 1.0).any().item())
         return bool(self.defect_par < 1.0)
@@ -179,7 +199,8 @@ class HBOR():
             self.defect_par = defect_par.detach().to(device=self.device, dtype=torch.float64).reshape(-1)
         else:
             self.defect_par = float(defect_par)
-        if self._defect_parameter_uses_defect():
+        self._uses_defect = self._compute_uses_defect()
+        if self._uses_defect:
             self.sum_of_staples = self.sum_of_staples_defect
             self.heatbath = self.heatbath_defect
         else:
@@ -333,7 +354,11 @@ class HBOR():
         return kappa[mu]
 
     def _beta_for_staples(self, k):
-        beta = torch.as_tensor(self.beta, device=k.device, dtype=k.dtype)
+        if torch.is_tensor(self.beta):
+            beta = self.beta.to(device=k.device, dtype=k.dtype)
+        else:
+            beta = _constant(("beta", float(self.beta), str(k.device), k.dtype),
+                             lambda: torch.tensor(float(self.beta), device=k.device, dtype=k.dtype))
         if beta.dim() == 0:
             return beta
         beta = beta.reshape(-1)
@@ -618,7 +643,8 @@ def SU3_compute_RK(new_cfgs, staples, sel, phb):
 
 def SU2_left_multiply_SU3(links, subgroup, phb):
     """Apply an SU(2) subgroup update to just the two affected SU(3) rows."""
-    pair = torch.tensor([i for i in range(3) if i != phb], device=links.device)
+    pair = _constant(("pair", int(phb), str(links.device)),
+                     lambda: torch.tensor([i for i in range(3) if i != phb], device=links.device))
     rows = links.index_select(-2, pair)
     updated_rows = torch.matmul(subgroup, rows)
     return links.index_copy(-2, pair, updated_rows)
