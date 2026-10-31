@@ -20,6 +20,17 @@ def SUN_determinant(cfgs):
     return torch.linalg.det(cfgs)
 
 
+def det_small(M):
+    """Determinant of a batch of 2x2 matrices in closed form (3x3 and larger go through torch.linalg).
+
+    The heat-bath and over-relaxation updates work on SU(2) subgroup blocks: the closed form keeps
+    the sweep free of cuSOLVER calls, so that it can be captured in a CUDA graph.
+    """
+    if M.shape[-1] == 2:
+        return M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
+    return torch.linalg.det(M)
+
+
 def SU2_haar(shape, device=None, dtype=torch.float64, generator=None):
     """Draw exact Haar SU(2) first-row pairs with shape `shape`."""
     g = torch.randn(tuple(shape) + (4,), dtype=dtype, device=device, generator=generator)

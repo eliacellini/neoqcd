@@ -153,6 +153,10 @@ class HBOR():
 
         self.beta = beta
         self._subgroup_order = (0, 1, 2)  # SU(2) subgroups of each SU(3) link update
+        # CUDA graphs of whole sweeps, keyed by shapes, mask, branch and sweep direction: see
+        # _graphed_sweep. Off by default; main_pt_obc.py turns it on with --cuda-graphs.
+        self.use_cuda_graphs = False
+        self._graphs = {}
 
         if self.N==2:
             self.hb_update=self._su2_selected_hb
@@ -192,16 +196,85 @@ class HBOR():
         gives a self-adjoint update, as the detailed balance of the O-REX swap requires.
         """
 
+        if (self.use_cuda_graphs and cfgs.is_cuda and not torch.is_grad_enabled()
+                and not isinstance(mask, sun.MaskedLinks)):
+            return self._graphed_sweep(cfgs, mask, defect, rand, reverse)
         if rand is None:
-            rn_shape = list(cfgs.shape[:-2])
-            if self.N == 3:
-                rn_shape.insert(1, 18)
-            elif self.N == 2:
-                rn_shape.insert(1, 6)
-            rn_shape = tuple(rn_shape)
-            #extracting random numbers
-            rand = torch.rand(rn_shape, device=cfgs.device, dtype=cfgs.real.dtype)
+            rand = torch.rand(self._rand_shape(cfgs), device=cfgs.device, dtype=cfgs.real.dtype)
+        return self._sweep(cfgs, mask, defect, rand, reverse)
 
+    def _rand_shape(self, cfgs):
+        rn_shape = list(cfgs.shape[:-2])
+        rn_shape.insert(1, 18 if self.N == 3 else 6)
+        return tuple(rn_shape)
+
+    def _graph_key(self, cfgs, mask, defect, reverse):
+        parameter = (
+            ("batched",) if torch.is_tensor(self.defect_par) and self.defect_par.numel() > 1
+            else ("scalar", float(self.defect_par.reshape(-1)[0]) if torch.is_tensor(self.defect_par) else float(self.defect_par))
+        )
+        return (tuple(cfgs.shape), str(cfgs.dtype), id(mask), int(mask._version), id(defect),
+                self._defect_parameter_uses_defect(), bool(reverse), parameter)
+
+    def _graphed_sweep(self, cfgs, mask, defect, rand, reverse):
+        """Replay the CUDA graph of this sweep, capturing it on first use.
+
+        Static buffers hold the configurations, the heat-bath random numbers and the per-chain
+        defect coupling; the graph is keyed by the shapes, the mask, the "uses defect" branch,
+        the sweep direction and (for a scalar coupling) its value, all of which are decided on the
+        host before the capture. If the capture fails the sweep runs eagerly from then on.
+        """
+        key = self._graph_key(cfgs, mask, defect, reverse)
+        entry = self._graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._capture_sweep(cfgs, mask, defect, reverse)
+            except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
+                import warnings
+                warnings.warn(f"CUDA graph capture of the HBOR sweep failed, running eagerly: {type(err).__name__}: {err}")
+                self.use_cuda_graphs = False
+                if rand is None:
+                    rand = torch.rand(self._rand_shape(cfgs), device=cfgs.device, dtype=cfgs.real.dtype)
+                return self._sweep(cfgs, mask, defect, rand, reverse)
+            self._graphs[key] = entry
+        graph, static_cfgs, static_rand, static_par, static_out, _links = entry
+        static_cfgs.copy_(cfgs)
+        if rand is None:
+            static_rand.uniform_()
+        else:
+            static_rand.copy_(rand)
+        if static_par is not None:
+            static_par.copy_(self.defect_par)
+        graph.replay()
+        return static_out.clone()
+
+    def _capture_sweep(self, cfgs, mask, defect, reverse):
+        static_cfgs = cfgs.clone()
+        static_rand = torch.rand(self._rand_shape(cfgs), device=cfgs.device, dtype=cfgs.real.dtype)
+        # The index tables are read by the captured kernels: keep them alive with the graph.
+        links = self._links_for_mask(mask)
+        static_par = None
+        saved_par = self.defect_par
+        if torch.is_tensor(self.defect_par) and self.defect_par.numel() > 1:
+            static_par = self.defect_par.clone()
+            self.defect_par = static_par  # the captured kernels read this buffer
+        try:
+            # Warm-up on a side stream, as the CUDA graph documentation prescribes, then capture.
+            stream = torch.cuda.Stream(device=cfgs.device)
+            stream.wait_stream(torch.cuda.current_stream(device=cfgs.device))
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self._sweep(static_cfgs, links, defect, static_rand, reverse)
+            torch.cuda.current_stream(device=cfgs.device).wait_stream(stream)
+            # Each graph keeps its own memory pool: they are replayed in any order.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = self._sweep(static_cfgs, links, defect, static_rand, reverse)
+        finally:
+            self.defect_par = saved_par
+        return graph, static_cfgs, static_rand, static_par, static_out, links
+
+    def _sweep(self, cfgs, mask, defect, rand, reverse):
         links = mask if isinstance(mask, sun.MaskedLinks) else self._links_for_mask(mask)
         flat = sun.flat_links(cfgs, self.D)
         blocks = list(range(2 * self.D))
@@ -342,7 +415,7 @@ class HBOR():
     def _su2_selected_over(self, flat, links, m, defect, cfgs):
         staple = self._gathered_staples(cfgs, flat, links, m, defect)
         old = flat.index_select(1, links.links[m])
-        k = torch.sqrt(sun.SUN_determinant(staple).abs())
+        k = torch.sqrt(sun.det_small(staple).abs())
         good = k > 0
         safe = torch.where(good, k, torch.ones_like(k))
         V = sun.SUN_dagger(staple / safe.unsqueeze(-1).unsqueeze(-1))
@@ -366,7 +439,7 @@ class HBOR():
         colors = torch.arange(3, device=cfgs.device)
         for phb in self._subgroup_order:
             Rk = SU3_compute_RK(new, staple, colors, phb)
-            k = torch.sqrt(sun.SUN_determinant(Rk).abs())
+            k = torch.sqrt(sun.det_small(Rk).abs())
             good = k > 0
             safe = torch.where(good, k, torch.ones_like(k))
             V = sun.SUN_dagger(Rk / safe.unsqueeze(-1).unsqueeze(-1))
@@ -386,7 +459,7 @@ class HBOR():
         return torch.cat((torch.index_select(B, -2, idx0), AA, torch.index_select(B, -2, idx1)), -2)
 
     def heatbath_standard(self, staples, rand, factor):
-        k = torch.sqrt(sun.SUN_determinant(staples).abs())
+        k = torch.sqrt(sun.det_small(staples).abs())
         k0 = k > 0
         safe_k = torch.where(k0, k, torch.ones_like(k))
         xi = (self.N / 2.0) / (self._beta_for_staples(safe_k) * safe_k)
@@ -426,7 +499,7 @@ class HBOR():
 
     def SU2_link_update_over(self, cfgs, mu, defect):
         staples = self.sum_of_staples(cfgs, mu, defect)
-        k = torch.sqrt(sun.SUN_determinant(staples).abs())
+        k = torch.sqrt(sun.det_small(staples).abs())
 
         #this guarantees that links whose sum of staples has zero determinant do not generate nans
         k0 = k > 0
@@ -467,7 +540,7 @@ class HBOR():
         sel = torch.tensor([0, 1, 2], device=new_cfgs.device)
         for phb in range(phb_steps):
             Rk = SU3_compute_RK(new_cfgs, staples, sel, phb)
-            k = torch.sqrt(sun.SUN_determinant(Rk).abs())
+            k = torch.sqrt(sun.det_small(Rk).abs())
 
             #this guarantees that links whose sum of staples has zero determinant do not generate nans
             k0 = k > 0

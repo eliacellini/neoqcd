@@ -321,12 +321,19 @@ class DefectSNFProtocolLayer(torch.nn.Module):
     Deterministic defect-coupling NF block compatible with NEOREXProtocolWrapper.
     """
 
+    # CUDA graphs of the forward map and of the fixed-iteration inverse on the patch, keyed by the
+    # batch shape (see _graphed). Off by default; --cuda-graphs turns it on. Class attributes, so
+    # that subclasses with their own __init__ (the residual layer) inherit the eager default.
+    use_cuda_graphs = False
+    inverse_fixed_iterations = 10
+
     def __init__(self, flow_pars: FlowPars):
         super().__init__()
         self.flow_pars = flow_pars
         self.smearing_jacobian_version = LOGDET_VERSION
         rho0 = torch.zeros(flow_pars.rho_shape, device=flow_pars.device, dtype=torch.float64)
         self.layer = DefectCouplingLayer(flow_pars, rho0, time=1.0)
+        self._graphs = {}
 
     @property
     def checkpoint_semantics(self):
@@ -404,11 +411,76 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         self.layer.smearing.jac_shape = (int(local_batch),) + tuple(old_shape[1:])
         return old_shape
 
+    def _run_blocks(self, kind, small, bc, delta_bc):
+        """The patch map of `kind` ("forward"/"inverse") without any host-device sync, for capture."""
+        smearing = self.layer.smearing
+        rho = self.layer._rho(None)
+        mask, dmask = self.flow_pars.small_mask[-1], self.flow_pars.smeared_defect_mask[-1]
+        if kind == "forward":
+            out, _, logdet = smearing._forward_blocks(small, mask, rho, dmasking=True, dmask=dmask, beta=bc, delta_beta=delta_bc)
+            return out, logdet
+        (out, _, logdet), _ = smearing._inverse_blocks(
+            small, mask, rho, True, dmask, bc, delta_bc, 1e-12, 100, fixed_iterations=self.inverse_fixed_iterations
+        )
+        return out, logdet
+
+    def _graphed(self, kind, x, bc, delta_bc):
+        """Replay the CUDA graph of the patch map, capturing it on first use; the deferred checks
+        (c1 of every block, inverse residual) are read once after the replay and a failed check
+        repeats the call eagerly. Returns None when graphs are unavailable."""
+        from neoqcd.smearing_jacobian import DeferredChecks
+        bs = int(x.shape[0])
+        key = (kind, tuple(x.shape), str(x.dtype))
+        if not hasattr(self, "_graphs"):
+            self._graphs = {}
+        entry = self._graphs.get(key)
+        buffer = self.flow_pars.patch_buffer
+        if entry is None:
+            try:
+                static_small = self.flow_pars.defect.cut_defect(x, buffer=buffer).clone()
+                static_bc, static_delta = bc.clone(), delta_bc.clone()
+                old_jac_shape = self._set_local_jac_shape(bs)
+                try:
+                    stream = torch.cuda.Stream(device=x.device)
+                    stream.wait_stream(torch.cuda.current_stream(device=x.device))
+                    with torch.cuda.stream(stream):
+                        for _ in range(2):
+                            with DeferredChecks():
+                                self._run_blocks(kind, static_small, static_bc, static_delta)
+                    torch.cuda.current_stream(device=x.device).wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        with DeferredChecks() as checks:
+                            static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
+                finally:
+                    self.layer.smearing.jac_shape = old_jac_shape
+            except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
+                import warnings
+                warnings.warn(f"CUDA graph capture of the smearing layer {kind} failed, running eagerly: "
+                              f"{type(err).__name__}: {err}")
+                self.use_cuda_graphs = False
+                return None
+            entry = (graph, static_small, static_bc, static_delta, static_out, static_logdet, checks)
+            self._graphs[key] = entry
+        graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = entry
+        static_small.copy_(self.flow_pars.defect.cut_defect(x, buffer=buffer))
+        static_bc.copy_(bc)
+        static_delta.copy_(delta_bc)
+        graph.replay()
+        series_valid, residual = checks.resolve()
+        if not series_valid or (kind == "inverse" and not residual <= 1e-12):
+            return None
+        return self._embed_small_cfgs(static_out.clone(), x, buffer=buffer), static_logdet.clone()
+
     def forward(self, x: torch.Tensor, bc: torch.Tensor, delta_bc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bs = int(x.shape[0])
         bc = self._normalize_parameter(bc, bs, x.device)
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+        if self.use_cuda_graphs and x.is_cuda and not torch.is_grad_enabled():
+            graphed = self._graphed("forward", x, bc, delta_bc)
+            if graphed is not None:
+                return graphed[0], graphed[1].to(dtype=work_dtype)
         old_jac_shape = self._set_local_jac_shape(bs)
         try:
             x_small, _, dlogj = self.layer(
@@ -443,6 +515,10 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         bc = self._normalize_parameter(bc, bs, x.device)
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+        if self.use_cuda_graphs and x.is_cuda and not torch.is_grad_enabled() and not kwargs:
+            graphed = self._graphed("inverse", x, bc, delta_bc)
+            if graphed is not None:
+                return graphed[0], graphed[1].to(dtype=work_dtype)
         small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self._inverse_small(small_cfgs, bc, delta_bc, **kwargs)
         return self._embed_small_cfgs(small_cfgs, x, buffer=self.flow_pars.patch_buffer), logdet.to(dtype=work_dtype)
@@ -619,6 +695,12 @@ def parse_args() -> argparse.Namespace:
         "time-slice..time-slice+1, spatial range space-slice-1..space-slice+defect-size), each unit extends "
         "it by one site in every direction. Default: the whole lattice. The equilibrium sweeps between "
         "swaps always cover the whole lattice.",
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="Replay CUDA graphs of the HBOR sweeps (equilibrium and protocol) and of the defect smearing "
+        "layer, captured on first use; eager execution is the fallback when a capture fails.",
     )
     parser.add_argument(
         "--protocol-symmetric-updates",
@@ -1207,6 +1289,13 @@ def main(args: argparse.Namespace) -> None:
         action_by_idx.append(Wilson_action(flow_pars, beta=args.beta, defect_par=lam_f))
     # The equilibrium sweep runs on the whole local batch at once, with the bc of each chain.
     hbor_batched = HBOR(flow_pars, beta=args.beta, defect_par=float(parameter_min))
+    hbor_batched.use_cuda_graphs = bool(args.cuda_graphs)
+    if orex_mcmc is not None:
+        orex_mcmc._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
+    if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
+        nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
+    if rank == 0 and bool(args.cuda_graphs):
+        print("cuda_graphs=on", flush=True)
 
     cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0
     cache_mode = "disabled"

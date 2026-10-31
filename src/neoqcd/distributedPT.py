@@ -1037,22 +1037,20 @@ class NEOREXProtocolWrapper(nn.Module):
         else:
             if self.work_mode == "work":
                 raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
-            # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1.
+            # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1. The
+            # map and its inverse run on the whole batch and each chain keeps its own: the shapes
+            # stay static for CUDA graphs, and the layers are launch-bound, so the doubled GPU work
+            # costs no wall-clock time.
             down = down.expand(x.shape[0])
             parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
             parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
-            x_next, aux = x, torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
-            for idx, run in (
-                (torch.nonzero(~down).squeeze(-1), self._call_nf),
-                (torch.nonzero(down).squeeze(-1), self._call_nf_inverse),
-            ):
-                if idx.numel() == 0:
-                    continue
-                low = torch.minimum(parameter_0, parameter_1).index_select(0, idx)
-                step = (parameter_1 - parameter_0).abs().index_select(0, idx)
-                x_part, aux_part = run(x.index_select(0, idx), low, step)
-                x_next = x_next.index_copy(0, idx, x_part)
-                aux = aux.index_copy(0, idx, aux_part.to(device=x.device, dtype=work_dtype))
+            low = torch.minimum(parameter_0, parameter_1)
+            step = (parameter_1 - parameter_0).abs()
+            x_up, aux_up = self._call_nf(x, low, step)
+            x_down, aux_down = self._call_nf_inverse(x, low, step)
+            down_view = down.view((x.shape[0],) + (1,) * (x.dim() - 1))
+            x_next = torch.where(down_view, x_down, x_up)
+            aux = torch.where(down, aux_down.to(device=x.device, dtype=work_dtype), aux_up.to(device=x.device, dtype=work_dtype))
         aux = aux.to(device=x.device, dtype=work_dtype)
         if self.work_mode == "work":
             dwork = aux
@@ -1270,14 +1268,13 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parameter: torch.Tensor,
         active_idx: torch.Tensor,
     ) -> torch.Tensor:
+        # The whole batch is swept (static shapes for CUDA graphs); inactive chains keep x.
         if active_idx.numel() == 0:
             return x.detach()
-        x_active = x.index_select(0, active_idx)
-        parameter_active = parameter.index_select(0, active_idx)
-        x_updated = module._run_stochastic_blocks(x_active, parameter_active)
-        out = x.detach().clone()
-        out.index_copy_(0, active_idx, x_updated.detach())
-        return out
+        active = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+        active[active_idx] = True
+        x_updated = module._run_stochastic_blocks(x, parameter)
+        return torch.where(self._sample_mask_view(active, x), x_updated.detach(), x.detach())
 
     def _run_nf_block_active(
         self,
@@ -1286,25 +1283,14 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parameter_1: torch.Tensor,
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
-        x_active = x.index_select(0, active_idx)
-        parameter_0_active = parameter_0.index_select(0, active_idx)
-        parameter_1_active = parameter_1.index_select(0, active_idx)
-
-        x_next_active, dwork_active = self.ddp_flow(
-            x_active,
-            parameter_0_active,
-            parameter_1_active,
-            nf_only=True,
-        )
-        zero_anchor = dwork_active.sum() * 0.0
-        dwork = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype) + zero_anchor
-        if active_idx.numel() == 0:
-            return x, dwork
-
-        dwork = dwork.index_copy(0, active_idx, dwork_active.to(dtype=self.param_dtype))
-        x_next = x.clone()
-        x_next.index_copy_(0, active_idx, x_next_active)
+        # The flow runs on the whole batch (static shapes for CUDA graphs): inactive chains have
+        # parameter_1 == parameter_0 and their outputs are discarded.
+        active = active.to(device=x.device, dtype=torch.bool)
+        x_next_all, dwork_all = self.ddp_flow(x, parameter_0, parameter_1, nf_only=True)
+        zero_anchor = dwork_all.sum() * 0.0
+        dwork = torch.where(active, dwork_all.to(dtype=self.param_dtype),
+                            torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)) + zero_anchor
+        x_next = torch.where(self._sample_mask_view(active, x), x_next_all, x)
         return x_next, dwork
 
     def _eval_flow_local_protocol(
