@@ -690,6 +690,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--updates-per-layer", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=0,
+        help="Profile this many measurement steps (from the second one) on rank 0 with torch.profiler and "
+        "write the operator tables and the time of each phase to <output-dir>/step_profile.txt.",
+    )
+    parser.add_argument(
         "--save-link-work-values",
         action="store_true",
         help="For O-REX/NEO-REX, save every proposed swap work by ladder link to link_work_values.npz.",
@@ -1284,7 +1291,29 @@ def main(args: argparse.Namespace) -> None:
         )
 
     last_log_elapsed = 0.0
+    # Optional profile of whole REX steps on rank 0: the phases are labelled with record_function so
+    # that the table attributes the time to the equilibrium sweep, the swap step and the bookkeeping.
+    profiler = None
+    profile_first, profile_last = 1, int(args.profile_steps)  # steps [1, profile_steps]; step 0 warms up
+    phase_seconds = {}
+
+    def _phase_clock():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
     for step in range(args.steps):
+        profiling = rank == 0 and profile_first <= step <= profile_last
+        if profiling and profiler is None:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            profiler = torch.profiler.profile(activities=activities, record_shapes=False)
+            profiler.__enter__()
+        phase_t0 = _phase_clock() if profiling else None
+        region = torch.profiler.record_function("equilibrium_sweep") if profiling else None
+        if region is not None:
+            region.__enter__()
         for _ in range(args.sweeps_per_step):
             cfgs = local_hbor_sweep(
                 cfgs=cfgs,
@@ -1294,6 +1323,12 @@ def main(args: argparse.Namespace) -> None:
                 mask=mask,
                 defect_mask=defect_mask,
             )
+        if region is not None:
+            region.__exit__(None, None, None)
+            phase_seconds["equilibrium_sweep"] = phase_seconds.get("equilibrium_sweep", 0.0) + _phase_clock() - phase_t0
+            phase_t0 = _phase_clock()
+            region = torch.profiler.record_function("swap_step")
+            region.__enter__()
 
         stats = {"n_accepted": 0, "n_proposed": 0}
         train_flow = False
@@ -1355,6 +1390,12 @@ def main(args: argparse.Namespace) -> None:
                     total_flow_applied_updates += int(stats.get("applied_updates", 0))
                     total_flow_skipped_updates += int(stats.get("skipped_nan_grad_updates", 0))
 
+        if region is not None:
+            region.__exit__(None, None, None)
+            phase_seconds["swap_step"] = phase_seconds.get("swap_step", 0.0) + _phase_clock() - phase_t0
+            phase_t0 = _phase_clock()
+            region = torch.profiler.record_function("bookkeeping")
+            region.__enter__()
         if bool(args.save_replica_history):
             # The plaquette of each local chain (whole lattice, Re Tr / N), gathered to rank 0 and
             # stored with the rung its slot carries now, so the carrier of any rung can be followed.
@@ -1541,6 +1582,28 @@ def main(args: argparse.Namespace) -> None:
                 )
             if history_labels:
                 save_replica_history()
+        if region is not None:
+            region.__exit__(None, None, None)
+            phase_seconds["bookkeeping"] = phase_seconds.get("bookkeeping", 0.0) + _phase_clock() - phase_t0
+        if profiler is not None and step == profile_last:
+            profiler.__exit__(None, None, None)
+            averages = profiler.key_averages()
+            n_prof = profile_last - profile_first + 1
+            with open(out_dir / "step_profile.txt", "w", encoding="utf-8") as handle:
+                handle.write(f"# {n_prof} REX steps of {args.algorithm} at batch {args.batch_size}, device {device}\n")
+                handle.write("# seconds per step by phase (device synchronized):\n")
+                for name, seconds in phase_seconds.items():
+                    handle.write(f"#   {name:20s} {seconds / n_prof:8.3f}\n")
+                handle.write(f"# operators by self {device.type} time\n")
+                handle.write(averages.table(sort_by=f"self_{device.type}_time_total", row_limit=40))
+                handle.write("\n# operators by self cpu time\n")
+                handle.write(averages.table(sort_by="self_cpu_time_total", row_limit=40))
+                handle.write("\n# operators by call count\n")
+                for event in sorted(averages, key=lambda e: -e.count)[:40]:
+                    handle.write(f"{event.key:60s} {event.count:8d}\n")
+            print("step_profile_phases=" + json.dumps({k: round(v / n_prof, 4) for k, v in phase_seconds.items()})
+                  + f"  step_profile_path={out_dir / 'step_profile.txt'}", flush=True)
+            profiler = None
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []

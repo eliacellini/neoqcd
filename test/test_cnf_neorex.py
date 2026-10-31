@@ -129,6 +129,7 @@ class CNFNEOREXTest(unittest.TestCase):
                 "--batch-size", "2", "--neorex-protocol-steps", "1",
                 "--thermal-steps", "0", "--steps", "2", "--orsteps", "0",
                 "--no-cfg-cache", "--output-dir", str(output_dir), "--main-dir", str(root),
+                "--profile-steps", "1",
             ]
             with mock.patch.object(sys, "argv", ["main_pt_obc", *argv]):
                 args = MAIN.parse_args()
@@ -149,6 +150,10 @@ class CNFNEOREXTest(unittest.TestCase):
             self.assertIn("work", meta)
             self.assertEqual(meta["replica_history"]["error"], "RuntimeError: gamma broke")
             self.assertTrue((output_dir / "replica_history.npz").exists())
+            profile = (output_dir / "step_profile.txt").read_text(encoding="utf-8")
+            self.assertIn("equilibrium_sweep", profile)
+            self.assertIn("swap_step", profile)
+            self.assertIn("operators by self cpu time", profile)
 
     def test_multirank_gloo_swaps_every_link_without_training_the_field(self):
         self._run_multirank(dict(CONFIG), world_size=3)
