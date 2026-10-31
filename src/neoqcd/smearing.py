@@ -4,7 +4,7 @@ from torch.profiler import record_function
 import numpy as np
 import neoqcd.sun_utils as sun
 from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
-from neoqcd.smearing_jacobian import StepQuantities, exp_coefficients, inverse_smearing_step, smearing_step
+from neoqcd.smearing_jacobian import DeferredChecks, StepQuantities, exp_coefficients, inverse_smearing_step, smearing_step
 from neoqcd.nn import HTCNN
 from neoqcd.utils import residual_patch_buffer, set_defect_rho_from_fits
 
@@ -1429,6 +1429,18 @@ class Smearing(torch.nn.Module):
         return rho_runtime[:, sm, m, :] if batched_rho else rho_runtime[sm, m, :]
 
     def forward(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
+        """The smearing layer; on the SU(3) stout path the series branch of the exp(iQ) coefficients is
+        taken for every block and c1 is checked once at the end (one host-device sync instead of
+        one per block); if some c1 was too large the call is repeated with the per-block choice."""
+        use_selected_links = self.N == 3 and not self.use_nn
+        if use_selected_links:
+            with DeferredChecks() as checks:
+                out = self._forward_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta)
+            if checks.resolve()[0]:
+                return out
+        return self._forward_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta)
+
+    def _forward_blocks(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
         real_dtype = cfgs.real.dtype
         bs = cfgs.shape[0]
         dlogJ = torch.zeros(bs, dtype=real_dtype, device=cfgs.device)
@@ -1495,16 +1507,35 @@ class Smearing(torch.nn.Module):
         return cfgs, 0, dlogJ
 
     def inverse(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None,
-                tol=1e-12, max_iter=100):
+                tol=1e-12, max_iter=100, fixed_iterations=10):
         """
         Inverse of forward (SU(3) stout path) with the same rho arguments: the masked updates are
         undone in reverse order. The staples of a mask contain only links it leaves fixed, so they
         are the same before and after its update and each link is inverted on its own.
-        Returns (cfgs, 0, logdet of the inverse map); iteration counts and the largest residual
-        are left in self.last_inverse_stats.
+        Every block first runs `fixed_iterations` of the fixed point (at most max_iter; the profile of
+        2026-10-30 needed at most 8 on the trained defect layer) with the
+        series coefficients and no host-device sync; the residuals and c1 are checked once at the
+        end, and if any check fails the inverse is repeated with the adaptive iteration and the
+        per-block checks. Returns (cfgs, 0, logdet of the inverse map); iteration counts and the
+        largest residual are left in self.last_inverse_stats.
         """
         if self.N != 3 or self.use_nn:
             raise NotImplementedError("the inverse is implemented for the SU(3) stout path only")
+        if fixed_iterations:
+            with DeferredChecks() as checks:
+                out, stats = self._inverse_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta,
+                                                  tol, max_iter, fixed_iterations=min(int(fixed_iterations), int(max_iter)))
+            series_valid, residual = checks.resolve()
+            if series_valid and residual <= tol:
+                stats["residual"] = residual
+                self.last_inverse_stats = stats
+                return out
+        out, stats = self._inverse_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta, tol, max_iter)
+        self.last_inverse_stats = stats
+        return out
+
+    def _inverse_blocks(self, cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta, tol, max_iter,
+                        fixed_iterations=None):
         rho_runtime, batched_rho = self._runtime_rho(cfgs, rho_layer, beta, delta_beta)
         links = self._links_for_smearing_mask(mask, dmask if dmasking else None)
         flat = sun.flat_links(cfgs, self.D)
@@ -1519,19 +1550,20 @@ class Smearing(torch.nn.Module):
                 rho = self._mask_rho(rho_runtime, batched_rho, sm, m)
                 C = self._selected_stout_staples(flat, cfg_shape, links, m, rho)
                 U, logdet, iterations, residual = inverse_smearing_step(
-                    flat.index_select(1, links.links[m]), C, tol=tol, max_iter=max_iter
+                    flat.index_select(1, links.links[m]), C, tol=tol, max_iter=max_iter,
+                    fixed_iterations=fixed_iterations,
                 )
-                if not residual <= tol:
-                    raise RuntimeError(
-                        f"stout inverse did not converge for mask {m}: residual {float(residual):.3e} "
-                        f"after {iterations} iterations"
-                    )
+                if fixed_iterations is None:
+                    if not residual <= tol:
+                        raise RuntimeError(
+                            f"stout inverse did not converge for mask {m}: residual {float(residual):.3e} "
+                            f"after {iterations} iterations"
+                        )
+                    stats["residual"] = max(stats["residual"], float(residual))
                 flat = flat.index_copy(1, links.links[m], U)
                 dlogJ = dlogJ + logdet.sum(dim=1)
                 stats["iterations"].append(iterations)
-                stats["residual"] = max(stats["residual"], float(residual))
-        self.last_inverse_stats = stats
-        return flat.reshape(cfg_shape), 0, dlogJ
+        return (flat.reshape(cfg_shape), 0, dlogJ), stats
 
     def _class_dmask(self, dmask):
         """

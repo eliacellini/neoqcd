@@ -215,13 +215,70 @@ def series_coefficients(c0, c1, order):
     im = monomials @ table[1, :, :3 * K]
     return list(torch.complex(re, im).unflatten(-1, (K, 3)).unbind(-2))
 
+class DeferredChecks:
+    """The device-side checks of one layer call, collected so that they cost a single sync at the end.
+
+    Inside `with DeferredChecks() as checks:` exp_coefficients takes the series branch without
+    asking the device whether every c1 < C1_SERIES, and records the largest c1; inverse steps with a
+    fixed iteration count record their residual instead of testing it. `checks.resolve()` syncs
+    once and returns (series_valid, largest_residual); the caller repeats the call the plain way
+    when a check fails, which the small rho of a flow makes rare. The scope is per thread.
+    """
+
+    def __init__(self):
+        self.c1_max = None
+        self.residual_max = None
+        self._previous = None
+
+    def __enter__(self):
+        global _DEFERRED
+        self._previous = _DEFERRED
+        _DEFERRED = self
+        return self
+
+    def __exit__(self, *exc):
+        global _DEFERRED
+        _DEFERRED = self._previous
+
+    @staticmethod
+    def _max(current, value):
+        if value.numel() == 0:
+            return current
+        value = value.detach().reshape(-1).max()
+        return value if current is None else torch.maximum(current, value)
+
+    def note_c1(self, c1):
+        self.c1_max = self._max(self.c1_max, c1)
+
+    def note_residual(self, residual):
+        self.residual_max = self._max(self.residual_max, residual)
+
+    def resolve(self):
+        """(every c1 was below C1_SERIES, largest inverse residual) with one host-device sync."""
+        values = [
+            torch.zeros(()) if self.c1_max is None else self.c1_max,
+            torch.zeros(()) if self.residual_max is None else self.residual_max,
+        ]
+        device = next((v.device for v in values if v.device.type != "cpu"), torch.device("cpu"))
+        c1_max, residual_max = torch.stack([v.to(device=device, dtype=torch.double) for v in values]).tolist()
+        return c1_max < C1_SERIES, residual_max
+
+
+_DEFERRED = None
+
+
 def exp_coefficients(c0, c1, order=1):
     # Coefficients (see the section banner) for any c1: the Taylor series below C1_SERIES, the closed
     # forms of Morningstar and Peardon above, evaluated only on the links that need them. Finding them
-    # costs one host-device sync. Usually no link needs them: c1 <= 9/8 (sum_p |rho_p|)^2 (see
-    # notes/stout_smearing_backward.tex, paragraph "Small Q"), below C1_SERIES for small rho.
+    # costs one host-device sync, unless a DeferredChecks scope is active: then the series is used
+    # and c1 is recorded for the check at the end of the scope. Usually no link needs the closed
+    # forms: c1 <= 9/8 (sum_p |rho_p|)^2 (see notes/stout_smearing_backward.tex, paragraph "Small
+    # Q"), below C1_SERIES for small rho.
     shape = c1.shape
     c0, c1 = c0.reshape(-1), c1.reshape(-1)
+    if _DEFERRED is not None:
+        _DEFERRED.note_c1(c1)
+        return [x.reshape(shape + (3,)) for x in series_coefficients(c0, c1, order)]
     small = c1 < C1_SERIES
     if bool(small.all()):
         return [x.reshape(shape + (3,)) for x in series_coefficients(c0, c1, order)]
@@ -327,11 +384,22 @@ def smearing_step(U, C):
     logdet = torch.linalg.slogdet(jacobian_matrix(stepq.jacobian())).logabsdet
     return stepq.Up, logdet
 
-def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100, check_every=4):
+def inverse_smearing_step(Up, C, tol=1e-12, max_iter=100, check_every=4, fixed_iterations=None):
     # Inverse of smearing_step at fixed staple sums C, by the fixed-point iteration of
     # sun.invert_left_update, testing convergence every check_every iterations (each test waits for
-    # the device). Returns U, the log|det| of the inverse map (minus the forward one at U),
-    # the number of iterations and the largest residual |exp(iQ) U - Up|.
+    # the device). With fixed_iterations the iteration runs exactly that many times without any
+    # test, and the residual is returned as a device tensor (recorded by an active DeferredChecks
+    # scope) for the caller to check once. Returns U, the log|det| of the inverse map (minus the
+    # forward one at U), the number of iterations and the largest residual |exp(iQ) U - Up|.
+    if fixed_iterations is not None:
+        left_factor = lambda V: StepQuantities(V, C).X
+        U = Up
+        for _ in range(int(fixed_iterations)):
+            U = sun.SUN_mul(sun.SUN_dagger(left_factor(U)), Up)
+        residual = (sun.SUN_mul(left_factor(U), U) - Up).abs().amax() if Up.numel() else torch.zeros((), device=Up.device)
+        if _DEFERRED is not None:
+            _DEFERRED.note_residual(residual)
+        return U, -smearing_step(U, C)[1], int(fixed_iterations), residual
     U, iterations, residual = sun.invert_left_update(
         lambda V: StepQuantities(V, C).X, Up, tol=tol, max_iter=max_iter, check_every=check_every
     )

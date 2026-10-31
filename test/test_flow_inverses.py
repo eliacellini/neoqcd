@@ -287,3 +287,65 @@ class PerSiteModeTests(ClassModeTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferredChecksTests(unittest.TestCase):
+    """The series-only forward and the fixed-iteration inverse match the per-block checked paths."""
+
+    def setUp(self):
+        torch.manual_seed(5)
+        _, self.pars, _ = build_cnf(_defect_config(batch_size=2))
+        self.layer = DefectCouplingLayer(self.pars, torch.zeros(self.pars.rho_shape, dtype=torch.double), time=1.0)
+        with torch.no_grad():
+            for parameter in self.layer.smearing.hyper_smearing.mlp.parameters():
+                parameter.add_(0.3 * torch.randn_like(parameter))
+        self.cfgs = sun.SUN_haar((2, 4, self.pars.T, self.pars.L, self.pars.L, self.pars.L, 3), dtype=torch.cdouble)
+        self.bc = torch.tensor([0.3, 0.6], dtype=torch.double)
+        self.delta = torch.full((2,), 1 / 7, dtype=torch.double)
+
+    def test_forward_takes_the_series_branch_once_checked_and_matches_the_plain_path(self):
+        from neoqcd import smearing_jacobian as sj
+        smearing = self.layer.smearing
+        with torch.no_grad():
+            fast, _, logdet_fast = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=self.delta)
+            # The plain path: per-block branch choice with its sync, which the scope removes.
+            with mock.patch.object(sj.DeferredChecks, "resolve", return_value=(False, 0.0)):
+                slow, _, logdet_slow = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=self.delta)
+        torch.testing.assert_close(fast, slow, rtol=0, atol=0)
+        torch.testing.assert_close(logdet_fast, logdet_slow, rtol=0, atol=0)
+        # Inside a scope no sync happens: resolve is the only place that reads the device.
+        with torch.no_grad(), sj.DeferredChecks() as checks, mock.patch("torch.Tensor.all", side_effect=AssertionError("sync")):
+            smearing._forward_blocks(self.pars.defect.cut_defect(self.cfgs, buffer=2), self.pars.small_mask[-1],
+                                     None, dmasking=True, dmask=self.pars.smeared_defect_mask[-1], beta=self.bc, delta_beta=self.delta)
+        self.assertIsNotNone(checks.c1_max)
+        self.assertTrue(checks.resolve()[0])
+
+    def test_fixed_iteration_inverse_matches_the_adaptive_one(self):
+        with torch.no_grad():
+            forward, _, logdet = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=self.delta)
+            # Haar links and a large rho need more than the production default of 10 iterations.
+            fixed, _, logdet_fixed = self.layer.inverse(forward, self.pars, None, beta=self.bc, delta_beta=self.delta,
+                                                        fixed_iterations=24)
+            stats_fixed = dict(self.layer.smearing.last_inverse_stats)
+            adaptive, _, logdet_adaptive = self.layer.inverse(forward, self.pars, None, beta=self.bc, delta_beta=self.delta,
+                                                              fixed_iterations=0)
+            stats_adaptive = dict(self.layer.smearing.last_inverse_stats)
+        self.assertEqual(set(stats_fixed["iterations"]), {24})
+        self.assertLessEqual(stats_fixed["residual"], 1e-12)
+        self.assertNotEqual(set(stats_adaptive["iterations"]), {24})
+        torch.testing.assert_close(fixed, adaptive, rtol=0, atol=1e-12)
+        torch.testing.assert_close(fixed, self.cfgs, rtol=0, atol=1e-11)
+        torch.testing.assert_close(logdet_fixed, logdet_adaptive, rtol=0, atol=1e-11)
+        torch.testing.assert_close(logdet_fixed, -logdet, rtol=0, atol=1e-10)
+
+    def test_a_failed_check_falls_back_to_the_adaptive_inverse(self):
+        from neoqcd import smearing_jacobian as sj
+        with torch.no_grad():
+            forward, _, _ = self.layer(self.cfgs, self.pars, None, beta=self.bc, delta_beta=self.delta)
+            with mock.patch.object(sj.DeferredChecks, "resolve", return_value=(True, 1.0)):
+                back, _, _ = self.layer.inverse(forward, self.pars, None, beta=self.bc, delta_beta=self.delta)
+        self.assertNotEqual(set(self.layer.smearing.last_inverse_stats["iterations"]), {10})
+        torch.testing.assert_close(back, self.cfgs, rtol=0, atol=1e-11)
+        # max_iter caps the fixed count too, so an impossible budget still raises through the fallback.
+        with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "did not converge"):
+            self.layer.inverse(forward, self.pars, None, beta=self.bc, delta_beta=self.delta, max_iter=1)
