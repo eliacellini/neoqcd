@@ -7,8 +7,13 @@
    (31/10): `--cuda-graphs` cattura gli sweep HBOR e la mappa/inversa dello smearing con buffer
    statici, serie di exp(iQ) con controllo di c1 dopo il replay (`DeferredChecks`), inversa a 10
    iterazioni fisse con controllo finale e ripiego senza graph; test su GPU in
-   `test/test_cuda_graphs.py`. Resta il residual: prima vanno tolte le copie dell'intero reticolo
-   per chiamata (192 memcpy nel profilo del 30/10), poi il controllo `delta == 0` va fuori dal graph.
+   `test/test_cuda_graphs.py`. Validato a 2 nodi il 31/10 (K=2, batch 64, patch h=1, update
+   simmetrici): O-REX da 1.31 a 0.92 s/step, NEO-REX smearing class da 2.05 a 1.72 s/step, stessa
+   fisica; con NCCL serve `NCCL_ASYNC_ERROR_HANDLING=0` (lo esporta `job/debug_neorex_eval.sh`,
+   va aggiunto a ogni job script di produzione che passi `--cuda-graphs`). Resta il residual: prima
+   vanno tolte le copie dell'intero reticolo per chiamata (192 memcpy nel profilo del 30/10), poi il
+   controllo `delta == 0` va fuori dal graph. Lo sweep HBOR non guadagna dai graph (è al pavimento
+   della latenza dei kernel GPU): servono meno kernel per stadio (fusione, Triton).
 
 2. **HBOR solo sulla regione del difetto** lungo i protocolli, come nel paper O-REX
    (arXiv:2510.25704): fatto con `--protocol-patch-halfsize h` (scatola attorno al difetto,
