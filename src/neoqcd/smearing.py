@@ -1438,6 +1438,7 @@ class Smearing(torch.nn.Module):
                 out = self._forward_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta)
             if checks.resolve()[0]:
                 return out
+            del out  # drop the first pass (and its autograd graph) before repeating it
         return self._forward_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta)
 
     def _forward_blocks(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
@@ -1530,6 +1531,7 @@ class Smearing(torch.nn.Module):
                 stats["residual"] = residual
                 self.last_inverse_stats = stats
                 return out
+            del out, stats
         out, stats = self._inverse_blocks(cfgs, mask, rho_layer, dmasking, dmask, beta, delta_beta, tol, max_iter)
         self.last_inverse_stats = stats
         return out
