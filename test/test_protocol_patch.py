@@ -46,7 +46,8 @@ class ProtocolPatchMaskTest(unittest.TestCase):
             patch_sites, reference_sites = patch.any(dim=0), reference.any(dim=0)
             for axis in range(4):
                 others = tuple(a for a in range(4) if a != axis)
-                self.assertTrue(torch.equal(patch_sites.any(dim=others), reference_sites.any(dim=others)), axis)
+                # (sum over the other axes: torch 2.0 does not take a tuple of dims in any())
+                self.assertTrue(torch.equal(patch_sites.sum(dim=others) > 0, reference_sites.sum(dim=others) > 0), axis)
             # The box holds every link at its sites, the strict set fewer: 512 against 104 for dsize 2.
             self.assertEqual(int(patch.sum()), 4 * 2 * (dsize + 2) ** 3)
             if dsize == 2:
