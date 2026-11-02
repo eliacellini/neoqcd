@@ -116,12 +116,17 @@ def tau_int(series: np.ndarray, S: float = 2.0, min_steps: int = 8) -> dict:
     }
 
 
+TIME_BLOCKS = 20  # jackknife blocks of steps when the run has a single chain slot
+
+
 def rung_moments(labels: np.ndarray, values: np.ndarray, n_rungs: int, discard_fraction: float = 0.2) -> dict:
     """Mean and variance of an observable on each rung, after dropping the first `discard_fraction` of
     the steps, pooled over steps and chain slots. The errors are jackknife errors over the B chain
     slots: the B ladders of the batch are independent Markov chains, so the errors include the
-    autocorrelation whatever its length. The variance of the defect action on each rung is the
-    metric of the optimal ladder (neoqcd.ladder)."""
+    autocorrelation whatever its length. With one chain slot (batch 1) the jackknife runs over
+    `TIME_BLOCKS` consecutive blocks of steps instead, which holds when the autocorrelation is much
+    shorter than a block. The variance of the defect action on each rung is the metric of the optimal
+    ladder (neoqcd.ladder)."""
     labels = np.asarray(labels)
     values = np.asarray(values, dtype=np.float64)
     if not 0.0 <= float(discard_fraction) < 1.0:
@@ -140,14 +145,23 @@ def rung_moments(labels: np.ndarray, values: np.ndarray, n_rungs: int, discard_f
         mean = float(total.sum() / series.size)
         result["mean"].append(mean)
         result["variance"].append(float(total_sq.sum() / series.size - mean * mean))
-        if n_chains < 2:
+        if n_chains >= 2:  # jackknife groups: the chain slots
+            count = np.full(n_chains, float(n_steps))
+        else:  # one slot: consecutive blocks of steps
+            edges = np.linspace(0, n_steps, min(TIME_BLOCKS, n_steps) + 1).round().astype(np.int64)
+            column = series[:, 0]
+            total = np.add.reduceat(column, edges[:-1])
+            total_sq = np.add.reduceat(column * column, edges[:-1])
+            count = np.diff(edges).astype(np.float64)
+        n_groups = total.size
+        if n_groups < 2:
             result["mean_error"].append(float("nan"))
             result["variance_error"].append(float("nan"))
             continue
-        n_left = (n_chains - 1) * n_steps
+        n_left = series.size - count
         jk_mean = (total.sum() - total) / n_left
         jk_var = (total_sq.sum() - total_sq) / n_left - jk_mean * jk_mean
-        scale = (n_chains - 1) / n_chains
+        scale = (n_groups - 1) / n_groups
         result["mean_error"].append(float(math.sqrt(scale * np.sum((jk_mean - jk_mean.mean()) ** 2))))
         result["variance_error"].append(float(math.sqrt(scale * np.sum((jk_var - jk_var.mean()) ** 2))))
     return result

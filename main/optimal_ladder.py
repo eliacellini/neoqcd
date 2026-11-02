@@ -74,6 +74,12 @@ def pool(points: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> tuple[np.nd
     out_c, out_var, out_err = [], [], []
     for key in np.unique(keys):
         sel = keys == key
+        if np.count_nonzero(sel) == 1 or not np.all(np.isfinite(err[sel])):
+            # one point, or errors unknown: plain mean
+            out_c.append(float(c[sel][0]))
+            out_var.append(float(np.mean(var[sel])))
+            out_err.append(float(np.sqrt(np.sum(err[sel] ** 2)) / np.count_nonzero(sel)))
+            continue
         w = 1.0 / np.maximum(err[sel], 1e-300) ** 2
         out_c.append(float(c[sel][0]))
         out_var.append(float(np.sum(w * var[sel]) / np.sum(w)))

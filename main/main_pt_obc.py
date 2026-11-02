@@ -794,6 +794,14 @@ def parse_args() -> argparse.Namespace:
     # Run control
     parser.add_argument("--thermal-steps", type=int, default=10)
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument(
+        "--max-run-minutes",
+        type=float,
+        default=0.0,
+        help="Stop the measurement before the step that would end after this many minutes from the start of "
+        "main (projected with 1.5 times the mean step time) and write every output as at the end of a full run; "
+        "0 = off. Set it a few minutes below the job time limit.",
+    )
     parser.add_argument("--sweeps-per-step", type=int, default=1)
     parser.add_argument("--sweep", type=int, default=None, help="Alias of --sweeps-per-step")
     parser.add_argument("--swap-every", type=int, default=1)
@@ -1017,6 +1025,7 @@ def _default_wandb_run_name(args: argparse.Namespace, world_size: int) -> str:
 
 
 def main(args: argparse.Namespace) -> None:
+    run_t0 = time.time()
     if args.algorithm == "neorex" and args.nf_layer_type == "cnf":
         args.neorex_eval_flow = True
     state = setup_runtime(args)
@@ -1484,7 +1493,23 @@ def main(args: argparse.Namespace) -> None:
             torch.cuda.synchronize(device)
         return time.perf_counter()
 
+    stop_after_s = 60.0 * float(args.max_run_minutes)
+    loop_t0 = time.time()
+    steps_completed = 0
     for step in range(args.steps):
+        if stop_after_s > 0 and step > 0:
+            # Rank 0 decides and broadcasts, so every rank leaves the loop after the same step.
+            stop = [False]
+            if rank == 0:
+                now = time.time()
+                stop[0] = (now - run_t0) + 1.5 * (now - loop_t0) / step > stop_after_s
+            dist.broadcast_object_list(stop, src=0)
+            if stop[0]:
+                if rank == 0:
+                    print(f"time_limit_stop=1  steps_completed={step}  steps_requested={args.steps}  "
+                          f"max_run_minutes={args.max_run_minutes}", flush=True)
+                break
+        steps_completed = step + 1  # this step runs to the end: a stop is decided only at the top of a step
         profiling = rank == 0 and profile_first <= step <= profile_last
         if profiling and profiler is None:
             activities = [torch.profiler.ProfilerActivity.CPU]
@@ -1856,6 +1881,9 @@ def main(args: argparse.Namespace) -> None:
             "measurement_seconds": float(measurement_elapsed),
             "total_seconds": float(total_elapsed),
         }
+        meta["steps_requested"] = int(args.steps)
+        meta["steps_completed"] = int(steps_completed)
+        meta["stopped_by_time_limit"] = bool(steps_completed < int(args.steps))
         meta["swap"] = {
             "acceptance_mean": float(mean_swap_acc),
             "total_accepted": int(total_swap_accepted),

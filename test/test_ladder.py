@@ -107,6 +107,19 @@ class RungMomentsTest(unittest.TestCase):
         summary = summarize_history(labels, values, world, defect_action=values)
         self.assertEqual(summary["defect_action"]["variance"], rung_moments(labels, values, world)["variance"])
 
+    def test_single_chain_slot_gets_time_block_errors(self):
+        rng = np.random.default_rng(1)
+        steps, world = 4000, 3
+        sigma = np.array([1.0, 2.0, 3.0])
+        labels = np.stack([rng.permutation(world)[:, None] for _ in range(steps)])  # (steps, world, 1)
+        values = rng.normal(size=labels.shape) * sigma[labels]
+        moments = rung_moments(labels, values, world, discard_fraction=0.2)
+        for r in range(world):
+            self.assertTrue(math.isfinite(moments["variance_error"][r]))
+            # 20 blocks of independent samples, 3200 samples on each rung: sigma^2 sqrt(2 / 3200).
+            self.assertAlmostEqual(moments["variance_error"][r] / (sigma[r] ** 2 * math.sqrt(2 / 3200)), 1.0, delta=0.5)
+            self.assertAlmostEqual(moments["variance"][r], sigma[r] ** 2, delta=5 * moments["variance_error"][r])
+
 
 class DefectActionTest(unittest.TestCase):
     def test_defect_action_is_the_exact_derivative(self):
@@ -229,6 +242,35 @@ class MainLadderTest(unittest.TestCase):
             moments = meta["replica_history"]["defect_action"]
             self.assertEqual(moments["parameter_ladder"], [0.0, 0.3, 1.0])
             self.assertTrue(all(v >= 0 for v in moments["variance"]))
+
+
+class TimeLimitStopTest(unittest.TestCase):
+    def test_run_stops_before_the_time_limit_and_writes_every_output(self):
+        world_size, batch_size, steps = 3, 2, 10000
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = os.path.join(directory, "run")
+            argv = [
+                "--cpu", "--algorithm", "orex", "--orex-protocol-steps", "1",
+                "--D", "4", "--T", "4", "--L", "4", "--N", "3",
+                "--defect-size", "1", "--time-slice", "1", "--space-slice", "1", "--beta", "6",
+                "--parameter-ladder", "0,0.3,1", "--batch-size", str(batch_size),
+                "--thermal-steps", "1", "--steps", str(steps), "--orsteps", "0", "--log-every", "1",
+                "--save-link-work-values", "--max-run-minutes", "0.1",
+                "--no-cfg-cache", "--output-dir", output_dir, "--main-dir", directory,
+            ]
+            mp.spawn(_multirank_worker, args=(world_size, _free_port(), argv), nprocs=world_size, join=True)
+            with open(os.path.join(output_dir, "run_meta.json")) as f:
+                meta = json.load(f)
+            completed = meta["steps_completed"]
+            self.assertTrue(meta["stopped_by_time_limit"])
+            self.assertEqual(meta["steps_requested"], steps)
+            self.assertGreater(completed, 0)
+            self.assertLess(completed, steps)
+            self.assertLess(meta["timing"]["total_seconds"], 6.0)
+            history = np.load(os.path.join(output_dir, "replica_history.npz"))
+            self.assertEqual(history["labels"].shape[0], completed)
+            self.assertTrue(os.path.exists(os.path.join(output_dir, "link_work_values.npz")))
+            self.assertEqual(meta["swap"]["total_proposed"] > 0, True)
 
 
 class TrainerDEOTest(unittest.TestCase):
