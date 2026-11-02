@@ -24,6 +24,10 @@ export OMP_NUM_THREADS=1
 export NCCL_SHM_DISABLE=1
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
+# Processes (one per GPU) per node: 4, or what sbatch --gpus-per-node gives. Leonardo bills by CPU, 8 per
+# GPU: with fewer GPUs per node pass --cpus-per-task 8 x GPUs too (3 GPUs and 24 CPUs cost 3/4 of a node).
+NPROC="${NPROC:-${SLURM_GPUS_PER_NODE:-4}}"
+NPROC="${NPROC##*:}"
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 OUT="reports/pg_distributed_${SLURM_JOB_ID}"
 
@@ -42,5 +46,5 @@ mkdir -p "$OUT"
 srun bash -c "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv -l 2 \
   > $OUT/gpu_utilization.node\$SLURM_NODEID.csv & \
   python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
-  --nproc_per_node=4 --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+  --nproc_per_node=$NPROC --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
   main/main_cnf_rex.py ${ARGS[*]}; status=\$?; kill \$!; exit \$status"

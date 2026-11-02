@@ -34,6 +34,10 @@ export NCCL_SHM_DISABLE=1
 case " $* " in *" --cuda-graphs "*) export NCCL_ASYNC_ERROR_HANDLING=0 ;; esac
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
+# Processes (one per GPU) per node: 4, or what sbatch --gpus-per-node gives. Leonardo bills by CPU, 8 per
+# GPU: with fewer GPUs per node pass --cpus-per-task 8 x GPUs too (3 GPUs and 24 CPUs cost 3/4 of a node).
+NPROC="${NPROC:-${SLURM_GPUS_PER_NODE:-4}}"
+NPROC="${NPROC##*:}"
 K="${K:-4}"
 STEPS="${STEPS:-300}"
 CNF_STEPS="${CNF_STEPS:-1}"
@@ -73,6 +77,6 @@ for entry in ${METHODS:?set METHODS}; do
   ARGS=("${COMMON[@]}" "${ALG[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${K}" "$@")
   # SLURM_NODEID must expand on each node, not on the batch host.
   srun bash -c "python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
-    --nproc_per_node=4 --rdzv_id=${SLURM_JOB_ID}_${name} --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    --nproc_per_node=$NPROC --rdzv_id=${SLURM_JOB_ID}_${name} --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     main/main_pt_obc.py ${ARGS[*]}"
 done
