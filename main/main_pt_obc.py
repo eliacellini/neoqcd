@@ -26,12 +26,13 @@ from neoqcd.distributedPT import (
 )
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR, quiesce_for_capture
+from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.replica_history import rung_indices, summarize_history
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
 from neoqcd.smearing_jacobian import LOGDET_VERSION
 from neoqcd.sun_utils import plaquette_SUN
 from neoqcd.theory import Wilson_action
-from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer
+from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer, translate_periodic_replica
 
 
 @dataclass
@@ -683,12 +684,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--parameter-min", type=float, default=None, help="Ladder min for tempering parameter")
     parser.add_argument("--parameter-max", type=float, default=None, help="Ladder max for tempering parameter")
+    parser.add_argument(
+        "--parameter-ladder",
+        default=None,
+        help="Explicit couplings, comma-separated or a JSON file written by main/optimal_ladder.py: one per rank, "
+        "strictly increasing; its ends set the ladder range (and must match --parameter-min/--parameter-max if "
+        "given). Default: evenly spaced from min to max.",
+    )
     parser.add_argument("--bc-min", type=float, default=0.0)
     parser.add_argument("--bc-max", type=float, default=1.0)
     # Alias compatibile con vecchi launcher/template (qui indica il range del parametro PT, non beta fisica).
     parser.add_argument("--beta-min", dest="beta_min_alias", type=float, default=None)
     parser.add_argument("--beta-max", dest="beta_max_alias", type=float, default=None)
-    parser.add_argument("--swap-parity", type=str, default="alternating", choices=["even", "odd", "alternating"])
+    parser.add_argument(
+        "--swap-parity",
+        type=str,
+        default="alternating",
+        choices=["even", "odd", "alternating", "even_odd"],
+        help="Standard PT: which pairs each step tries. even_odd = all even then all odd pairs every step (DEO, "
+        "as the O-REX/NEO-REX even_odd schedule); alternating = one parity per step.",
+    )
     parser.add_argument("--acceptance-rule", type=str, default="exact", choices=["exact", "linear", "auto"])
     parser.add_argument("--orex-protocol-steps", type=int, default=8)
     parser.add_argument("--orex-mcmc-steps-per-step", type=int, default=1)
@@ -782,6 +797,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweeps-per-step", type=int, default=1)
     parser.add_argument("--sweep", type=int, default=None, help="Alias of --sweeps-per-step")
     parser.add_argument("--swap-every", type=int, default=1)
+    parser.add_argument(
+        "--periodic-translation",
+        action="store_true",
+        help="After every round of swaps, translate the configuration of the periodic replica (bc = 1) by one "
+        "site along a random positive direction, as in PTBC: the defect explores the whole lattice.",
+    )
     parser.add_argument("--orsteps", type=int, default=4)
     parser.add_argument("--updates-per-layer", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=10)
@@ -1010,6 +1031,12 @@ def main(args: argparse.Namespace) -> None:
         parameter_min = args.beta_min_alias if args.beta_min_alias is not None else args.bc_min
     if parameter_max is None:
         parameter_max = args.beta_max_alias if args.beta_max_alias is not None else args.bc_max
+    explicit_ladder = None
+    if args.parameter_ladder is not None:
+        explicit_ladder = validate_ladder(
+            parse_ladder(args.parameter_ladder), world_size, args.parameter_min, args.parameter_max
+        )
+        parameter_min, parameter_max = explicit_ladder[0], explicit_ladder[-1]
     if parameter_min >= parameter_max:
         raise ValueError(f"parameter_min must be < parameter_max, got {parameter_min} >= {parameter_max}")
 
@@ -1160,6 +1187,7 @@ def main(args: argparse.Namespace) -> None:
             parameter_dtype=torch.float64,
             swap_parity=args.swap_parity,
             acceptance_rule="exact",
+            parameter_ladder=explicit_ladder,
             orex_protocol_steps=args.orex_protocol_steps,
             orex_mcmc_steps_per_step=args.orex_mcmc_steps_per_step,
             orex_schedule=args.orex_schedule,
@@ -1225,6 +1253,7 @@ def main(args: argparse.Namespace) -> None:
             parameter_dtype=torch.float64,
             swap_parity=args.swap_parity,
             acceptance_rule="exact",
+            parameter_ladder=explicit_ladder,
             orex_protocol_steps=args.neorex_protocol_steps,
             orex_mcmc_steps_per_step=args.neorex_heatbath_steps_per_step,
             orex_schedule=args.orex_schedule,
@@ -1273,18 +1302,33 @@ def main(args: argparse.Namespace) -> None:
             parameter_dtype=torch.float64,
             swap_parity=args.swap_parity,
             acceptance_rule=args.acceptance_rule,
+            parameter_ladder=explicit_ladder,
         )
         pt = ParallelTempering(pt_cfg, rank, world_size, device)
         orex_mcmc = None
 
-    parameter_ladder = torch.linspace(
-        pt_cfg.parameter_min,
-        pt_cfg.parameter_max,
-        world_size,
-        device=device,
-        dtype=pt_cfg.parameter_dtype,
-    )
+    if explicit_ladder is not None:
+        parameter_ladder = torch.tensor(explicit_ladder, device=device, dtype=pt_cfg.parameter_dtype)
+    else:
+        parameter_ladder = torch.linspace(
+            pt_cfg.parameter_min,
+            pt_cfg.parameter_max,
+            world_size,
+            device=device,
+            dtype=pt_cfg.parameter_dtype,
+        )
+    if rank == 0:
+        print(
+            f"parameter_ladder={'explicit' if explicit_ladder is not None else 'linear'}  "
+            f"parameter_ladder_json={json.dumps([round(float(v), 10) for v in parameter_ladder.cpu()])}",
+            flush=True,
+        )
     n_links = max(0, world_size - 1)
+    periodic_value = None
+    if bool(args.periodic_translation):
+        periodic_value = float(parameter_ladder[-1].item())
+        if periodic_value != 1.0:
+            raise ValueError(f"--periodic-translation needs the periodic coupling bc = 1 on the ladder, got max {periodic_value}")
     if wandb_run is not None:
         wandb_run.config.update(
             {
@@ -1404,7 +1448,18 @@ def main(args: argparse.Namespace) -> None:
     saved_link_work_values = [[] for _ in range(n_links)]
     history_labels = []  # rank 0: (world_size, batch) rung index of every chain slot after each step
     history_plaquette = []  # rank 0: (world_size, batch) plaquette of every chain slot after each step
+    history_defect_action = []  # rank 0: (world_size, batch) dS/dc of every chain slot at its coupling
     history_path = out_dir / "replica_history.npz"
+    # dS/dc on the bc-dependent plaquettes, for the metric of the optimal ladder (main/optimal_ladder.py).
+    defect_probe = None
+    if bool(args.save_replica_history):
+        defect_probe = orex_mcmc if orex_mcmc is not None else DefectMCMCAdapter(
+            flow_pars=flow_pars,
+            beta=args.beta,
+            defect_mask=defect_mask,
+            batch_size=args.batch_size,
+            parameter_name="bc",
+        )
 
     def save_replica_history():
         """Rank 0 writes the history so far; a run stopped by the time limit keeps its round trips."""
@@ -1412,6 +1467,7 @@ def main(args: argparse.Namespace) -> None:
             history_path,
             labels=np.stack(history_labels, axis=0).astype(np.int8),
             plaquette=np.stack(history_plaquette, axis=0),
+            defect_action=np.stack(history_defect_action, axis=0),
             parameter_ladder=parameter_ladder.detach().cpu().numpy().astype(np.float64),
             swap_every=np.asarray(int(args.swap_every)),
         )
@@ -1478,6 +1534,8 @@ def main(args: argparse.Namespace) -> None:
                     dtype=pt.param_dtype,
                 )
                 stats = pt.step(local_actions=local_actions)
+            if periodic_value is not None:
+                cfgs = translate_periodic_replica(cfgs, pt.local_parameters, periodic_value, args.D)
             if rank == 0:
                 total_swap_accepted += int(stats["n_accepted"])
                 total_swap_proposed += int(stats["n_proposed"])
@@ -1531,9 +1589,15 @@ def main(args: argparse.Namespace) -> None:
                 [torch.zeros_like(local_plaquette) for _ in range(world_size)] if rank == 0 else None
             )
             dist.gather(local_plaquette, gather_list=gather_list, dst=0)
+            local_defect_action = defect_probe.defect_action(cfgs, pt.local_parameters).to(dtype=torch.float64)
+            defect_gather = (
+                [torch.zeros_like(local_defect_action) for _ in range(world_size)] if rank == 0 else None
+            )
+            dist.gather(local_defect_action, gather_list=defect_gather, dst=0)
             if rank == 0:
                 history_labels.append(rung_indices(pt.parameter_matrix, parameter_ladder).cpu().numpy())
                 history_plaquette.append(torch.stack(gather_list, dim=0).cpu().numpy())
+                history_defect_action.append(torch.stack(defect_gather, dim=0).cpu().numpy())
 
         link_accepted_step = _normalize_metric_list(stats.get("link_accepted"), n_links, 0)
         link_proposed_step = _normalize_metric_list(stats.get("link_proposed"), n_links, 0)
@@ -1909,8 +1973,14 @@ def main(args: argparse.Namespace) -> None:
             try:
                 save_replica_history()
                 history = summarize_history(
-                    np.stack(history_labels, axis=0), np.stack(history_plaquette, axis=0), world_size
+                    np.stack(history_labels, axis=0),
+                    np.stack(history_plaquette, axis=0),
+                    world_size,
+                    defect_action=np.stack(history_defect_action, axis=0),
                 )
+                history["defect_action"]["parameter_ladder"] = [
+                    float(v) for v in parameter_ladder.detach().cpu().tolist()
+                ]
                 history["path"] = str(history_path)
                 top = history["plaquette_top"]
                 print(

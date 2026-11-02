@@ -770,6 +770,18 @@ class DefectMCMCAdapter:
         self._defect_plaquettes = (str(device), tables)
         return tables
 
+    def defect_action(self, x: torch.Tensor, parameter: torch.Tensor, step: float = 0.125) -> torch.Tensor:
+        """S_D = dS/dc per chain, at each chain's coupling: the variance of S_D is the metric of the
+        optimal ladder (neoqcd.ladder). Each plaquette weight is a product of four couplings linear in
+        c, a polynomial of degree <= 4, so the five-point central difference of action_difference
+        (bc-dependent plaquettes only) is exact for any `step`; the constant part of the action, which
+        action_difference leaves out, does not depend on the configuration."""
+        p = self._normalize_parameter(parameter, device=x.device, expected_batch_size=int(x.shape[0]))
+        h = float(step)
+        near = self.action_difference(x, p - h, p + h)
+        far = self.action_difference(x, p - 2.0 * h, p + 2.0 * h)
+        return (8.0 * near - far) / (12.0 * h)
+
     def _normalize_parameter(
         self,
         parameter: torch.Tensor,

@@ -9,6 +9,7 @@ from torch.profiler import record_function
 
 import neoqcd.sun_utils as sun
 from neoqcd.distributedPT import ParallelTempering, PTConfig
+from neoqcd.ladder import is_uniform
 from neoqcd.mcmc import HBOR
 from .cnf import path_gradient_loss
 
@@ -325,11 +326,10 @@ class DistributedCNFREXTrainer:
             raise ValueError("domain must be 'beta' or 'defect'")
         if self.parameters.numel() != self.world_size:
             raise ValueError(f"one replica per rank: {self.parameters.numel()} replicas on {self.world_size} ranks")
-        ladder = torch.linspace(float(self.parameters[0]), float(self.parameters[-1]), self.world_size,
-                                dtype=torch.float64, device=self.device)
-        if self.world_size < 2 or not torch.allclose(self.parameters, ladder, rtol=0, atol=1e-12) \
-                or not bool((torch.diff(self.parameters) > 0).all()):
-            raise ValueError("the replica ladder must be increasing and evenly spaced, as in the distributed PT")
+        if self.world_size < 2 or not bool((torch.diff(self.parameters) > 0).all()):
+            raise ValueError("the replica ladder must be strictly increasing, one coupling per rank")
+        # An evenly spaced ladder is rebuilt by the PT exactly as before; any other one is passed as is.
+        explicit_ladder = None if is_uniform(self.parameters.tolist()) else self.parameters.tolist()
         if self.batch_size < 2:
             raise ValueError("batch_size must be >= 2")
         if self.updates_per_replica < 1:
@@ -346,6 +346,7 @@ class DistributedCNFREXTrainer:
                 batch_size=self.batch_size, parameter_min=float(self.parameters[0]),
                 parameter_max=float(self.parameters[-1]), swap_parity=swap_parity,
                 parameter_name="beta" if self.domain == "beta" else "bc", acceptance_rule="exact",
+                parameter_ladder=explicit_ladder,
             ),
             self.rank, self.world_size, self.device,
         )

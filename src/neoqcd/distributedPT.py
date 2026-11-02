@@ -8,6 +8,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataclasses import dataclass
 from typing import Optional, Sequence, Any
 from contextlib import nullcontext
+
+from neoqcd.ladder import is_uniform, validate_ladder
  
 
 def _neorex_checkpoint_state(
@@ -110,7 +112,7 @@ class PTConfig:
     batch_size: int          # replicas per node
     parameter_min: float
     parameter_max: float
-    swap_parity: str = "alternating"   # "even" | "odd" | "alternating"
+    swap_parity: str = "alternating"   # "even" | "odd" | "alternating" | "even_odd" (both rounds every step)
     parameter_dtype: torch.dtype = torch.float64
     # General tempering parameter support:
     # - parameter_name: e.g. "beta" or "bc"
@@ -120,8 +122,22 @@ class PTConfig:
     #   auto:    picks exact when local_actions is passed, else linear
     parameter_name: str = "beta"
     acceptance_rule: str = "exact"
+    # Explicit couplings of the ladder, one per rank, increasing from parameter_min to
+    # parameter_max (e.g. the optimal ladder of neoqcd.ladder); None keeps the evenly spaced one.
+    parameter_ladder: Optional[Sequence[float]] = None
  
  
+def ladder_values(config: PTConfig, world_size: int) -> torch.Tensor:
+    """(world_size,) couplings of the ladder: config.parameter_ladder, or evenly spaced from min to max."""
+    if config.parameter_ladder is not None:
+        values = validate_ladder(config.parameter_ladder, world_size, config.parameter_min, config.parameter_max)
+        return torch.tensor(values, dtype=config.parameter_dtype)
+    params = torch.linspace(config.parameter_min, config.parameter_max, world_size, dtype=config.parameter_dtype)
+    params[0] = config.parameter_min
+    params[-1] = config.parameter_max
+    return params
+
+
 class ParallelTempering:
     """
     Manages tempering-parameter labels and swaps between replicas.
@@ -150,25 +166,25 @@ class ParallelTempering:
         # It is computed on rank 0 and broadcast so every rank has the same value.
         self.delta_parameter = torch.zeros((), device=device, dtype=self.param_dtype)
 
-        if config.swap_parity not in {"even", "odd", "alternating"}:
-            raise ValueError(f"swap_parity must be 'even', 'odd', or 'alternating', got: {config.swap_parity!r}")
+        if config.swap_parity not in {"even", "odd", "alternating", "even_odd"}:
+            raise ValueError(
+                f"swap_parity must be 'even', 'odd', 'alternating' or 'even_odd', got: {config.swap_parity!r}"
+            )
         if self.acceptance_rule not in {"exact", "linear", "auto"}:
             raise ValueError(
                 f"acceptance_rule must be 'exact', 'linear', or 'auto', got: {config.acceptance_rule!r}"
             )
 
+        self.ladder = ladder_values(config, world_size).to(device=device)
+        self.uniform_ladder = config.parameter_ladder is None or is_uniform(config.parameter_ladder)
+
         # rank 0 holds the global parameter matrix
         if rank == 0:
-            params = torch.linspace(
-                self.param_min,
-                self.param_max,
-                world_size,
-                dtype=self.param_dtype,
-            )
-            params[0] = self.param_min
-            params[-1] = self.param_max
+            params = self.ladder.clone()
             if world_size > 1:
-                self.delta_parameter = (params[1] - params[0]).to(device=device, dtype=self.param_dtype)
+                # One spacing only for an evenly spaced ladder; NaN otherwise (each link has its own).
+                spacing = params[1] - params[0] if self.uniform_ladder else torch.tensor(float("nan"))
+                self.delta_parameter = spacing.to(device=device, dtype=self.param_dtype)
             # (B, n_nodes): each column is constant at its rank parameter value
             self.parameter_matrix = params.view(1, world_size).repeat(self.B, 1).contiguous().to(device)
         else:
@@ -205,6 +221,22 @@ class ParallelTempering:
         Returns:
             dict with n_accepted, n_proposed (only rank 0 has values > 0)
         """
+        if self.config.swap_parity == "even_odd":
+            # Deterministic even-odd (DEO, non-reversible PT): all even pairs, then all odd pairs, every
+            # step, as the O-REX/NEO-REX "even_odd" schedule. The action table belongs to the
+            # configurations, which stay on their ranks, so both rounds use it.
+            stats = None
+            for parity in ("even", "odd"):
+                round_stats = self._attempt_swaps(local_energies, local_actions, parity)
+                self._scatter_parameters()
+                stats = round_stats if stats is None else {
+                    "n_accepted": stats["n_accepted"] + round_stats["n_accepted"],
+                    "n_proposed": stats["n_proposed"] + round_stats["n_proposed"],
+                    "link_accepted": [a + b for a, b in zip(stats["link_accepted"], round_stats["link_accepted"])],
+                    "link_proposed": [a + b for a, b in zip(stats["link_proposed"], round_stats["link_proposed"])],
+                }
+            self._pt_step += 1
+            return stats
         parity = self._current_parity()
         stats  = self._attempt_swaps(local_energies, local_actions, parity)
         self._scatter_parameters()
@@ -1664,6 +1696,8 @@ class NeuralParallelTempering(ParallelTempering):
         optimizer_param_groups: Optional[Sequence[dict]] = None,
     ):
         super().__init__(config, rank, world_size, device)
+        if not self.uniform_ladder:
+            raise NotImplementedError("NeuralParallelTempering uses one spacing for all links: evenly spaced ladders only")
 
         self.config: NeuralPTConfig = config
 

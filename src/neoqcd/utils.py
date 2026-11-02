@@ -677,3 +677,20 @@ def nn_dir_i(mu, x, y, z, L):
         return x, y, (z+1)%L
     else:
         return None
+
+
+def translate_periodic_replica(cfgs, local_parameters, periodic_value, D, generator=None):
+    """Move the field of every chain at the periodic coupling by one site along a positive lattice
+    direction drawn at random per chain, as in PTBC (Hasenbusch 2017; O-REX paper, Sec. PTBC): the
+    defect then explores the whole lattice relative to the field. Exact, since the periodic action is
+    translation invariant. cfgs: (B, D, T, L, ..., N, N); returns a new tensor."""
+    periodic = local_parameters.to(cfgs.device) == float(periodic_value)
+    if not bool(periodic.any()):
+        return cfgs
+    directions = torch.randint(0, int(D), (cfgs.shape[0],), device=cfgs.device, generator=generator)
+    out = cfgs
+    for mu in range(int(D)):
+        idx = (periodic & (directions == mu)).nonzero().squeeze(-1)
+        if idx.numel():
+            out = out.index_copy(0, idx, torch.roll(cfgs.index_select(0, idx), shifts=1, dims=2 + mu))
+    return out

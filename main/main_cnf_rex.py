@@ -20,6 +20,7 @@ from neoqcd.cnf import CNFProtocolLayer, integrate_flow
 from neoqcd.cnf_io import DEFECT_PATCH_ARCHITECTURES, build_cnf, defect_patch_buffer, load_cnf_checkpoint, save_cnf_checkpoint
 from neoqcd.cnf_training import CNFREXTrainer, DistributedCNFREXTrainer
 from neoqcd.distributedPT import NEOREXProtocolWrapper
+from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.mcmc import HBOR
 
 
@@ -33,6 +34,12 @@ def parse_args(argv=None):
     p.add_argument("--L", type=int, default=4)
     p.add_argument("--parameter-min", type=float, default=0.5)
     p.add_argument("--parameter-max", type=float, default=1.0)
+    p.add_argument("--swap-parity", choices=("alternating", "even_odd"), default="alternating",
+                   help="Replica swaps of the distributed trainer: one parity per sweep (alternating) or all even "
+                        "then all odd pairs every sweep (even_odd, deterministic even-odd as in O-REX/NEO-REX).")
+    p.add_argument("--parameter-ladder", default=None,
+                   help="Explicit couplings, comma-separated or a JSON file from main/optimal_ladder.py; one per "
+                        "replica, from --parameter-min to --parameter-max. Default: evenly spaced.")
     p.add_argument("--beta", type=float, default=6.0, help="Fixed beta for a defect ladder")
     p.add_argument("--defect-size", type=int, default=1)
     p.add_argument("--time-slice", type=int, default=1)
@@ -100,6 +107,12 @@ def parse_args(argv=None):
             p.error("defect requires D=4 and parameters in [0,1]")
         if not (0 <= args.time_slice < args.T and args.defect_size > 0 and 0 <= args.space_slice <= args.L - args.defect_size):
             p.error("defect must fit inside the lattice")
+    if args.parameter_ladder is not None:
+        try:
+            args.parameter_ladder = validate_ladder(parse_ladder(args.parameter_ladder), args.replicas,
+                                                    args.parameter_min, args.parameter_max)
+        except (ValueError, KeyError, OSError) as err:
+            p.error(f"--parameter-ladder: {err}")
     if args.phase == "evaluate" and args.checkpoint is None:
         p.error("evaluation requires --checkpoint")
     if not 0 <= args.lr_min <= args.lr:
@@ -276,14 +289,20 @@ def main(argv=None):
         raise SystemExit(f"one replica per rank: --replicas {config['replicas']} on {world_size} ranks")
     # Independent Markov chains on every rank; the field itself is broadcast from rank 0.
     torch.manual_seed(args.seed + rank)
-    ladder = torch.linspace(config["parameter_min"], config["parameter_max"], config["replicas"], dtype=torch.float64, device=device)
+    if config.get("parameter_ladder") is not None:
+        ladder = torch.tensor(config["parameter_ladder"], dtype=torch.float64, device=device)
+    else:
+        ladder = torch.linspace(config["parameter_min"], config["parameter_max"], config["replicas"], dtype=torch.float64, device=device)
     optimizer = torch.optim.Adam(field.parameters(), lr=config["lr"])
     options = dict(domain=config["domain"], beta=config["beta"], defect_mask=mask, batch_size=config["batch_size"],
                    updates_per_replica=config["mcmc_steps"], grad_clip_norm=config["grad_clip_norm"],
                    chunk_size=args.pg_chunk_size or None, directions_per_term=args.pg_direction_batch)
     if distributed:
-        trainer = DistributedCNFREXTrainer(field, pars, ladder, optimizer, rank=rank, world_size=world_size, **options)
+        trainer = DistributedCNFREXTrainer(field, pars, ladder, optimizer, rank=rank, world_size=world_size,
+                                           swap_parity=args.swap_parity, **options)
     else:
+        if args.swap_parity != "alternating":
+            raise SystemExit("--swap-parity even_odd needs the distributed trainer (one replica per rank)")
         trainer = CNFREXTrainer(field, pars, ladder, optimizer, **options)
     start = 0
     if payload and "trainer" in payload:

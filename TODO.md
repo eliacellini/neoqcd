@@ -23,11 +23,14 @@
    h (0, 1, 2, intero reticolo) su 8^4 per O-REX e NEO-REX, con round trip e tau_int come metrica:
    su GPU il costo di uno sweep non scala con il volume della patch (lanci di kernel, vedi punto 1).
 
-3. **Scala delle repliche ottimale** invertendo la lunghezza termodinamica: dal lavoro di scambio
-   per coppia di repliche di O-REX/NEO-REX si costruisce L(lambda) e si mettono i gradini a
-   lambda_r = L^-1(r L_tot / (R - 1)), così da equalizzare l'accettazione. Oggi
-   `ParallelTempering` e `DistributedCNFREXTrainer` accettano solo scale uniformi. Le produzioni
-   salvano il lavoro per coppia (`--save-link-work-values`). (Rob pensaci tu)
+3. **Scala delle repliche ottimale** invertendo la lunghezza termodinamica: implementata sul branch
+   `optimal-ladder` (1/11), da validare su Leonardo. `neoqcd.ladder` calcola
+   Lambda(c) = ∫ sqrt(Var_c S_D) e inverte Lambda(c_r) = Lambda r / (n_rep - 1) come nell'appendice
+   "Optimal ladder" del paper O-REX; `main/optimal_ladder.py` la ricava da Var_c(S_D) (metrica del
+   paper: `defect_action` in `replica_history.npz`, S_D = dS/dc esatta) oppure dalle accettanze per
+   link di un run (`--metric acceptance`, ladder "O-REX-aware"); `--parameter-ladder` la passa a
+   `main_pt_obc.py` e `main_cnf_rex.py`. Da fare: un run con il codice nuovo per misurare Var_c(S_D),
+   poi O-REX e NEO-REX sulla ladder ottimale contro quella lineare.
 
 4. **Carica topologica, suscettibilità e cooling.** Nel codice non c'è ancora nulla:
    - cooling di Wilson (il paper arXiv:2510.25704 usa n_cool = 60, R_s circa sqrt(8 n_cool / 3));

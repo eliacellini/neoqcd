@@ -116,8 +116,51 @@ def tau_int(series: np.ndarray, S: float = 2.0, min_steps: int = 8) -> dict:
     }
 
 
-def summarize_history(labels: np.ndarray, plaquette: np.ndarray | None, n_rungs: int) -> dict:
-    """JSON-ready summary: round trips, flux and plaquette tau_int on the bottom and top rungs."""
+def rung_moments(labels: np.ndarray, values: np.ndarray, n_rungs: int, discard_fraction: float = 0.2) -> dict:
+    """Mean and variance of an observable on each rung, after dropping the first `discard_fraction` of
+    the steps, pooled over steps and chain slots. The errors are jackknife errors over the B chain
+    slots: the B ladders of the batch are independent Markov chains, so the errors include the
+    autocorrelation whatever its length. The variance of the defect action on each rung is the
+    metric of the optimal ladder (neoqcd.ladder)."""
+    labels = np.asarray(labels)
+    values = np.asarray(values, dtype=np.float64)
+    if not 0.0 <= float(discard_fraction) < 1.0:
+        raise ValueError(f"discard_fraction must lie in [0, 1), got {discard_fraction}")
+    start = int(round(float(discard_fraction) * labels.shape[0]))
+    result = {"discard_fraction": float(discard_fraction), "steps_used": int(labels.shape[0] - start),
+              "mean": [], "mean_error": [], "variance": [], "variance_error": []}
+    for rung in range(int(n_rungs)):
+        series = replica_observable_series(labels[start:], values[start:], rung)  # (steps, B)
+        n_steps, n_chains = series.shape
+        if n_steps == 0:
+            for key in ("mean", "mean_error", "variance", "variance_error"):
+                result[key].append(float("nan"))
+            continue
+        total, total_sq = series.sum(axis=0), (series * series).sum(axis=0)
+        mean = float(total.sum() / series.size)
+        result["mean"].append(mean)
+        result["variance"].append(float(total_sq.sum() / series.size - mean * mean))
+        if n_chains < 2:
+            result["mean_error"].append(float("nan"))
+            result["variance_error"].append(float("nan"))
+            continue
+        n_left = (n_chains - 1) * n_steps
+        jk_mean = (total.sum() - total) / n_left
+        jk_var = (total_sq.sum() - total_sq) / n_left - jk_mean * jk_mean
+        scale = (n_chains - 1) / n_chains
+        result["mean_error"].append(float(math.sqrt(scale * np.sum((jk_mean - jk_mean.mean()) ** 2))))
+        result["variance_error"].append(float(math.sqrt(scale * np.sum((jk_var - jk_var.mean()) ** 2))))
+    return result
+
+
+def summarize_history(
+    labels: np.ndarray,
+    plaquette: np.ndarray | None,
+    n_rungs: int,
+    defect_action: np.ndarray | None = None,
+) -> dict:
+    """JSON-ready summary: round trips, flux, plaquette tau_int on the bottom and top rungs and, when
+    given, the mean and variance of the defect action on every rung."""
     trips = round_trips(labels, n_rungs)
     summary = {
         "steps": int(labels.shape[0]),
@@ -131,4 +174,6 @@ def summarize_history(labels: np.ndarray, plaquette: np.ndarray | None, n_rungs:
     if plaquette is not None:
         for name, rung in (("bottom", 0), ("top", n_rungs - 1)):
             summary[f"plaquette_{name}"] = tau_int(replica_observable_series(labels, plaquette, rung))
+    if defect_action is not None:
+        summary["defect_action"] = rung_moments(labels, defect_action, n_rungs)
     return summary

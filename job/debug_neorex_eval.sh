@@ -16,7 +16,11 @@
 # training (chains from the job/thermalize_defect.sh cache). Every swap runs K protocol
 # steps, each with one MCMC update (1 HB + 4 OR) and, for NEO-REX, the flow layer.
 # Smearing and residual fields are copied into their finite layer; CloverChair is a CNF.
-# Usage: METHODS="orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
+# Usage: METHODS="pt orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
+# "pt" is standard REX (instantaneous swaps, exact action differences); K does not enter it.
+# Lattice and defect default to 8^4, L_d = 2 at time slice 4, space slice 3; set NT, NS (time and
+# space extent), DSIZE, TSLICE, SSLICE, THERMAL (thermalization steps) for other geometries: the
+# flow conversion below must see the same geometry as the run, so pass them here, not as flags.
 
 set -euo pipefail
 
@@ -37,13 +41,15 @@ OUT="reports/neorex_eval_${SLURM_JOB_ID}"
 mkdir -p "$OUT"
 
 COMMON=(
-  --D 4 --T 8 --L 8 --N 3 --beta 6 --defect-size 2 --time-slice 4 --space-slice 3
-  --parameter-min 0 --parameter-max 1 --batch-size "${BATCH:-8}" --orsteps 4 --thermal-steps 1000
+  --D 4 --T "${NT:-8}" --L "${NS:-8}" --N 3 --beta 6 --defect-size "${DSIZE:-2}" --time-slice "${TSLICE:-4}"
+  --space-slice "${SSLICE:-3}" --parameter-min 0 --parameter-max 1 --batch-size "${BATCH:-8}" --orsteps 4
+  --thermal-steps "${THERMAL:-1000}"
 )
 
 for entry in ${METHODS:?set METHODS}; do
   name="${entry%%:*}"; ckpt="${entry#*:}"
   case "$name" in
+    pt)       ALG=(--algorithm pt --acceptance-rule exact) ;;
     orex)     ALG=(--algorithm orex --orex-protocol-steps "$K" --orex-mcmc-steps-per-step 1) ;;
     smearing) ALG=(--algorithm neorex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}"
                    --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
@@ -54,7 +60,7 @@ for entry in ${METHODS:?set METHODS}; do
     clover)   ALG=(--algorithm neorex --nf-layer-type cnf --cnf-checkpoint "$ckpt" --cnf-integration-steps "$CNF_STEPS") ;;
     *) echo "unknown method $name" >&2; exit 2 ;;
   esac
-  if [[ "$name" != orex ]]; then
+  if [[ "$name" != orex && "$name" != pt ]]; then
     ALG+=(--neorex-protocol-steps "$K" --neorex-heatbath-steps-per-step 1)
   fi
   if [[ "$name" == smearing || "$name" == residual ]]; then
