@@ -8,6 +8,7 @@ proposals per sweep).
 """
 
 import math
+import os
 import unittest
 
 import torch
@@ -27,6 +28,8 @@ from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian
 
 G4 = Geometry(4, 4, 2, 3)  # 2^3 x 4, SU(3)
 G2 = Geometry(2, 4, 4, 3)  # 2D 4 x 4, SU(3)
+
+VERBOSE = bool(os.environ.get("NEOQCD_TEST_VERBOSE"))  # print the diagnostics
 
 
 def haar_links(geometry, batch, seed):
@@ -61,7 +64,8 @@ class ReversibilityTest(unittest.TestCase):
                     U1, P1, _ = hmc.integrate(U, P)
                     U2, P2, _ = hmc.integrate(U1, -P1)
                     dU, dP = (U2 - U).abs().max().item(), (P2 + P).abs().max().item()
-                    print(f"\nreuse_guess={reuse} tol={tol:g} {integrator}: |U2 - U| = {dU:.1e}, |P2 + P| = {dP:.1e}")
+                    if VERBOSE:
+                        print(f"\nreuse_guess={reuse} tol={tol:g} {integrator}: |U2 - U| = {dU:.1e}, |P2 + P| = {dP:.1e}")
                     self.assertGreater((U1 - U).abs().max().item(), 0.1)
                     self.assertLess(dU, bound)
                     self.assertLess(dP, bound)
@@ -97,7 +101,8 @@ class EnergyScalingTest(unittest.TestCase):
                 x = torch.tensor([math.log(1.0 / n) for n in self.STEPS], dtype=torch.double)
                 y = torch.tensor([math.log(d) for d in dH], dtype=torch.double)
                 slope = (((x - x.mean()) * (y - y.mean())).sum() / ((x - x.mean()) ** 2).sum()).item()
-                print(f"\n{integrator}: <|dH|> = {['%.2e' % d for d in dH]}, slope {slope:.3f}")
+                if VERBOSE:
+                    print(f"\n{integrator}: <|dH|> = {['%.2e' % d for d in dH]}, slope {slope:.3f}")
                 self.assertGreater(slope, 1.85, msg=f"dH={dH}")
                 self.assertLess(slope, 2.15, msg=f"dH={dH}")
                 mean_dH[integrator] = dH
@@ -126,8 +131,9 @@ class GroupManifoldTest(unittest.TestCase):
         self.assertEqual(st["force_calls"], n_traj * (2 * 3 + 1))
         self.assertEqual(st["solves"], st["force_calls"] + st["action_calls"])
         self.assertLess(st["last_residual"].max().item(), 1e-12)
-        print(f"\nstats: {st['solves']} solves, {st['cg_iterations']} CG iterations "
-              f"({st['cg_iterations'] / st['solves']:.1f} per solve, max over the batch)")
+        if VERBOSE:
+            print(f"\nstats: {st['solves']} solves, {st['cg_iterations']} CG iterations "
+                  f"({st['cg_iterations'] / st['solves']:.1f} per solve, max over the batch)")
 
 
 class ExactComparisonTest(unittest.TestCase):
@@ -137,9 +143,16 @@ class ExactComparisonTest(unittest.TestCase):
     fermion weight). Also <exp(-dH)> = 1. Errors from the spread of the 32 chain means.
 
     kappa = 0.12 is the point of the plan; in 2D it is a heavy quark (free kappa_c = 1/4) and the
-    fermion effect is below the errors, so a quenched HMC run is printed as reference. kappa = 0.22
-    makes the comparison discriminating: there <log det> of the exact sampler differs from the
-    quenched one by many sigma (asserted), and <P> by about 4 sigma.
+    fermion effect is below the errors, so a quenched HMC run is printed as reference. At kappa = 0.22
+    the test discriminates dynamical from quenched: <log det> of the exact sampler differs from the
+    quenched one by many sigma (asserted), <P> by about 4 sigma, and the HMC <log det> must lie
+    within 30% of that quenched gap from the exact one. It does not pin the normalisation of the
+    determinant: an HMC with S_pf and its force halved (N_f = 1) passes these assertions with this
+    statistics. N_f = 2 versus 1 is pinned by StochasticEstimatorTest and ForceExpectationTest in
+    test_fermions_pseudofermion.py.
+
+    The Metropolis chains start cold and are thermalised for 40 sweeps (tau_exp ~ 5 sweeps at
+    eps = 0.45), the HMC chains for 15 trajectories.
     """
 
     B = 32
@@ -187,7 +200,7 @@ class ExactComparisonTest(unittest.TestCase):
     def run_case(self, kappa, discriminating):
         ham = TwoFlavourHamiltonian(self.BETA, kappa, G2, n_gauge_substeps=3)
         (p_h, e_ph), (l_h, e_lh), (x, e_x), acc = self.run_hmc(ham, kappa, 15, 60, 300)
-        (p_m, e_pm), (l_m, e_lm), acc_m = self.run_metropolis(kappa, 20, 60, 400)
+        (p_m, e_pm), (l_m, e_lm), acc_m = self.run_metropolis(kappa, 40, 60, 400)
         (p_q, e_pq), (l_q, e_lq), _, _ = self.run_hmc(H.WilsonGaugeHamiltonian(self.BETA, G2), kappa, 15, 60, 500)
         st = ham.fermion.stats
         msg = (f"2D 4x4 SU(3) beta={self.BETA} kappa={kappa}:\n"
@@ -196,8 +209,14 @@ class ExactComparisonTest(unittest.TestCase):
                f"  <log det>    HMC {l_h:.4f}({e_lh:.4f})  exact Metropolis {l_m:.4f}({e_lm:.4f})  "
                f"quenched HMC {l_q:.4f}({e_lq:.4f})\n"
                f"  <exp(-dH)> = {x:.4f}({e_x:.4f}), HMC acceptance {acc:.3f}, Metropolis acceptance {acc_m:.3f}, "
-               f"CG iterations per solve {st['cg_iterations'] / st['solves']:.1f}")
-        print("\n" + msg)
+               f"CG iterations per solve {st['cg_iterations'] / st['solves']:.1f}\n"
+               f"  sigmas: <P> HMC-exact {abs(p_h - p_m) / math.hypot(e_ph, e_pm):.2f}, "
+               f"<log det> HMC-exact {abs(l_h - l_m) / math.hypot(e_lh, e_lm):.2f}, "
+               f"exact-quenched {abs(l_m - l_q) / math.hypot(e_lm, e_lq):.2f}, "
+               f"<exp(-dH)>-1 {abs(x - 1.0) / e_x:.2f}; |l_hmc - l_exact| / |l_exact - l_quenched| = "
+               f"{abs(l_h - l_m) / abs(l_m - l_q):.3f}")
+        if VERBOSE:
+            print("\n" + msg)
         self.assertGreater(acc, 0.8, msg=msg)
         self.assertGreater(acc_m, 0.3, msg=msg)
         self.assertLess(abs(x - 1.0), 4 * e_x, msg=msg)
@@ -205,6 +224,7 @@ class ExactComparisonTest(unittest.TestCase):
         self.assertLess(abs(l_h - l_m), 4 * math.hypot(e_lh, e_lm), msg=msg)
         if discriminating:
             self.assertGreater(abs(l_m - l_q), 4 * math.hypot(e_lm, e_lq), msg=msg)
+            self.assertLess(abs(l_h - l_m), 0.3 * abs(l_m - l_q), msg=msg)
 
     def test_kappa_012(self):
         self.run_case(0.12, discriminating=False)
