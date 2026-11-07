@@ -70,7 +70,8 @@ def bc_link_couplings(defect_mask, bc):
     bc = _as_parameter(bc)
     if torch.is_tensor(bc):
         view = (-1,) + (1,) * (defect_mask.dim() - 1)
-        return defect_mask[0].unsqueeze(0) + defect_mask[1].unsqueeze(0) * bc.to(defect_mask.dtype).view(view)
+        bc = bc.to(dtype=defect_mask.dtype, device=defect_mask.device).view(view)
+        return defect_mask[0].unsqueeze(0) + defect_mask[1].unsqueeze(0) * bc
     return defect_mask[0] + defect_mask[1] * bc
 
 

@@ -10,9 +10,16 @@ Exact references (Z(lambda) = int dU dphi exp(-S(U, phi; lambda)), constants can
   dense determinant of `exact.log_det_two_flavour` on every configuration of an independent
   equilibrium sample at k1;
 - beta:  Z(b2)/Z(b1) = < exp(-(b2 - b1) S_g(U; beta = 1)) >_{b1}.
+Power: in kappa the 8-step run tests the fermionic work against zero (13 sigma). In beta the work
+is gauge-only, and with one step it is the reweighting exponent itself, so the beta test gets its
+power from a quenched reference instead: the same 8-step run with pure-gauge HMC blocks (blocks
+that ignore the fermions, same random numbers) must give a dF that differs by more than 2 sigma of
+the paired jackknife. The effect is small here (dF_quenched - dF ~ 0.04-0.08 for beta 5 -> 5.6,
+kappa = 0.18): 3 sigma would need about 4x the statistics (> 2 min for this file).
 Errors: reference from the spread of the 64 chain means; NE-MCMC from the delete-one jackknife of
 `jarzynski_free_energy` over the 256 work values (4 starting snapshots x 64 chains, snapshots 3
-trajectories apart on the same chains, so the error may be slightly underestimated).
+trajectories apart on the same chains, so the error may be slightly underestimated); 768 in beta
+(8 more snapshots, 3 trajectories apart, from an independent set of 64 chains).
 """
 
 import math
@@ -38,7 +45,7 @@ from neoqcd.fermions.snf import (
 G2 = Geometry(2, 4, 4, 3)
 B = 64
 BETA, KAPPA = 5.0, 0.18
-KAPPA2, BETA2 = 0.21, 5.3
+KAPPA2, BETA2 = 0.21, 5.6
 HMC_KW = dict(tau=1.0, n_steps=2, n_traj=1, integrator="omelyan")
 N_SUB = 3
 N_THERM = 20
@@ -92,6 +99,8 @@ class Ensembles:
         cls.ref_beta_ratio = torch.stack([torch.exp(-(BETA2 - BETA) * gauge_slope(U)) for U in ref])
         # independent starting points for the NE-MCMC: 4 snapshots, 3 trajectories apart
         cls.starts = plain_hmc(BETA, KAPPA, 2002, N_THERM, 4, every=3)
+        # 4 more on independent chains, for the beta test (quenched-reference resolution)
+        cls.beta_starts = cls.starts + plain_hmc(BETA, KAPPA, 2003, N_THERM, 4, every=3)
         cls.ready = True
 
 
@@ -105,11 +114,12 @@ def make_action(name, **kw):
     return QCDAction(G2, name, beta=BETA, kappa=KAPPA, defect_mask=defect_mask(), n_gauge_substeps=N_SUB, **kw)
 
 
-def run_ne(name, protocol, seed, starts):
+def run_ne(name, protocol, seed, starts, block_class=None):
     """NE-MCMC from every starting snapshot; returns the concatenated W, Q and the last driver."""
     gen = torch.Generator().manual_seed(seed)
     act = make_action(name)
-    ne = FermionNEMCMC(act, protocol, **HMC_KW)
+    block = None if block_class is None else block_class(act, **HMC_KW)
+    ne = FermionNEMCMC(act, protocol, block=block, **({} if block is not None else HMC_KW))
     Ws, Qs = [], []
     for U in starts:
         _, W, Q, _ = ne.forward(FieldState(U), gen)
@@ -122,6 +132,41 @@ def linear_protocol(a, b, n):
     return [a + (b - a) * (i + 1) / n for i in range(n)]
 
 
+class QuenchedBlock(HMCBlock):
+    """Pure-gauge HMC block (`hmc.WilsonGaugeHamiltonian` at beta = parameter): a block that ignores
+    the fermions, the wrong dynamics the beta test must detect. Beta protocol only. Each trajectory
+    first draws the pseudofermions as the fermionic one does (phi enters only the S bookkeeping), so
+    with the same seed both runs use the same momenta and Metropolis uniforms (common random
+    numbers: correlated work, see `paired_difference`)."""
+
+    @torch.no_grad()
+    def __call__(self, U, parameter, generator=None, S_old=None):
+        hmc = H.HMC(G2, H.WilsonGaugeHamiltonian(float(parameter), G2), self.tau, self.n_steps,
+                    integrator=self.integrator, exp_method=self.exp_method)
+        info = {"acceptance": [], "exp_minus_dH": []}
+        for _ in range(self.n_traj):
+            self.action.refresh(U, generator)
+            U, _, _, stats = hmc.trajectory(U, generator)
+            info["acceptance"].append(stats["acceptance"])
+            info["exp_minus_dH"].append(stats["exp_minus_dH"])
+        S_new = self.action.action(U, parameter)
+        return U, S_new - S_old, S_new, info
+
+
+def paired_difference(W_a, W_b):
+    """dF(W_a) - dF(W_b) (Jarzynski) with the delete-one jackknife error of the difference, deleting
+    the same configuration from both: the error of correlated work samples (same starts and random
+    numbers), which hypot(e_a, e_b) would overestimate."""
+    def loo_dF(W):
+        shift = W.min()
+        e = torch.exp(-(W - shift))
+        return -(torch.log((e.sum() - e) / (W.numel() - 1)) - shift)
+    n = W_a.numel()
+    jk = loo_dF(W_a) - loo_dF(W_b)
+    d = jarzynski_free_energy(W_a)[0] - jarzynski_free_energy(W_b)[0]
+    return d, math.sqrt((n - 1) / n * ((jk - jk.mean()) ** 2).sum().item())
+
+
 class JarzynskiTest(unittest.TestCase):
     """3, 4. <exp(-W)> = Z(lambda_n)/Z(lambda_0) for kappa and beta protocols, one jump and 8 steps."""
 
@@ -129,25 +174,38 @@ class JarzynskiTest(unittest.TestCase):
     def setUpClass(cls):
         Ensembles.build()
 
-    def check(self, name, start, end, ref_ratio):
+    def check(self, name, start, end, ref_ratio, starts):
         r, e_r = chain_mean_error(ref_ratio)
         dF_ref, e_ref = -math.log(r), e_r / r
         lines = [f"{name}: {start} -> {end}, exact reweighting Z_n/Z_0 = {r:.4f}({e_r:.4f}), "
                  f"dF = {dF_ref:.4f}({e_ref:.4f})"]
         results = {}
         for n_step in (1, 8):
-            W, Q, ne = run_ne(name, linear_protocol(start, end, n_step), 3000 + n_step, Ensembles.starts)
+            W, Q, ne = run_ne(name, linear_protocol(start, end, n_step), 3000 + n_step, starts)
             dF, e = jarzynski_free_energy(W)
             ess = effective_sample_size(W)
             acc = sum(a for info in ne.last_run["block_info"] for a in info["acceptance"]) / n_step
             results[n_step] = (dF, e, W.mean().item(), (W.std() / math.sqrt(W.numel())).item())
+            W8 = W
             lines.append(f"  n_step = {n_step}: <exp(-W)> = {math.exp(-dF):.4f}({math.exp(-dF) * e:.4f}), "
                          f"dF = {dF:.4f}({e:.4f}), <W> = {W.mean().item():.4f}, ESS = {ess:.3f}, "
                          f"(dF - dF_ref)/sigma = {(dF - dF_ref) / math.hypot(e, e_ref):+.2f}, "
                          f"last-run acceptance {acc:.3f}")
+        if name == "beta":
+            W_q, _, _ = run_ne(name, linear_protocol(start, end, 8), 3008, starts, QuenchedBlock)
+            dF_q, e_q = jarzynski_free_energy(W_q)
+            dF8, e8 = results[8][:2]
+            d, e_d = paired_difference(W_q, W8)
+            sep = abs(d) / e_d
+            lines.append(f"  quenched blocks, n_step = 8: dF = {dF_q:.4f}({e_q:.4f}), dF_quenched - dF8 = "
+                         f"{d:.4f}({e_d:.4f}) paired = {sep:.2f} sigma ({abs(d) / math.hypot(e8, e_q):.2f} "
+                         f"with hypot(e8, e_q))")
         msg = "\n".join(lines)
         print("\n" + msg)
-        self.assertGreater(abs(r - 1.0), 5 * e_r, msg=msg)
+        if name == "beta":
+            self.assertGreater(sep, 2.0, msg=msg)
+        else:
+            self.assertGreater(abs(r - 1.0), 5 * e_r, msg=msg)
         for n_step, (dF, e, W_mean, e_W) in results.items():
             self.assertLess(abs(dF - dF_ref), 3 * math.hypot(e, e_ref), msg=msg)
             self.assertGreater(W_mean, dF_ref - 3 * math.hypot(e_W, e_ref), msg=msg)  # second law <W> >= dF
@@ -156,10 +214,10 @@ class JarzynskiTest(unittest.TestCase):
         self.assertLess(e8, e1 * 1.5, msg=msg)
 
     def test_kappa_protocol(self):
-        self.check("kappa", KAPPA, KAPPA2, Ensembles.ref_det_ratio)
+        self.check("kappa", KAPPA, KAPPA2, Ensembles.ref_det_ratio, Ensembles.starts)
 
     def test_beta_protocol(self):
-        self.check("beta", BETA, BETA2, Ensembles.ref_beta_ratio)
+        self.check("beta", BETA, BETA2, Ensembles.ref_beta_ratio, Ensembles.beta_starts)
 
 
 class RecordingNEMCMC(FermionNEMCMC):
@@ -174,6 +232,15 @@ class RecordingNEMCMC(FermionNEMCMC):
         dW, S_new = super()._jump(U, p_old, p_new, S_cur)
         self.jumps.append((U, self.action.phi, p_old, p_new, dW, self.action.fermion.stats["solves"] - solves))
         return dW, S_new
+
+
+class RecordingBlock(HMCBlock):
+    """Records, after every block, the fields (U, phi), the parameter and the end-of-block S."""
+
+    def __call__(self, U, parameter, generator=None, S_old=None):
+        U, dQ, S_new, info = super().__call__(U, parameter, generator, S_old)
+        self.records.append((U, self.action.phi.clone(), parameter, S_new, info))
+        return U, dQ, S_new, info
 
 
 class BookkeepingTest(unittest.TestCase):
@@ -224,6 +291,38 @@ class BookkeepingTest(unittest.TestCase):
                         self.assertEqual(solves, 0)
                     else:
                         self.assertEqual(solves, 1)  # S at the old kappa is known from the block
+
+    def test_low_acceptance(self):
+        """kappa protocol with one Omelyan step per trajectory (acceptance well below 1): after every
+        block the end-of-block S equals that of an independent action object fed the recorded
+        (U, phi), so a stale S after a rejected trajectory (old U, new phi) would be caught; each
+        jump is checked as in test_accounting."""
+        Ensembles.build()
+        U0 = Ensembles.starts[0][:32]
+        protocol = [0.19, 0.2, 0.205, 0.21]
+        act = make_action("kappa")
+        block = RecordingBlock(act, tau=1.0, n_steps=1, n_traj=1, integrator="omelyan")
+        block.records = []
+        ne = RecordingNEMCMC(act, protocol, block=block)
+        state, W, Q, obs = ne.forward(FieldState(U0), torch.Generator().manual_seed(78))
+        acc = [a for *_, info in block.records for a in info["acceptance"]]
+        print(f"\nlow-acceptance kappa protocol: acceptance per block {[round(a, 3) for a in acc]}")
+        self.assertTrue(0.1 < sum(acc) / len(acc) < 0.7 and min(acc) < 0.9, msg=str(acc))
+        self.assertEqual(len(block.records), len(protocol))
+        for i, (U, phi, p, S_rec, _) in enumerate(block.records):
+            ref_act = make_action("kappa")
+            ref_act.phi = phi
+            ref = ref_act.action(U, p)
+            self.assertLess((S_rec - ref).abs().max().item(), 1e-9 * ref.abs().max().item())
+            self.assertTrue(torch.equal(obs[:, i, 3], S_rec))
+        self.assertEqual(len(ne.jumps), len(protocol))
+        for U, phi, p_old, p_new, dW, _ in ne.jumps:
+            ref_act = make_action("kappa")
+            ref_act.phi = phi
+            ref = ref_act.action(U, p_new) - ref_act.action(U, p_old)
+            self.assertLess((dW - ref).abs().max().item(), 1e-10 * ref.abs().max().item())
+        self.assertLess((W + Q + ne.last_run["S0"] - block.records[-1][3]).abs().max().item(),
+                        1e-10 * block.records[-1][3].abs().max().item())
 
 
 class EquilibriumLimitTest(unittest.TestCase):
