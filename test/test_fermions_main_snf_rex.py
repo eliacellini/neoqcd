@@ -34,6 +34,8 @@ from neoqcd.fermions.io import read_observables  # noqa: E402
 LATTICE = ["--D", "2", "--T", "4", "--L", "4", "--N", "3", "--beta", "5.0", "--kappa", "0.18",
            "--tau", "0.5", "--n-steps", "2", "--n-gauge-substeps", "2", "--device", "cpu", "--quiet"]
 
+STAGGERED = [a for a in LATTICE if a not in ("--kappa", "0.18")] + ["--fermions", "staggered", "--mass", "0.3"]
+
 
 def _rows(path):
     with open(path, newline="") as handle:
@@ -137,6 +139,29 @@ class MainSNFFermionsTest(unittest.TestCase):
                             "--seed", "9", "--out", str(out)])
         self._check_eval(out, 4, 2)
 
+    def test_nemcmc_staggered_mass(self):
+        out = self.tmp / "stag"
+        SNF.main(STAGGERED + ["--protocol", "mass", "--final", "0.25", "--n-step", "2", "--mode", "nemcmc",
+                              "--batch", "4", "--eval-samples", "8", "--therm", "2", "--seed", "5",
+                              "--out", str(out)])
+        s = self._check_eval(out, 8, 2)
+        np.testing.assert_allclose(s["blocks"]["parameter"], [0.275, 0.25])
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertEqual(meta["parameters"]["fermions"], "staggered")
+        self.assertEqual(meta["parameters"]["mass"], 0.3)
+        self.assertIsNone(meta["parameters"]["kappa"])
+        side = json.loads((out / "pool.json").read_text())
+        self.assertEqual(side["fermions"], "staggered")
+        self.assertEqual(side["mass"], 0.3)
+
+    def test_wrong_fermion_combinations(self):
+        for argv in (STAGGERED + ["--kappa", "0.1", "--protocol", "mass", "--final", "0.2", "--n-step", "1"],
+                     STAGGERED + ["--protocol", "kappa", "--final", "0.2", "--n-step", "1"],
+                     LATTICE + ["--protocol", "mass", "--final", "0.2", "--n-step", "1"],
+                     LATTICE + ["--mass", "0.3", "--protocol", "beta", "--final", "5.2", "--n-step", "1"]):
+            with self.assertRaises(SystemExit):
+                SNF.parse_args(argv)
+
 
 class MainREXFermionsTest(unittest.TestCase):
     def setUp(self):
@@ -184,6 +209,27 @@ class MainREXFermionsTest(unittest.TestCase):
         a, b = read_observables(full / "observables.csv"), read_observables(part / "observables.csv")
         np.testing.assert_allclose(a["plaquette"], b["plaquette"], rtol=0, atol=1e-12)
         np.testing.assert_array_equal(a["solves"], b["solves"])
+
+    def test_staggered(self):
+        out = self.tmp / "stag"
+        REX.main(STAGGERED + ["--ladder", "0,0.5,1", "--defect-shape", "line", "--defect-size", "2",
+                              "--n-chains", "2", "--therm", "1", "--seed", "7", "--steps", "3", "--out", str(out)])
+        for name in ("observables.csv", "replica_history.npz", "run_meta.json", "checkpoint.pt",
+                     "checkpoint.json", "rex_state.pt"):
+            self.assertTrue((out / name).exists(), name)
+        rows = _rows(out / "observables.csv")
+        self.assertEqual(len(rows), 4 * 3)
+        cols = read_observables(out / "observables.csv")
+        self.assertTrue(np.all(np.isfinite(cols["plaquette"])))
+        with np.load(out / "replica_history.npz") as h:
+            self.assertEqual(h["labels"].shape, (4, 3, 2))
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["parameters"]["fermions"], "staggered")
+        self.assertEqual(meta["run"]["mass"], 0.3)
+        side = json.loads((out / "checkpoint.json").read_text())
+        self.assertEqual((side["fermions"], side["mass"]), ("staggered", 0.3))
+        self.assertIsNone(side.get("kappa"))
 
 
 if __name__ == "__main__":

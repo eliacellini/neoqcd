@@ -126,7 +126,11 @@ def add_physics_args(p):
     p.add_argument("--L", type=int, default=4)
     p.add_argument("--N", type=int, default=3)
     p.add_argument("--beta", type=float, default=5.6)
-    p.add_argument("--kappa", type=float, default=0.153)
+    p.add_argument("--fermions", choices=("wilson", "staggered"), default="wilson",
+                   help="wilson: N_f = 2 Wilson (--kappa); staggered: one staggered field, N_f = 2^(D/2) (--mass).")
+    p.add_argument("--kappa", type=float, default=None,
+                   help="Wilson hopping parameter (--fermions wilson only; default 0.153).")
+    p.add_argument("--mass", type=float, default=None, help="Staggered bare mass (required with --fermions staggered).")
     p.add_argument("--time-sign", type=float, default=-1.0, choices=(-1.0, 1.0))
     p.add_argument("--solver-tol", type=float, default=1e-10, help="CG relative residual (force solves).")
     p.add_argument("--action-tol", type=float, default=None, help="CG relative residual (action solves).")
@@ -154,8 +158,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="NE-MCMC / SNF with N_f = 2 Wilson fermions.")
     add_physics_args(p)
     p.add_argument("--bc", type=float, default=1.0, help="Defect coupling (fixed unless --protocol bc).")
-    p.add_argument("--protocol", choices=("beta", "kappa", "bc"), required=True)
-    p.add_argument("--initial", type=float, default=None, help="lambda_0 (default: --beta/--kappa/--bc).")
+    p.add_argument("--protocol", choices=("beta", "kappa", "mass", "bc"), required=True,
+                   help="kappa: Wilson only; mass: staggered only.")
+    p.add_argument("--initial", type=float, default=None, help="lambda_0 (default: --beta/--kappa/--mass/--bc).")
     p.add_argument("--final", type=float, default=None, help="lambda_n of the linear protocol.")
     p.add_argument("--n-step", type=int, default=None, help="Protocol steps n of the linear protocol.")
     p.add_argument("--protocol-file", type=str, default=None, help="Text file with lambda_1 .. lambda_n.")
@@ -204,10 +209,29 @@ def validate_common(args):
     if args.resume and args.overwrite:
         raise SystemExit("--resume and --overwrite exclude each other")
     args.integrator_levels = parse_integrator(args.integrator)
+    if args.fermions == "wilson":
+        if args.mass is not None:
+            raise SystemExit("--mass is for --fermions staggered (Wilson fermions take --kappa)")
+        if args.kappa is None:
+            args.kappa = 0.153
+    else:
+        if args.kappa is not None:
+            raise SystemExit("--kappa is for --fermions wilson (staggered fermions take --mass)")
+        if args.mass is None or args.mass <= 0:
+            raise SystemExit("--fermions staggered needs --mass > 0")
+
+
+def fermion_parameter(args):
+    """Name and value of the fermion coupling: ("kappa", kappa) or ("mass", mass)."""
+    return ("kappa", args.kappa) if args.fermions == "wilson" else ("mass", args.mass)
 
 
 def validate_args(args):
     validate_common(args)
+    if args.protocol == "kappa" and args.fermions != "wilson":
+        raise SystemExit("--protocol kappa needs --fermions wilson (use --protocol mass for staggered)")
+    if args.protocol == "mass" and args.fermions != "staggered":
+        raise SystemExit("--protocol mass needs --fermions staggered (use --protocol kappa for Wilson)")
     if args.initial is None:
         args.initial = getattr(args, args.protocol)
     if args.protocol_file is not None:
@@ -249,26 +273,29 @@ def validate_args(args):
 def default_name(args):
     lat = f"{args.T}x{args.L}p{args.D - 1}"
     tag = f"{args.mode}" + ("" if args.mode == "nemcmc" else f"_{args.layers}")
-    return (f"{tag}_{args.protocol}{args.initial:g}to{args.final:g}_n{args.n_step}_b{args.beta:g}_k{args.kappa:g}"
+    f = f"k{args.kappa:g}" if args.fermions == "wilson" else f"stag_m{args.mass:g}"
+    return (f"{tag}_{args.protocol}{args.initial:g}to{args.final:g}_n{args.n_step}_b{args.beta:g}_{f}"
             f"_D{args.D}_{lat}_SU{args.N}_B{args.batch}_s{args.seed}")
 
 
 def initial_couplings(args):
-    """(beta_0, kappa_0, bc_0) at lambda_0."""
-    c = {"beta": args.beta, "kappa": args.kappa, "bc": getattr(args, "bc", 1.0)}
+    """(beta_0, kappa_0 or mass_0, bc_0) at lambda_0."""
+    name, value = fermion_parameter(args)
+    c = {"beta": args.beta, name: value, "bc": getattr(args, "bc", 1.0)}
     c[args.protocol] = args.initial
-    return float(c["beta"]), float(c["kappa"]), float(c["bc"])
+    return float(c["beta"]), float(c[name]), float(c["bc"])
 
 
 def physics_key(args):
     return {
         "geometry": {"D": args.D, "T": args.T, "L": args.L, "N": args.N},
-        "batch": args.batch, "beta": float(args.beta), "kappa": float(args.kappa), "bc": float(args.bc),
+        "batch": args.batch, "beta": float(args.beta), "kappa": None if args.kappa is None else float(args.kappa), "bc": float(args.bc),
         "time_sign": float(args.time_sign), "protocol": args.protocol, "initial": float(args.initial),
         "protocol_values": list(args.protocol_values), "mode": args.mode, "layers": args.layers,
         "defect": defect_key(args) if args.uses_defect else None,
         "n_traj": args.n_traj, "tau": float(args.tau), "n_steps": args.n_steps,
         "n_gauge_substeps": args.n_gauge_substeps, "integrator": list(args.integrator_levels),
+        **staggered_key(args),
     }
 
 
@@ -294,6 +321,25 @@ def build_defect_mask(args, geometry):
     return torch.stack((1.0 - m, m), dim=0)
 
 
+def staggered_key(args):
+    """Extra physics-key entries for staggered runs (none for Wilson: keys of Wilson runs unchanged)."""
+    return {"fermions": "staggered", "mass": float(args.mass)} if args.fermions == "staggered" else {}
+
+
+def action_kwargs(args):
+    """Fermion type and coupling for QCDAction / FermionREX (kappa=None explicitly for staggered)."""
+    if args.fermions == "wilson":
+        return dict(kappa=args.kappa)
+    return dict(kappa=None, fermions="staggered", mass=args.mass)
+
+
+def state_couplings(args, fpar0):
+    """save_state keywords: fermion type and kappa or mass."""
+    if args.fermions == "wilson":
+        return dict(fermions="wilson", kappa=fpar0)
+    return dict(fermions="staggered", mass=fpar0)
+
+
 def fermion_kwargs(args):
     return dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
                 max_iter=args.max_iter, reuse_guess=args.reuse_guess)
@@ -307,13 +353,14 @@ def start_links(args, geometry, device, batch, beta0, kappa0, bc0):
     g = meta["geometry"]
     if (g["D"], g["T"], g["L"], g["N"]) != (geometry.D, geometry.T, geometry.L, geometry.N):
         raise SystemExit(f"--start-config geometry {g} differs from the run's")
-    if meta["fermions"] != "wilson" or meta["kappa"] is None:
-        raise SystemExit("--start-config must come from a Wilson run")
-    if (abs(meta["beta"] - beta0) > 1e-12 or abs(meta["kappa"] - kappa0) > 1e-12
+    name = fermion_parameter(args)[0]
+    if meta["fermions"] != args.fermions or meta.get(name) is None:
+        raise SystemExit(f"--start-config must come from a {args.fermions} run")
+    if (abs(meta["beta"] - beta0) > 1e-12 or abs(meta[name] - kappa0) > 1e-12
             or meta["time_sign"] != args.time_sign or bc0 != 1.0):
-        raise SystemExit(f"--start-config couplings beta={meta['beta']} kappa={meta['kappa']} "
+        raise SystemExit(f"--start-config couplings beta={meta['beta']} {name}={meta[name]} "
                          f"time_sign={meta['time_sign']} (bc = 1) differ from the initial ones "
-                         f"beta={beta0} kappa={kappa0} bc={bc0} time_sign={args.time_sign}")
+                         f"beta={beta0} {name}={kappa0} bc={bc0} time_sign={args.time_sign}")
     if U.shape[0] < batch:
         raise SystemExit(f"--start-config holds {U.shape[0]} configurations, {batch} needed")
     return U[:batch].clone(), f"{args.start_config} (trajectory {meta['trajectory']})"
@@ -463,8 +510,8 @@ def main(argv=None):
     lam0 = float(args.initial)
     protocol = list(args.protocol_values)
     defect_mask = build_defect_mask(args, geometry).to(device) if args.uses_defect else None
-    action = QCDAction(geometry, args.protocol, beta=args.beta, kappa=args.kappa, bc=args.bc,
-                       defect_mask=defect_mask, n_gauge_substeps=args.n_gauge_substeps, **fermion_kwargs(args))
+    action = QCDAction(geometry, args.protocol, beta=args.beta, bc=args.bc, defect_mask=defect_mask,
+                       n_gauge_substeps=args.n_gauge_substeps, **action_kwargs(args), **fermion_kwargs(args))
     action.set_parameter(lam0)
     hmc_kw = dict(tau=args.tau, n_steps=args.n_steps, n_traj=args.n_traj, integrator=args.integrator_levels)
 
@@ -539,12 +586,13 @@ def main(argv=None):
     params_json = {k: v for k, v in vars(args).items()}
     info = run_info("main/main_snf_fermions.py", argv, device)
     info.update(lattice=list(geometry.lattice), volume=geometry.volume, start_source=source,
-                initial_couplings={"beta": beta0, "kappa": kappa0, "bc": bc0},
+                fermions=args.fermions, mass=args.mass,
+                initial_couplings={"beta": beta0, fermion_parameter(args)[0]: kappa0, "bc": bc0},
                 defect_links=int(defect_mask[1].sum().item()) if defect_mask is not None else 0)
 
     def checkpoint(phase_, progress_, final=False):
-        save_state(pool_prefix, pool.U, geometry=geometry, beta=beta0, fermions="wilson", trajectory=progress_,
-                   time_sign=args.time_sign, kappa=kappa0, generator=generator,
+        save_state(pool_prefix, pool.U, geometry=geometry, beta=beta0, trajectory=progress_,
+                   time_sign=args.time_sign, generator=generator, **state_couplings(args, kappa0),
                    extra={"phase": phase_, "progress": int(progress_), "physics": clean_json(key),
                           "source": source, "bc": bc0, "seed": args.seed})
         if args.mode == "snf":
@@ -563,7 +611,7 @@ def main(argv=None):
         return summary
 
     _log(args, f"{args.mode} {args.layers} protocol {args.protocol}: {lam0} -> {protocol[-1]} in {len(protocol)} "
-               f"steps, lattice {geometry.lattice} SU({args.N}) beta={args.beta} kappa={args.kappa} bc={args.bc} "
+               f"steps, lattice {geometry.lattice} SU({args.N}) beta={args.beta} {args.fermions} {'kappa=%g' % args.kappa if args.fermions == 'wilson' else 'mass=%g' % args.mass} bc={args.bc} "
                f"B={args.batch} device={device} -> {out}")
 
     # ---- thermalisation of the pool

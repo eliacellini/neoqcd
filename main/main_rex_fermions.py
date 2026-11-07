@@ -52,13 +52,16 @@ for _p in (ROOT / "src", ROOT / "main"):
 from main_hmc import _sync, choose_device  # noqa: E402
 from main_snf_fermions import (  # noqa: E402
     _log,
+    action_kwargs,
     add_physics_args,
     build_defect_mask,
     clean_json,
     defect_key,
     fermion_kwargs,
     run_info,
+    staggered_key,
     start_links,
+    state_couplings,
     validate_common,
 )
 
@@ -131,17 +134,19 @@ def parse_args(argv=None):
 def default_name(args):
     lat = f"{args.T}x{args.L}p{args.D - 1}"
     return (f"rex_r{len(args.ladder_values)}_c{args.n_chains}_d{args.defect_shape}{args.defect_size}"
-            f"_b{args.beta:g}_k{args.kappa:g}_D{args.D}_{lat}_SU{args.N}_s{args.seed}")
+            f"_b{args.beta:g}_" + (f"k{args.kappa:g}" if args.fermions == "wilson" else f"stag_m{args.mass:g}") +
+            f"_D{args.D}_{lat}_SU{args.N}_s{args.seed}")
 
 
 def physics_key(args):
     return {
         "geometry": {"D": args.D, "T": args.T, "L": args.L, "N": args.N},
-        "beta": float(args.beta), "kappa": float(args.kappa), "time_sign": float(args.time_sign),
+        "beta": float(args.beta), "kappa": None if args.kappa is None else float(args.kappa), "time_sign": float(args.time_sign),
         "ladder": list(args.ladder_values), "n_chains": args.n_chains, "defect": defect_key(args),
         "tau": float(args.tau), "n_steps": args.n_steps, "n_gauge_substeps": args.n_gauge_substeps,
         "integrator": list(args.integrator_levels), "swap_parity": args.swap_parity,
         "periodic_translation": bool(args.periodic_translation),
+        **staggered_key(args),
     }
 
 
@@ -213,6 +218,7 @@ def main(argv=None):
     swap_generator.manual_seed(int(args.seed) + 1)
     torch.manual_seed(int(args.seed))
 
+    fpar = args.kappa if args.fermions == "wilson" else args.mass
     n_rungs = len(args.ladder_values)
     B = n_rungs * args.n_chains
     defect_mask = build_defect_mask(args, geometry).to(device)
@@ -239,13 +245,14 @@ def main(argv=None):
             raise SystemExit(f"{out} holds a previous run ({[p.name for p in previous]}): use --resume or --overwrite")
         for p in previous:
             p.unlink()
-        U, source = start_links(args, geometry, device, B, args.beta, args.kappa, 1.0)
+        U, source = start_links(args, geometry, device, B, args.beta, fpar, 1.0)
 
-    rex = FermionREX(geometry, args.beta, args.kappa, defect_mask, args.ladder_values, n_chains=args.n_chains,
+    akw = action_kwargs(args)
+    rex = FermionREX(geometry, args.beta, akw.pop("kappa"), defect_mask, args.ladder_values, n_chains=args.n_chains,
                      tau=args.tau, n_steps=args.n_steps, integrator=args.integrator_levels,
                      n_gauge_substeps=args.n_gauge_substeps, swap_parity=args.swap_parity,
                      periodic_translation=args.periodic_translation, U=U, swap_generator=swap_generator,
-                     **fermion_kwargs(args))
+                     **akw, **fermion_kwargs(args))
     writer = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
     if args.resume:
         rex.labels = rex_state["labels"].clone()
@@ -261,6 +268,7 @@ def main(argv=None):
     params_json = {k: v for k, v in vars(args).items()}
     info = run_info("main/main_rex_fermions.py", argv, device)
     info.update(lattice=list(geometry.lattice), volume=geometry.volume, start_source=source, B=B,
+                fermions=args.fermions, mass=args.mass,
                 n_rungs=n_rungs, defect_links=int(defect_mask[1].sum().item()), obs_fields=list(OBS_FIELDS))
     fermion = rex.qcd.fermion
 
@@ -269,8 +277,9 @@ def main(argv=None):
         torch.save({"labels": rex.labels.clone(), "n_steps_done": rex.n_steps_done,
                     "link_accepted": rex.link_accepted.clone(), "link_proposed": rex.link_proposed.clone(),
                     "swap_rng": swap_generator.get_state()}, rex_state_path)
-        save_state(state_prefix, rex.U, geometry=geometry, beta=args.beta, fermions="wilson",
-                   trajectory=rex.n_steps_done, time_sign=args.time_sign, kappa=args.kappa, generator=generator,
+        save_state(state_prefix, rex.U, geometry=geometry, beta=args.beta,
+                   trajectory=rex.n_steps_done, time_sign=args.time_sign, generator=generator,
+                   **state_couplings(args, fpar),
                    extra={"physics": key, "source": source, "seed": args.seed, "final": bool(final)})
         summary = summarize(rex, csv_path, args.therm)
         atomic_json_save(clean_json({"parameters": params_json, "run": info, "steps_done": rex.n_steps_done,
@@ -278,8 +287,9 @@ def main(argv=None):
                          meta_path)
         return summary
 
-    _log(args, f"REX N_f=2 Wilson ladder {args.ladder_values} x {args.n_chains} chains, lattice {geometry.lattice} "
-               f"SU({args.N}) beta={args.beta} kappa={args.kappa}, defect {int(defect_mask[1].sum())} links, "
+    fdesc = f"N_f=2 Wilson kappa={args.kappa}" if args.fermions == "wilson" else f"staggered mass={args.mass}"
+    _log(args, f"REX {fdesc} ladder {args.ladder_values} x {args.n_chains} chains, lattice {geometry.lattice} "
+               f"SU({args.N}) beta={args.beta}, defect {int(defect_mask[1].sum())} links, "
                f"device={device} -> {out}")
     while rex.n_steps_done < total:
         step = rex.n_steps_done
