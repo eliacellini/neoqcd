@@ -108,7 +108,7 @@ def fermion_boundary_links(U, time_sign=-1.0):
     """
     sign = float(time_sign)
     if sign == 1.0:
-        return U
+        return U.clone()
     scale = torch.ones(U.shape[2], dtype=U.real.dtype, device=U.device)
     scale[0] = sign
     view = (1, 1, U.shape[2]) + (1,) * (U.dim() - 3)

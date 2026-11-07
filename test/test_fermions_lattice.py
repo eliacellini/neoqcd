@@ -89,6 +89,18 @@ class LatticeTest(unittest.TestCase):
         self.assertTrue(torch.equal(Ub[:, 1:], U[:, 1:]))
         self.assertTrue(torch.equal(fermion_boundary_links(U, 1.0), U))
 
+    def test_boundary_links_do_not_alias_the_gauge_field(self):
+        # both signs return a new tensor: zeroing the caller's links afterwards changes nothing
+        geo = Geometry(4, 4, 2, 3)
+        for time_sign in (-1.0, 1.0):
+            with self.subTest(time_sign=time_sign):
+                U = random_links(geo, 2, 8)
+                Ub = fermion_boundary_links(U, time_sign)
+                ref = Ub.clone()
+                U.zero_()
+                self.assertTrue(torch.equal(Ub, ref))
+                self.assertGreater(Ub.abs().max().item(), 0.5)
+
     def test_parity_masks(self):
         for geo in (Geometry(4, 4, 2, 3), Geometry(2, 4, 4, 3), Geometry(4, 4, 4, 3)):
             with self.subTest(geometry=geo):

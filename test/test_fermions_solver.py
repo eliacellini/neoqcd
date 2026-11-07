@@ -77,23 +77,86 @@ class SolverTest(unittest.TestCase):
                     self.assertLess((single.x[0] - res.x[s]).abs().max().item(), 1e-13)
 
     def test_degenerate_samples(self):
+        # sample 0 starts at the solution, sample 1 has b = 0 with a nonzero x0 (zero tol |b|
+        # target: it must stop at roundoff, not underflow into NaN), sample 2 is generic
         D = WilsonDirac(random_links(G4s, 3, 7), 0.10, G4s)
         b = random_field(G4s, 3, 8)
         b[1] = 0.0
         exact = solve(D, b, tol=1e-13).x
         x0 = exact.clone()
-        x0[2] = 0.0  # sample 0 starts at the solution, sample 1 has b = 0, sample 2 is generic
+        x0[1] = random_field(G4s, 1, 9)[0]
+        x0[2] = 0.0
         for name, solver, A in (("cg", cg, D.normal), ("bicgstab", bicgstab, D.apply)):
             with self.subTest(solver=name):
                 rhs = D.apply_dagger(D.apply(exact)) if name == "cg" else b
                 rhs = rhs.clone()
                 rhs[1] = 0.0
-                res = solver(A, rhs, x0=x0 * (torch.arange(3) != 1).view(-1, 1, 1, 1, 1, 1, 1), tol=1e-9)
+                res = solver(A, rhs, x0=x0, tol=1e-9, max_iter=1000)
                 self.assertTrue(torch.isfinite(res.x.abs()).all().item())
-                self.assertEqual(res.iterations.tolist()[:2], [0, 0])
-                self.assertGreater(int(res.iterations[2]), 0)
-                self.assertEqual(res.x[1].abs().max().item(), 0.0)
-                self.assertLess(res.residual.max().item(), 1e-9)
+                self.assertTrue(torch.isfinite(res.residual).all().item())
+                its = res.iterations.tolist()
+                self.assertEqual(its[0], 0)
+                self.assertGreater(its[1], 0)
+                self.assertGreater(its[2], 0)
+                self.assertLess(max(its), 300)
+                # b = 0: x -> 0 and the reported residual is the absolute |A x|, at roundoff
+                # relative to the initial |A x0|
+                self.assertLess(res.x[1].abs().max().item(), 1e-10)
+                self.assertLess(res.residual[1].item(), 1e-12 * A(x0)[1].norm().item())
+                self.assertLess(res.residual[[0, 2]].max().item(), 1e-9)
+
+    def test_zero_tolerance(self):
+        # tol = 0 with b != 0: converges at roundoff, finite, well below max_iter
+        D = WilsonDirac(random_links(G4s, 2, 13), kappas(0.08, 0.12), G4s)
+        b = random_field(G4s, 2, 14)
+        for name, solver, A in (("cg", cg, D.normal), ("bicgstab", bicgstab, D.apply)):
+            with self.subTest(solver=name):
+                res = solver(A, b, tol=0.0, max_iter=2000)
+                self.assertTrue(torch.isfinite(res.x.abs()).all().item())
+                self.assertTrue(torch.isfinite(res.residual).all().item())
+                self.assertLess(res.iterations.max().item(), 400)
+                self.assertLess(res.residual.max().item(), 1e-12)
+
+    def test_conjugate_view_rhs(self):
+        # a lazy conjugate view as right-hand side (view_as_real rejects unresolved conj views)
+        D = WilsonDirac(random_links(G4s, 2, 11), 0.10, G4s)
+        b = random_field(G4s, 2, 12).conj()
+        self.assertTrue(b.is_conj())
+        for name, run in (("cg", lambda: cg(D.normal, b, tol=TOL)),
+                          ("bicgstab", lambda: bicgstab(D.apply, b, tol=TOL)),
+                          ("solve", lambda: solve(D, b, tol=TOL))):
+            with self.subTest(solver=name):
+                res = run()
+                self.assertLess(res.residual.max().item(), TOL)
+                A = D.normal if name == "cg" else D.apply
+                r = b.resolve_conj() - A(res.x)
+                self.assertLess((r.norm() / b.resolve_conj().norm()).item(), TOL)
+
+    def test_bicgstab_breakdown_and_half_step(self):
+        # x -> x * diag(1, -1), b = (1, 1): r_hat = b and <r_hat, A b> = 0, so alpha cannot be
+        # formed. The sample stops after one iteration at x = 0 with residual 1, no NaN.
+        sign = torch.tensor([1.0, -1.0], dtype=C)
+        res = bicgstab(lambda x: x * sign, torch.ones(1, 2, dtype=C), tol=1e-12)
+        self.assertTrue(torch.isfinite(res.x.abs()).all().item())
+        self.assertEqual(res.iterations.tolist(), [1])
+        self.assertTrue(torch.isfinite(res.residual).all().item())
+        self.assertAlmostEqual(res.residual.item(), 1.0, places=14)
+        self.assertEqual(res.x.abs().max().item(), 0.0)
+        # A = 2 * identity: b is an eigenvector, s = r - alpha A p vanishes exactly at the half
+        # step, omega is set to 0 (t = A s = 0) and x = b / 2 after one iteration.
+        b = torch.tensor([[1.0, 2.0j, -3.0]], dtype=C)
+        res = bicgstab(lambda x: 2 * x, b, tol=1e-12)
+        self.assertEqual(res.iterations.tolist(), [1])
+        self.assertTrue(torch.isfinite(res.x.abs()).all().item())
+        self.assertEqual(res.residual.item(), 0.0)
+        self.assertTrue(torch.equal(res.x, b / 2))
+        # batched: the breakdown sample does not disturb a sample that converges normally
+        A = torch.tensor([[[1.0, 0.0], [0.0, -1.0]], [[2.0, 1.0], [0.0, 3.0]]], dtype=C)
+        bb = torch.ones(2, 2, dtype=C)
+        res = bicgstab(lambda x: torch.einsum("bij,bj->bi", A, x), bb, tol=1e-12)
+        self.assertTrue(torch.isfinite(res.x.abs()).all().item())
+        self.assertAlmostEqual(res.residual[0].item(), 1.0, places=14)
+        self.assertLess(res.residual[1].item(), 1e-12)
 
     def test_solve_direct_and_even_odd(self):
         k = kappas(0.10, 0.12)

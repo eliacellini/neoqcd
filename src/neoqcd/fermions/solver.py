@@ -6,9 +6,13 @@ systems: inner products and residual norms are per sample, and a sample whose re
 from vanishing denominators). The operator is still applied to the whole batch at every
 iteration, so the cost per iteration is that of the slowest sample.
 
-The tolerance is relative to |b| (a sample with b = 0 is converged at x = 0). The returned
-`residual` is the true relative residual |b - A x| / |b| recomputed at the end, not the
-recursively updated one.
+The tolerance is relative to |b| (a sample with b = 0 is converged at x = 0). The convergence
+target is never below roundoff: |r| <= max(tol |b|, eps |r_0|) with eps the machine epsilon of
+the field and r_0 the initial residual, so tol = 0, or b = 0 with a nonzero x0, stop at the first
+iteration where the residual is at roundoff instead of running into underflow. A sample whose
+recursive residual becomes non-finite, or that meets a breakdown, is deactivated unconverged.
+The returned `residual` is the true relative residual |b - A x| / |b| (|b - A x| when b = 0)
+recomputed at the end, not the recursively updated one.
 """
 
 from typing import NamedTuple
@@ -55,7 +59,7 @@ def _dot(a, b):
 
 def _norm2(a):
     """Per-sample squared norm, real, shape (B,)."""
-    a = torch.view_as_real(a) if a.is_complex() else a
+    a = torch.view_as_real(a.resolve_conj()) if a.is_complex() else a
     return (a * a).reshape(a.shape[0], -1).sum(dim=1)
 
 
@@ -66,6 +70,18 @@ def _bview(c, field):
 def _safe(den, ok):
     """den where `ok`, 1 elsewhere: the value is discarded there, the division stays finite."""
     return torch.where(ok, den, torch.ones_like(den))
+
+
+def _target(b, r, tol):
+    """Squared per-sample convergence target max(tol^2 |b|^2, eps^2 |r_0|^2) (module docstring)."""
+    eps = torch.finfo(b.real.dtype if b.is_complex() else b.dtype).eps
+    return torch.maximum((tol ** 2) * _norm2(b), (eps ** 2) * _norm2(r))
+
+
+def _finite(x):
+    """Per-sample flag: every entry of the field is finite, shape (B,)."""
+    return torch.isfinite(torch.view_as_real(x.resolve_conj()) if x.is_complex() else x).reshape(
+        x.shape[0], -1).all(dim=1)
 
 
 def _relative_residual(apply, b, x):
@@ -95,7 +111,7 @@ def cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000):
         r = b - apply_normal(x)
     p = r.clone()
     rr = _norm2(r)
-    target = (tol ** 2) * _norm2(b)
+    target = _target(b, r, tol)
     active = rr > target
     iterations = torch.zeros(B, dtype=torch.long, device=b.device)
     for _ in range(int(max_iter)):
@@ -103,6 +119,7 @@ def cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000):
             break
         Ap = apply_normal(p)
         pAp = _dot(p, Ap).real
+        active = active & (pAp > 0) & torch.isfinite(pAp)  # breakdown: A not positive on p
         alpha = torch.where(active, rr / _safe(pAp, active), torch.zeros_like(rr))
         x = x + _bview(alpha, x).to(x.dtype) * p
         r = r - _bview(alpha, r).to(r.dtype) * Ap
@@ -111,7 +128,7 @@ def cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000):
         p = r + _bview(beta, p).to(p.dtype) * p
         rr = torch.where(active, rr_new, rr)
         iterations = iterations + active.long()
-        active = active & (rr > target)
+        active = active & torch.isfinite(rr) & (rr > target)
     return SolverResult(x, iterations, _relative_residual(apply_normal, b, x))
 
 
@@ -119,8 +136,9 @@ def bicgstab(apply, b, x0=None, tol=1e-10, max_iter=1000):
     """BiCGstab for a general (non-hermitian) operator, e.g. `op.apply` for the Wilson D.
 
     Each iteration applies the operator twice. Samples converge independently; a sample that
-    converges at the half step (|s| <= tol |b|) takes omega = 0 and stops there. A breakdown
-    (rho or <r_hat, v> exactly zero) leaves the sample unconverged instead of producing NaN.
+    converges at the half step (|s| below the target) takes omega = 0 and stops there. A
+    breakdown (|<r_hat, v>| <= eps |r_hat| |v|, or |t|^2 = 0 with s above target) leaves the
+    sample unconverged at its last finite iterate instead of producing NaN.
     Returns SolverResult(x, iterations, residual).
     """
     B = b.shape[0]
@@ -138,7 +156,9 @@ def bicgstab(apply, b, x0=None, tol=1e-10, max_iter=1000):
     alpha = torch.ones(B, dtype=cdtype, device=b.device)
     omega = torch.ones(B, dtype=cdtype, device=b.device)
     zero = torch.zeros(B, dtype=cdtype, device=b.device)
-    target = (tol ** 2) * _norm2(b)
+    eps = torch.finfo(b.real.dtype).eps if b.is_complex() else torch.finfo(b.dtype).eps
+    target = _target(b, r, tol)
+    rh2 = _norm2(r_hat)
     active = _norm2(r) > target
     iterations = torch.zeros(B, dtype=torch.long, device=b.device)
     for _ in range(int(max_iter)):
@@ -150,20 +170,24 @@ def bicgstab(apply, b, x0=None, tol=1e-10, max_iter=1000):
         p = r + _bview(beta, p) * (p - _bview(omega, v) * v)
         v = apply(p)
         rv = _dot(r_hat, v)
-        ok = active & (rv != 0)
-        alpha = torch.where(ok, rho_new / _safe(rv, ok), zero)
+        ok_a = active & (rv.abs() > eps * torch.sqrt(rh2 * _norm2(v))) & (rho_new != 0)
+        alpha = torch.where(ok_a, rho_new / _safe(rv, ok_a), zero)
         s = r - _bview(alpha, v) * v
         half = _norm2(s) <= target
         t = apply(s)
-        tt = _norm2(t).to(cdtype)
-        ok = active & ~half & (tt != 0)
-        omega = torch.where(ok, _dot(t, s) / _safe(tt, ok), zero)
-        x = x + _bview(alpha, x) * p + _bview(omega, x) * s
-        r = s - _bview(omega, t) * t
+        tt = _norm2(t)
+        ok = ok_a & ~half & (tt > 0)
+        omega = torch.where(ok, _dot(t, s) / _safe(tt.to(cdtype), ok), zero)
+        x_new = x + _bview(alpha, x) * p + _bview(omega, x) * s
+        r_new = s - _bview(omega, t) * t
+        r2 = _norm2(r_new)
+        # breakdown: alpha could not be formed, t vanished above target, or non-finite iterate
+        good = ok_a & (half | (tt > 0)) & torch.isfinite(r2) & _finite(x_new)
+        x = torch.where(_bview(good, x), x_new, x)
+        r = torch.where(_bview(good, r), r_new, r)
         rho = torch.where(active, rho_new, rho)
         iterations = iterations + active.long()
-        breakdown = active & (alpha == 0)  # rho_new or <r_hat, v> vanished
-        active = active & (_norm2(r) > target) & ~breakdown
+        active = active & good & (r2 > target)
     return SolverResult(x, iterations, _relative_residual(apply, b, x))
 
 

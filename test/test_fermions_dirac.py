@@ -42,6 +42,17 @@ def gamma5_dense(geometry):
     return torch.kron(torch.kron(torch.eye(geometry.volume, dtype=C), g5), torch.eye(geometry.N, dtype=C))
 
 
+def closed_form_free_matrix(geometry, kappa, p):
+    """D(p) = 1 - 2 kappa sum_mu cos p_mu + 2 i kappa sum_mu gamma_mu sin p_mu, written out here
+    independently of free_wilson_matrix."""
+    gammas, _ = gamma_matrices(geometry.D)
+    one = torch.eye(geometry.spin, dtype=C)
+    out = (1 - 2 * kappa * p.cos().sum().item()) * one
+    for mu in range(geometry.D):
+        out = out + 2j * kappa * p[mu].sin().item() * gammas[mu]
+    return out
+
+
 def max_multiset_distance(a, b):
     """Largest |a_i - b_pi(i)| for the optimal matching pi of two multisets of complex numbers."""
     cost = (a[:, None] - b[None, :]).abs().numpy()
@@ -82,6 +93,21 @@ class GammaTest(unittest.TestCase):
         self.assertTrue(torch.equal(g5, torch.diag(torch.tensor([1, -1], dtype=C))))
         with self.assertRaises(NotImplementedError):
             gamma_matrices(3)
+
+    def test_representation_literal(self):
+        # openQCD chiral representation, written out entry by entry
+        i = 1j
+        g0 = [[0, 0, -1, 0], [0, 0, 0, -1], [-1, 0, 0, 0], [0, -1, 0, 0]]
+        g1 = [[0, 0, 0, -i], [0, 0, -i, 0], [0, i, 0, 0], [i, 0, 0, 0]]  # [[0, -i s1], [i s1, 0]]
+        g2 = [[0, 0, 0, -1], [0, 0, 1, 0], [0, 1, 0, 0], [-1, 0, 0, 0]]  # [[0, -i s2], [i s2, 0]]
+        g3 = [[0, 0, -i, 0], [0, 0, 0, i], [i, 0, 0, 0], [0, -i, 0, 0]]  # [[0, -i s3], [i s3, 0]]
+        g5 = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, -1]]
+        gammas, gamma5 = gamma_matrices(4)
+        self.assertTrue(torch.equal(gammas, torch.tensor([g0, g1, g2, g3], dtype=C)))
+        self.assertTrue(torch.equal(gamma5, torch.tensor(g5, dtype=C)))
+        gammas, gamma5 = gamma_matrices(2)
+        self.assertTrue(torch.equal(gammas, torch.tensor([[[0, 1], [1, 0]], [[0, -i], [i, 0]]], dtype=C)))
+        self.assertTrue(torch.equal(gamma5, torch.tensor([[1, 0], [0, -1]], dtype=C)))
 
 
 class WilsonDiracTest(unittest.TestCase):
@@ -141,6 +167,32 @@ class WilsonDiracTest(unittest.TestCase):
         col = ((t * geo.L + x) * geo.spin + s) * geo.N + c
         self.assertLess((M[:, col] - D.apply(psi).reshape(-1)).abs().max().item(), 1e-15)
 
+    def test_sparse_matches_dense_4x4(self):
+        # once on 4^4 SU(3) (dense dimension 3072), including apply_dagger vs the dense adjoint
+        geo = G4_44
+        D = WilsonDirac(random_links(geo, 1, 33), 0.13, geo)
+        psi = random_field(geo, 1, 34)
+        M = dense_matrix(D, geo)
+        self.assertEqual(M.shape, (3072, 3072))
+        self.assertLess((D.apply(psi).reshape(-1) - M @ psi.reshape(-1)).abs().max().item(), 1e-13)
+        self.assertLess((D.apply_dagger(psi).reshape(-1) - M.conj().T @ psi.reshape(-1)).abs().max().item(),
+                        1e-13)
+
+    def test_float32_kappa_is_upcast_after_rounding(self):
+        # Current behaviour, documented: a float32 kappa tensor is cast to float64 with its
+        # float32-rounded value (no error, no warning); pass float64 to get the exact value.
+        # A check belongs in dirac.py (_kappa_tensor).
+        U = random_links(G2, 2, 35)
+        k32 = torch.tensor([0.12, 0.13])
+        self.assertEqual(k32.dtype, torch.float32)
+        D32 = WilsonDirac(U, k32, G2)
+        D64 = WilsonDirac(U, torch.tensor([0.12, 0.13], dtype=torch.float64), G2)
+        self.assertEqual(D32.kappa.dtype, torch.float64)
+        self.assertTrue(torch.equal(D32.kappa, k32.to(torch.float64)))
+        self.assertTrue(torch.equal(D64.kappa, torch.tensor([0.12, 0.13], dtype=torch.float64)))
+        self.assertGreater((D32.kappa - D64.kappa).abs().max().item(), 1e-10)
+        self.assertTrue(torch.equal(WilsonDirac(U, k32.to(torch.float64), G2).kappa, D32.kappa))
+
     def test_free_spectrum(self):
         kappa = 0.11
         for geo in (G4, G2):
@@ -153,16 +205,21 @@ class WilsonDiracTest(unittest.TestCase):
                     self.assertEqual(lam.numel(), ref.numel())
                     self.assertLess(max_multiset_distance(lam, ref), 1e-10)
                     spectra[time_sign] = lam
-            # the boundary condition changes the spectrum
-            self.assertGreater(max_multiset_distance(spectra[-1.0], spectra[1.0]), 1e-2)
-            # the two predictions are not interchangeable
-            ref_p = free_wilson_eigenvalues(geo, kappa, 1.0)
-            self.assertGreater(max_multiset_distance(spectra[-1.0], ref_p), 1e-2)
+            if len(spectra) < 2:
+                continue  # a failure above is already reported for this geometry
+            with self.subTest(geometry=geo, check="boundary conditions differ"):
+                # the boundary condition changes the spectrum
+                self.assertGreater(max_multiset_distance(spectra[-1.0], spectra[1.0]), 1e-2)
+                # the two predictions are not interchangeable
+                ref_p = free_wilson_eigenvalues(geo, kappa, 1.0)
+                self.assertGreater(max_multiset_distance(spectra[-1.0], ref_p), 1e-2)
 
     def test_free_plane_waves_pin_momentum_sign(self):
-        # psi(n) = exp(-i p.n) u is mapped to exp(-i p.n) D(p) u, n = array index.
+        # psi(n) = exp(-i p.n) u is mapped to exp(-i p.n) D(p) u, n = array index. Only momenta
+        # with sin p != 0 see the sign of the exponent and the assignment of the projectors
+        # (1 -/+ gamma_mu), so the test uses three of those in every subtest (L = 4 in 4D).
         kappa = 0.11
-        for geo in (G4, G2):
+        for geo in (G4_44, G2):
             for time_sign in (-1.0, 1.0):
                 with self.subTest(geometry=geo, time_sign=time_sign):
                     D = WilsonDirac(unit_links(geo), kappa, geo, time_sign)
@@ -171,18 +228,22 @@ class WilsonDiracTest(unittest.TestCase):
                         *[torch.arange(k, dtype=torch.float64) for k in geo.lattice], indexing="ij")], -1)
                     g = torch.Generator().manual_seed(51)
                     u = torch.randn(geo.spin, geo.N, dtype=C, generator=g)
-                    for k in (1, 3, p_all.shape[0] // 2 + 1):
+                    weight = p_all.sin().abs().sum(dim=1)
+                    chosen = torch.nonzero(weight > 0.5).flatten()
+                    self.assertGreaterEqual(chosen.numel(), 3)
+                    for k in chosen[torch.linspace(0, chosen.numel() - 1, 3).long()].tolist():
                         p = p_all[k]
+                        self.assertGreater(p.sin().abs().max().item(), 0.5)
                         wave = torch.exp(-1j * (n.to(C) @ p.to(C))).reshape(geo.lattice)
                         psi = (wave[..., None, None] * u)[None]
-                        Dp = free_wilson_matrix(geo, kappa, p)
+                        Dp = closed_form_free_matrix(geo, kappa, p)
+                        self.assertLess((free_wilson_matrix(geo, kappa, p) - Dp).abs().max().item(), 1e-15)
                         ref = (wave[..., None, None] * (Dp @ u))[None]
                         self.assertLess((D.apply(psi) - ref).abs().max().item(), 1e-13)
-                        # opposite sign of the exponent fails whenever sin p != 0
-                        if p.sin().abs().max() > 1e-6:
-                            psi_m = (wave.conj()[..., None, None] * u)[None]
-                            ref_m = (wave.conj()[..., None, None] * (Dp @ u))[None]
-                            self.assertGreater((D.apply(psi_m) - ref_m).abs().max().item(), 1e-3)
+                        # the opposite sign of the exponent fails since sin p != 0
+                        psi_m = (wave.conj()[..., None, None] * u)[None]
+                        ref_m = (wave.conj()[..., None, None] * (Dp @ u))[None]
+                        self.assertGreater((D.apply(psi_m) - ref_m).abs().max().item(), 1e-3)
 
     def test_batch_independence(self):
         geo = G4
