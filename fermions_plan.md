@@ -1,6 +1,6 @@
 # Fermioni dinamici in neoqcd: piano (branch `fermions`)
 
-Stato: piano, 4 novembre 2026. Nessuna riga di codice fermionico esiste ancora nel repository.
+Stato: piano del 4 novembre 2026; prima implementazione completata nella notte del 6-7 novembre 2026 (vedi "Stato al 7 novembre" in fondo e `doc/fermions.md`).
 
 ## Decisioni prese
 
@@ -287,3 +287,24 @@ Dimensioni tipiche: `verify-module` 10-15 agenti di cui 4-7 Fable; `benchmark-co
 - Caselle, Nada, Panero, arXiv:1801.03110.
 - Bulgarelli, Cellini, Nada, Phys. Rev. D 111 (2025) 074517, arXiv:2412.00200 (SNF SU(3), protocolli in β).
 - Jansen, Liu, hep-lat/9506020 (SU(2) N_f = 2 Wilson, 12^4).
+
+## Stato al 7 novembre 2026
+
+Branch `fermions`, 20 commit nella notte del 6-7 novembre, tutti con test verdi; nessun modulo SU(3) esistente modificato. Ogni modulo è stato scritto da un agente Opus e confutato da un agente Fable con derivazioni indipendenti e mutazioni deliberate; i rilievi sono entrati in commit di rifinitura separati. Dettagli, convenzioni e limiti in `doc/fermions.md`.
+
+Fatto (verificato solo su 2D 4x4, 2^3 x 4, 2^4 e 4^4, sul Mac):
+- Fase 0: operatore di Wilson, even-odd, CG/BiCGstab, matrice densa, spettro libero, correlatore pionico libero, log det. Staggered con fasi, even-odd, spettro libero.
+- B1: HMC di pura gauge (momenti, forza dalle staple, leapfrog e Omelyan a più livelli, confronto con l'heatbath).
+- Fase 1: pseudofermioni N_f = 2 even-odd, forza analitica (contro differenze finite e autograd su solve densi), HMC a due livelli, Metropolis a determinante esatto come riferimento indipendente, Hasenbusch.
+- C2: pseudofermioni staggered (N_f = 2^{D/2}), forza, HMC, Metropolis esatto.
+- Fase 3: `QCDAction` con parametro β, κ (o massa) o bc, blocchi HMC con stato (U, φ), NE-MCMC con identità di Jarzynski verificata contro i rapporti esatti dei determinanti nei tre protocolli (Wilson e staggered).
+- Fase 4 passo 2: azione pseudofermionica come `autograd.Function` con backward dalla forza (nessuna retropropagazione nel CG), strati deterministici con S_pf nel lavoro, `FermionSNF` allenabile, log-Jacobiano di Haar verificato esattamente per SU(3).
+- Fase 5: REX sul difetto di sola gauge con repliche HMC, swap senza solve, storia delle repliche, passo distribuito su `ParallelTempering`.
+- Driver `main_hmc.py`, `main_snf_fermions.py`, `main_rex_fermions.py` con ripresa da checkpoint; job di debug per Leonardo (non lanciati).
+
+Da fare, in ordine:
+1. Primi run su Leonardo (coda di debug): `job/debug_hmc_fermions.sh` (4^4 β = 1, κ = 0.1 con log det esatto; 8^4 β = 5.6, κ = 0.153), poi `debug_snf_fermions.sh` e `debug_rex_fermions.sh`. Nessun codice fermionico ha ancora girato su GPU.
+2. openQCD e Grid su Leonardo per i punti 4^4 e 8^4 (traccia B3).
+3. Fase 4 passo 3: training SNF nei tre protocolli ai punti di benchmark; confronto con HMC e con i flussi MIT; costo in solve per configurazione.
+4. SNF con strati per staggered (in corso), RHMC N_f = 2 staggered, clover, DD-HMC (opzionale), protocollo a fisica costante.
+5. Rilievo ereditato dal codice puro gauge: la regola "2x" di `Flow._full_logdet` per SU(2) non è il Jacobiano di Haar esatto (errore relativo ~1e-3 a ρ = 0.01-0.1); per SU(3) il log det dello strato è esatto a 1e-14.
