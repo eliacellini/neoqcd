@@ -23,3 +23,5 @@ from neoqcd.mcmc import HBOR  # noqa: F401
 from neoqcd.utils import create_mask  # noqa: F401
 from neoqcd.smearing import CouplingLayer, ResidualCouplingLayer  # noqa: F401
 from neoqcd.flow import FlowPars  # noqa: F401
+from neoqcd.utils import Defect, translate_periodic_replica  # noqa: F401
+from neoqcd.replica_history import replica_observable_series, rung_indices, summarize_history  # noqa: F401
