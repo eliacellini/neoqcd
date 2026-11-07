@@ -15,7 +15,8 @@ import torch
 
 from neoqcd.fermions._gauge import FlowPars, create_mask
 from neoqcd.fermions.action import QCDAction
-from neoqcd.fermions.algebra import expi, random_algebra
+from neoqcd.fermions.algebra import (algebra_basis, algebra_components, expi, project_hermitian_traceless,
+                                     random_algebra)
 from neoqcd.fermions.exact import assemble_even_odd
 from neoqcd.fermions.lattice import parity
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson
@@ -212,6 +213,41 @@ class BookkeepingTest(unittest.TestCase):
         self.assertGreater((st.U - U).abs().max().item(), 1e-3)
 
 
+class HaarJacobianTest(unittest.TestCase):
+    """2b. The layer's dlogJ is the exact Haar log-Jacobian (SU(3)): one stout `CouplingLayer` at
+    rho = 0.05 on one random 2D 4 x 4 configuration; the Jacobian of the whole layer map in
+    orthonormal tangent coordinates (input U = e^{iX} U_0, output components of
+    -i U'(X) U'(0)^dagger projected on su(3), both in the basis tr(T^a T^b) = delta_ab) by dense
+    autograd. Left-invariant coordinates on both sides, so log |det J| is the Haar log-Jacobian;
+    the full 256 x 256 determinant (block-triangular over the mask blocks) is exact."""
+
+    def test_logdet(self):
+        gen = torch.Generator().manual_seed(31)
+        U0 = expi(random_algebra((1, G2.D, G2.T, G2.L, G2.N, G2.N), gen))
+        fp = flow_pars([KAPPA], 1)
+        layer = make_gauge_layers(fp, "smearing", rho=0.05)[0]
+        T = algebra_basis(G2.N)
+        with torch.no_grad():
+            U0p, _, dlogJ = layer(U0, fp, None, beta=KAPPA, delta_beta=0.0)
+        dlogJ = FermionLayerBlock(layer, make_action("kappa"), fp, KAPPA, 0.0)._full_logdet(
+            torch.as_tensor(dlogJ, dtype=torch.float64).reshape(-1))[0].item()
+        n = U0[..., 0, 0].numel() * T.shape[0]
+
+        def f(x):
+            X = torch.einsum("...a,aij->...ij", x.view(U0.shape[:-2] + (T.shape[0],)).to(U0.dtype), T)
+            Up, _, _ = layer(torch.matmul(expi(X), U0), fp, None, beta=KAPPA, delta_beta=0.0)
+            Y = project_hermitian_traceless(-1j * torch.matmul(Up, U0p.conj().transpose(-1, -2)))
+            return algebra_components(Y).reshape(-1)
+
+        J = torch.autograd.functional.jacobian(f, torch.zeros(n, dtype=torch.float64), vectorize=True)
+        sign, logdet = torch.linalg.slogdet(J)
+        print(f"\nHaar log-Jacobian, stout rho = 0.05, 4x4 SU(3): dense {logdet.item():.15f}, layer {dlogJ:.15f}, "
+              f"diff {logdet.item() - dlogJ:.1e}")
+        self.assertEqual(sign.item(), 1.0)
+        self.assertGreater(abs(dlogJ), 1e-2)
+        self.assertLess(abs(logdet.item() - dlogJ), 1e-10)
+
+
 RHO_J = 0.005
 
 
@@ -269,7 +305,8 @@ class JarzynskiTest(unittest.TestCase):
 
 class TrainingSmokeTest(unittest.TestCase):
     """4. 20 Adam steps on mean(W) for kappa 0.18 -> 0.21 in 2 steps: finite gradients, and the
-    mean work at a fixed seed on fixed starts (common random numbers) does not increase beyond noise."""
+    mean work at a fixed seed on fixed starts (common random numbers) decreases by more than one
+    standard error of the paired difference."""
 
     def test_training(self):
         Ensembles.build()
@@ -283,7 +320,7 @@ class TrainingSmokeTest(unittest.TestCase):
         def evaluate():
             with torch.no_grad():
                 W = torch.cat([snf(FieldState(Us), torch.Generator().manual_seed(99))[1]
-                               for Us in (Ensembles.starts[0][:32], Ensembles.starts[1][:32])])
+                               for Us in (Ensembles.starts[0], Ensembles.starts[1])])
             return W
 
         W_before = evaluate()
@@ -304,8 +341,10 @@ class TrainingSmokeTest(unittest.TestCase):
         d, e = diff.mean().item(), (diff.std() / math.sqrt(diff.numel())).item()
         print(f"\ntraining: losses first/last 5 {[round(x, 4) for x in losses[:5]]} / {[round(x, 4) for x in losses[-5:]]}\n"
               f"  <W> fixed seed before {W_before.mean().item():.4f}, after {W_after.mean().item():.4f}, "
-              f"paired diff {d:+.4f}({e:.4f}); rho = {[p.detach().reshape(-1).tolist() for p in params]}")
-        self.assertLess(d, 3 * e + 1e-12)
+              f"paired diff {d:+.4f}({e:.4f}) = {d / e:+.2f} sigma; rho = {[p.detach().reshape(-1).tolist() for p in params]}")
+        # Trained rho may cross zero: the stout layer uses |rho| (Smearing._mask_rho), so the sign
+        # of the printed rho is not meaningful, only its modulus.
+        self.assertLess(d, -e)
 
 
 if __name__ == "__main__":

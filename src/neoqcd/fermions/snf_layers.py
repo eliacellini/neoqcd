@@ -18,9 +18,12 @@ Bookkeeping (S(x; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa) of `QCDAction
     W = sum_i (dW_i^jump + dW_i^layer),  Q = sum_i dQ_i,  logJ = sum_i log J_i,
     W + Q = S(x_n; lambda_n) - S(x_0; lambda_0) - logJ,
 
-the identity `w = st - s0 - Q - logJ` of `Flow.__call__`. log J_i = log |det df_i/dU| is the Haar
-log-Jacobian the pure-gauge layer returns (doubled for the legacy SU(2) stout layer, as in
-`Flow._full_logdet`). Jarzynski: <exp(-W)> = Z(lambda_n)/Z(lambda_0) on the joint (U, phi), since
+the identity `w = st - s0 - Q - logJ` of `Flow.__call__`. log J_i is the log-Jacobian the pure-gauge
+layer returns, treated as in `Flow._full_logdet`. For SU(3) it is the exact Haar log-Jacobian
+log |det df_i/dU| (checked against the dense tangent-space Jacobian to ~1e-14, test_fermions_snf);
+for SU(2) the stout value is doubled by the legacy rule of `Flow._full_logdet`, which is NOT the
+exact Haar log-Jacobian (relative error ~1e-3 measured at rho = 0.01-0.1), so Jarzynski is only
+approximate there (`FermionLayerBlock` warns). Jarzynski: <exp(-W)> = Z(lambda_n)/Z(lambda_0) on the joint (U, phi), since
 each layer is a bijection of U at fixed phi with Jacobian J_i and each HMC trajectory leaves
 exp(-S(x; lambda_i)) invariant.
 
@@ -65,6 +68,8 @@ exactly SU(N) as functions of their inputs and parameters, so every vector-Jacob
 through them annihilates it. Conversely F = project_hermitian_traceless(-i G U^dagger) recovers
 the force from any gradient G with the same tangent part (G = i F U + normal part).
 """
+
+import warnings
 
 import torch
 
@@ -175,9 +180,16 @@ class FermionLayerBlock(torch.nn.Module):
         self.flow_pars = flow_pars
         self.condition = float(condition)
         self.delta_condition = float(delta_condition)
+        if action.geometry.N == 2 and not isinstance(layer, ResidualCouplingLayer):
+            warnings.warn("FermionLayerBlock with SU(2) and a stout layer: the log-Jacobian follows the "
+                          "legacy 2x rule of Flow._full_logdet, which is not the exact Haar log-Jacobian "
+                          "(relative error ~1e-3); the work is only approximately Jarzynski-exact",
+                          RuntimeWarning, stacklevel=2)
 
     def _full_logdet(self, logdet):
-        # as Flow._full_logdet: the legacy SU(2) stout determinant counts complex entries twice
+        # As Flow._full_logdet (legacy SU(2) stout rule: logdet doubled). For SU(3) the layer's
+        # dlogJ is the exact Haar log-Jacobian (to ~1e-14); for SU(2) the doubled value is not
+        # (relative error ~1e-3 at rho = 0.01-0.1, measured), see the module doc.
         if self.action.geometry.N == 2 and not isinstance(self.layer, ResidualCouplingLayer):
             return 2.0 * logdet
         return logdet
@@ -200,10 +212,14 @@ class FermionLayerBlock(torch.nn.Module):
         return new_state, dW, S_new, dlogJ
 
 
-def make_gauge_layers(flow_pars, kind="smearing", rho=0.0):
+def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3):
     """One pure-gauge layer per protocol step, as `Flow.__init__` builds them for flow_type='snf'
     (time (i+1)/n): kind "smearing" -> `CouplingLayer` with rho_layer = rho * ones(rho_shape)
-    (a float or a tensor of shape rho_shape), "residual" -> `ResidualCouplingLayer`."""
+    (a float or a tensor of shape rho_shape), "residual" -> `ResidualCouplingLayer`.
+
+    The default rho is small but nonzero: the stout layer uses |rho| (`Smearing._mask_rho`), whose
+    gradient at rho = 0 exactly is zero, so layers built with rho = 0 are silently untrainable.
+    Pass rho = 0.0 explicitly for the identity layers (the NE-MCMC limit)."""
     n = int(flow_pars.nstep)
     layers = []
     for i in range(n):
