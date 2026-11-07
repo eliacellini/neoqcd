@@ -31,6 +31,11 @@ the action S(x; kappa_{i-1}) already known from the end of the previous block (o
 not two). A zero jump (lambda_i == lambda_{i-1}) is exactly zero, so a constant protocol has W = 0
 exactly. S(x_i; lambda_i) at the end of a block is always recomputed from scratch.
 
+Staggered fermions: with a `QCDAction(..., fermions="staggered")` everything above holds with the
+mass in place of kappa (protocol parameter "mass", one solve per jump as for kappa) and
+Z(lambda) ~ int dU det M_ee(m) exp(-S_g(U; beta, bc)); FieldState.phi is then the even-site
+staggered field. Nothing in this module depends on the fermion discretisation beyond that.
+
 Accumulators: `FieldState` carries `work`, `heat` and `logJ` per configuration, so a run can be
 continued from its final state; `FermionNEMCMC.forward` also returns W and Q of the run alone.
 """
@@ -145,7 +150,7 @@ class FermionNEMCMC:
         """(dW, S(x; p_new)) at fixed fields, given S_cur = S(x; p_old)."""
         if _same_parameter(p_old, p_new):
             return torch.zeros_like(S_cur), S_cur
-        if self.action.parameter_name == "kappa":
+        if self.action.parameter_name in ("kappa", "mass"):  # fermion parameter: one solve
             S_new = self.action.action(U, p_new)
             return S_new - S_cur, S_new
         dW = self.action.action_difference(U, p_old, p_new)

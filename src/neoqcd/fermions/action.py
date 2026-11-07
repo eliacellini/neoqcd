@@ -24,6 +24,14 @@ Parameters are a float or a (B,) tensor (one value per configuration). For bc a 
 per-configuration plaquette weights of shape (B,) + lattice (`bc_plaquette_weights`), which
 `hmc.WilsonGaugeAction` accepts as they are.
 
+Staggered fermions (`QCDAction(..., fermions="staggered", mass=m)`): the fermion term is
+`ParametricStaggeredPseudofermion` (one even-site field, N_f = 2^(D/2), see
+`staggered_pseudofermion`), S_pf = phi^dagger M_ee(m)^-1 phi, and the mass protocol replaces the
+kappa one: parameter_name in {"beta", "mass", "bc"} ("kappa" is rejected for staggered, "mass" for
+Wilson). A mass jump at fixed fields is S_pf(m_new) - S_pf(m_old), two CG solves of M_ee (the
+NE-MCMC driver spends one, as for kappa); beta and bc are unchanged (gauge only, no solve). Z(m) is
+proportional to int dU det M_ee(m) exp(-S_g).
+
 kappa updates: `ParametricTwoFlavourWilson` is a `TwoFlavourWilson` with `set_kappa`. Nothing is
 cached per kappa in TwoFlavourWilson (the Dirac operator is rebuilt from `self.kappa` at every
 call), so changing kappa costs nothing; the only kappa-dependent cache is eta^dagger eta = S_pf at
@@ -37,11 +45,15 @@ import torch
 from neoqcd.fermions._gauge import plaquette_fields
 from neoqcd.fermions.hmc import Hamiltonian, WilsonGaugeAction
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson
+from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion
 
-__all__ = ["PARAMETER_NAMES", "bc_link_couplings", "bc_plaquette_weights", "ParametricTwoFlavourWilson",
+__all__ = ["PARAMETER_NAMES", "STAGGERED_PARAMETER_NAMES", "FERMION_TYPES", "bc_link_couplings",
+           "bc_plaquette_weights", "ParametricTwoFlavourWilson", "ParametricStaggeredPseudofermion",
            "JointHamiltonian", "QCDAction"]
 
-PARAMETER_NAMES = ("beta", "kappa", "bc")
+PARAMETER_NAMES = ("beta", "kappa", "bc")  # Wilson fermions (the default)
+STAGGERED_PARAMETER_NAMES = ("beta", "mass", "bc")
+FERMION_TYPES = ("wilson", "staggered")
 
 
 def _as_parameter(value):
@@ -121,6 +133,52 @@ class ParametricTwoFlavourWilson(TwoFlavourWilson):
         return self.action(U_new) - self.action(U_old)
 
 
+class ParametricStaggeredPseudofermion(StaggeredPseudofermion):
+    """`StaggeredPseudofermion` whose mass can change between calls at fixed phi.
+
+    Nothing is cached per mass in the base class except S_pf at the refresh links, which (unlike
+    the Wilson eta^dagger eta) needs a solve and is computed lazily by `action_difference` at
+    whatever mass is current at that moment. Here that cached value is keyed by the mass it was
+    computed at: it is reused only while the current mass equals that mass, otherwise it is
+    recomputed (one solve) at the current mass. The last CG solution X is kept across mass changes
+    as the initial guess (only affects the iteration count).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mass = _as_parameter(self.mass)
+        self._refresh_action_mass = None
+
+    def set_mass(self, mass):
+        self.mass = _as_parameter(mass)
+
+    def set_phi(self, phi):
+        """Install a pseudofermion field (e.g. carried by a `FieldState`); drops the refresh cache."""
+        self.phi = phi
+        self.X = None
+        self._refresh_links = None
+        self._refresh_version = None
+        self._refresh_action = None
+        self._refresh_action_mass = None
+
+    def refresh(self, U, generator=None):
+        super().refresh(U, generator)
+        self._refresh_action_mass = None
+
+    def action_difference(self, U_old, U_new):
+        """S_pf(U_new) - S_pf(U_old) at fixed phi and the current mass; the refresh-links value is
+        cached per mass (class doc)."""
+        S_new = self.action(U_new)
+        if U_old is self._refresh_links and U_old._version == self._refresh_version:
+            if self._refresh_action is None or not _same_parameter(self.mass, self._refresh_action_mass):
+                self._refresh_action = self.action(U_old)
+                self._refresh_action_mass = self.mass
+            S_old = self._refresh_action
+        else:
+            S_old = self.action(U_old)
+        return S_new - S_old
+
+
 class JointHamiltonian(Hamiltonian):
     """Fermion term on the outer level, gauge term on the inner one (as `TwoFlavourHamiltonian`),
     but with a given (shared) fermion term. Attributes `fermion` and `gauge`."""
@@ -132,17 +190,23 @@ class JointHamiltonian(Hamiltonian):
 
 
 class QCDAction:
-    """S(U, phi; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa), lambda = `parameter_name`.
+    """S(U, phi; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa or mass), lambda = `parameter_name`.
 
     Args:
         geometry: `lattice.Geometry`.
-        parameter_name: "beta", "kappa" or "bc", the protocol parameter.
+        parameter_name: "beta", "kappa" or "bc" (Wilson), "beta", "mass" or "bc" (staggered), the
+            protocol parameter.
         beta, kappa: couplings; the one named by `parameter_name` is the initial parameter value.
+            kappa is required for Wilson fermions and must be None for staggered ones.
+        fermions: "wilson" (default, N_f = 2 `TwoFlavourWilson`) or "staggered" (one even-site
+            staggered field, N_f = 2^(D/2), `StaggeredPseudofermion`).
+        mass: staggered bare mass (required for "staggered", must be None for "wilson").
         bc: defect parameter (default 1, no defect); needs `defect_mask` (shape (2, D) + lattice,
             the layout of `utils.Defect`/`DefectMCMCAdapter`) unless bc stays 1 and the protocol
             is not "bc".
         n_gauge_substeps: inner gauge steps per outer fermion step of the Hamiltonians.
-        Extra keyword arguments go to `TwoFlavourWilson` (time_sign, even_odd, solver_tol, ...).
+        Extra keyword arguments go to `TwoFlavourWilson` (time_sign, even_odd, solver_tol, ...)
+        or `StaggeredPseudofermion` (time_sign, solver_tol, action_tol, max_iter, reuse_guess).
 
     Interface (that of a target for distributedPT/Flow):
         set_parameter(value), parameter;
@@ -151,18 +215,36 @@ class QCDAction:
         action_difference(U, p_old, p_new) -> (B,)        at fixed (U, phi), see module doc;
         refresh(U, generator)                             phi heat bath at the current parameter;
         hamiltonian(parameter=None) -> JointHamiltonian   for the HMC blocks;
-        phi (get/set), fermion (the shared ParametricTwoFlavourWilson, holding phi and its stats).
+        phi (get/set), fermion (the shared ParametricTwoFlavourWilson or
+        ParametricStaggeredPseudofermion, holding phi and its stats);
+        fermions ("wilson"/"staggered"), fermion_parameter_name ("kappa"/"mass").
     `hamiltonian(p)` sets the current parameter to p, because its fermion term is the shared one.
     """
 
-    def __init__(self, geometry, parameter_name, beta, kappa, bc=1.0, defect_mask=None,
-                 n_gauge_substeps=1, **fermion_kwargs):
-        if parameter_name not in PARAMETER_NAMES:
-            raise ValueError(f"parameter_name must be one of {PARAMETER_NAMES}, got {parameter_name!r}")
+    def __init__(self, geometry, parameter_name, beta, kappa=None, bc=1.0, defect_mask=None,
+                 n_gauge_substeps=1, fermions="wilson", mass=None, **fermion_kwargs):
+        if fermions not in FERMION_TYPES:
+            raise ValueError(f"fermions must be one of {FERMION_TYPES}, got {fermions!r}")
+        names = PARAMETER_NAMES if fermions == "wilson" else STAGGERED_PARAMETER_NAMES
+        if parameter_name not in names:
+            raise ValueError(f"parameter_name must be one of {names} for {fermions} fermions, got {parameter_name!r}")
+        if fermions == "wilson":
+            if kappa is None:
+                raise ValueError("Wilson fermions need kappa")
+            if mass is not None:
+                raise ValueError("mass is a staggered parameter: Wilson fermions take kappa (use fermions='staggered')")
+        else:
+            if mass is None:
+                raise ValueError("staggered fermions need mass")
+            if kappa is not None:
+                raise ValueError("kappa is a Wilson parameter: staggered fermions take mass")
         self.geometry = geometry
+        self.fermions = fermions
+        self.fermion_parameter_name = "kappa" if fermions == "wilson" else "mass"
         self.parameter_name = parameter_name
         self.beta = _as_parameter(beta)
-        self.kappa = _as_parameter(kappa)
+        self.kappa = None if kappa is None else _as_parameter(kappa)
+        self.mass = None if mass is None else _as_parameter(mass)
         self.bc = _as_parameter(bc)
         if defect_mask is not None:
             defect_mask = torch.as_tensor(defect_mask, dtype=torch.float64)
@@ -173,7 +255,10 @@ class QCDAction:
             raise ValueError("a bc protocol needs a defect_mask")
         self.defect_mask = defect_mask
         self.n_gauge_substeps = int(n_gauge_substeps)
-        self.fermion = ParametricTwoFlavourWilson(self.kappa, geometry, **fermion_kwargs)
+        if fermions == "wilson":
+            self.fermion = ParametricTwoFlavourWilson(self.kappa, geometry, **fermion_kwargs)
+        else:
+            self.fermion = ParametricStaggeredPseudofermion(self.mass, geometry, **fermion_kwargs)
 
     # ---- parameter -------------------------------------------------------------------------
     @property
@@ -182,15 +267,26 @@ class QCDAction:
 
     def set_parameter(self, value):
         setattr(self, self.parameter_name, _as_parameter(value))
-        if self.parameter_name == "kappa":
-            self.fermion.set_kappa(self.kappa)
+        if self.parameter_name == self.fermion_parameter_name:
+            self._set_fermion_parameter(getattr(self, self.parameter_name))
+
+    def _set_fermion_parameter(self, value):
+        if self.fermions == "wilson":
+            self.fermion.set_kappa(value)
+        else:
+            self.fermion.set_mass(value)
+
+    def _get_fermion_parameter(self):
+        return self.fermion.kappa if self.fermions == "wilson" else self.fermion.mass
 
     def _couplings(self, parameter):
-        """(beta, kappa, bc) with the protocol parameter replaced by `parameter` if given."""
-        c = {"beta": self.beta, "kappa": self.kappa, "bc": self.bc}
+        """(beta, kappa, bc) with the protocol parameter replaced by `parameter` if given; for
+        staggered fermions the middle entry is the mass."""
+        f = self.fermion_parameter_name
+        c = {"beta": self.beta, f: getattr(self, f), "bc": self.bc}
         if parameter is not None:
             c[self.parameter_name] = _as_parameter(parameter)
-        return c["beta"], c["kappa"], c["bc"]
+        return c["beta"], c[f], c["bc"]
 
     # ---- pseudofermion state ---------------------------------------------------------------
     @property
@@ -202,8 +298,9 @@ class QCDAction:
         self.fermion.set_phi(value)
 
     def refresh(self, U, generator=None):
-        """phi = D_hat^dagger eta at the current kappa: S_pf(U) = eta^dagger eta afterwards."""
-        self.fermion.set_kappa(self.kappa)
+        """phi heat bath at the current kappa (Wilson: phi = D_hat^dagger eta, S_pf(U) = eta^dagger eta
+        afterwards) or mass (staggered: phi = (D^dagger chi)_e)."""
+        self._set_fermion_parameter(getattr(self, self.fermion_parameter_name))
         self.fermion.refresh(U, generator)
 
     # ---- gauge part -----------------------------------------------------------------------
@@ -223,14 +320,14 @@ class QCDAction:
 
     # ---- fermion part ---------------------------------------------------------------------
     def fermion_action(self, U, parameter=None):
-        """S_pf(U, phi; kappa) at the kappa of `parameter` (one solve); the current kappa is kept."""
-        _, kappa, _ = self._couplings(parameter)
-        saved = self.fermion.kappa
-        self.fermion.set_kappa(kappa)
+        """S_pf(U, phi; kappa or mass) at the value of `parameter` (one solve); the current one is kept."""
+        _, value, _ = self._couplings(parameter)
+        saved = self._get_fermion_parameter()
+        self._set_fermion_parameter(value)
         try:
             return self.fermion.action(U)
         finally:
-            self.fermion.set_kappa(saved)
+            self._set_fermion_parameter(saved)
 
     # ---- joint action ---------------------------------------------------------------------
     def action(self, U, parameter=None):
@@ -246,7 +343,7 @@ class QCDAction:
                 dbeta = dbeta.to(device=U.device)
             slope = WilsonGaugeAction(1.0, self.geometry, self.plaquette_weights(self.bc)).action(U)
             return dbeta * slope
-        if name == "kappa":
+        if name in ("kappa", "mass"):
             return self.fermion_action(U, p_new) - self.fermion_action(U, p_old)
         # bc: gauge only, (beta/N) sum_p (w_old - w_new) Re tr U_p
         D, N = self.geometry.D, self.geometry.N
@@ -269,5 +366,5 @@ class QCDAction:
         """JointHamiltonian at `parameter` (default: the current one), which becomes current."""
         if parameter is not None:
             self.set_parameter(parameter)
-        self.fermion.set_kappa(self.kappa)
+        self._set_fermion_parameter(getattr(self, self.fermion_parameter_name))
         return JointHamiltonian(self.fermion, self.gauge_term(), self.n_gauge_substeps)
