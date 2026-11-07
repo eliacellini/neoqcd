@@ -1,6 +1,6 @@
 # Dynamical fermions in neoqcd (`src/neoqcd/fermions/`)
 
-Branch `fermions`, commits `237383c` .. `ec05820` (the plan, `fermions_plan.md`, is `3c1b17c`).
+Branch `fermions`, commits `237383c` .. `bcc4757` (the plan, `fermions_plan.md`, is `3c1b17c`).
 This page describes the code as it is. The plan holds the motivation and the literature.
 
 ## 1. Scope and status
@@ -17,13 +17,18 @@ This page describes the code as it is. The plan holds the motivation and the lit
   outside, gauge force inside), and the pure-gauge Wilson action with optional defect weights.
 - Exact dense-determinant tools and exact-determinant Metropolis samplers (Wilson, staggered)
   for tiny lattices.
-- `QCDAction`: one parametric joint action S(U, φ; λ) with λ ∈ {β, κ, bc}. The defect `bc`
-  enters the gauge action only (Bonanno et al., arXiv:2404.14151).
-- Fermionic NE-MCMC (Jarzynski on the joint (U, φ)) for protocols in β, κ or bc.
+- Hasenbusch mass preconditioning for N_f = 2 Wilson (`hasenbusch.py`): heavy and ratio terms,
+  three-level Hamiltonian. On 2D 4×4 it saves no cost; the gain is to be measured on larger lattices.
+- `QCDAction`: one parametric joint action S(U, φ; λ) with λ ∈ {β, κ, bc} (Wilson) or
+  {β, mass, bc} (`fermions="staggered"`). The defect `bc` enters the gauge action only
+  (Bonanno et al., arXiv:2404.14151).
+- Fermionic NE-MCMC (Jarzynski on the joint (U, φ)) for protocols in β, κ/mass or bc, Wilson or staggered.
 - Fermionic SNF: pure-gauge stout/residual layers (trainable) before every HMC block. The S_pf
-  gradient comes from a custom autograd Function, with no backpropagation through CG.
+  gradient comes from a custom autograd Function, with no backpropagation through CG. Wilson
+  only for now; staggered SNF with layers is in progress in `snf_layers.py`.
 - REX on the gauge-only defect: fermionic HMC replicas and solve-free swaps. There is a
-  single-process `FermionREX` and a `distributedPT.ParallelTempering` target (tested on Gloo).
+  single-process, device-safe `FermionREX` and a `distributedPT.ParallelTempering` target (tested
+  on Gloo). Wilson and staggered.
 - Drivers `main/main_hmc.py`, `main/main_snf_fermions.py` and `main/main_rex_fermions.py`, all
   with checkpoint/resume, plus three Leonardo debug jobs.
 
@@ -34,11 +39,10 @@ against plain HMC. No physics number on 4^4 or 8^4 has been produced yet.
 
 **Not done.**
 
-- Hasenbusch mass preconditioning.
 - Clover term.
 - RHMC: staggered N_f = 2 in 4D, Zolotarev, multishift CG.
 - DD-HMC.
-- Staggered in `QCDAction`/NE-MCMC/SNF/REX: these are Wilson only.
+- Staggered SNF with layers (in progress).
 - O-REX and NEO-REX with fermions (out of this plan).
 - The 4^4 (β = 1, κ = 0.1) and 8^4 (β = 5.6, κ = 0.153, 0.1545) benchmarks.
 - The comparison with openQCD/Grid.
@@ -115,11 +119,16 @@ tensors that vanish on odd sites. All extents must be even.
   - Normalisation: ∫dφ dφ* e^{−S_pf} = π^n det(D̂†D̂).
   - Refresh: φ = D̂†η, with η complex Gaussian of density ∝ e^{−η†η} (⟨|η_i|²⟩ = 1, `torch.randn`).
     Then S_pf at the refresh links is exactly η†η (cached, no solve) and ⟨S_pf⟩ = n = V/2·S·N.
+- Hasenbusch (`hasenbusch.py`, hep-lat/0107019): det D̂†D̂ = det D̂'†D̂' · det A†A with
+  D̂' = D̂(κ'), κ' < κ, A = D̂D̂'^{−1}. Heavy term S_1 = φ_1†(D̂'†D̂')^{−1}φ_1; ratio term
+  S_2 = χ†M^{−1}χ with χ = D̂'†φ_2, refreshed so that S_2 = η_2†η_2. Formulas and forces in the
+  module docstring.
 - Staggered (`staggered_pseudofermion.py`):
   - Action: S_pf = φ†M_ee^{−1}φ.
   - Refresh: φ = (D†χ)_e = mχ_e − K_eo χ_o, with χ Gaussian on all sites.
   - S_pf at the refresh links is not χ†χ (D† restricted to even rows is rectangular). It costs
-    one solve, cached on first use.
+    one solve, cached on first use. In `ParametricStaggeredPseudofermion` the cache is keyed on
+    the links' identity and `_version`, so an in-place change of U invalidates it.
 
 **Force convention** (`hmc.py`, `algebra.py`):
 
@@ -166,7 +175,8 @@ block, so its change of S counts as heat, not work. Jarzynski,
 ⟨e^{−W}⟩ = Z(λ_n)/Z(λ_0), holds on the joint (U, φ). Z(λ) is the gauge-fermion partition function
 up to a λ-independent π^n.
 
-Jump costs: β is Δβ·S_g(U; β = 1) and bc is gauge only, both without a solve; κ takes one solve
+Jump costs: β is Δβ·S_g(U; β = 1) and bc is gauge only, both without a solve; κ (or the
+staggered mass) takes one solve
 (S at the old κ is known from the end of the previous block). A zero jump is exactly zero. If x_0 has no φ, φ is drawn by a heat bath at λ_0. The SNF loss is
 mean(W). The HMC blocks are under no_grad, so the gradient flows only through the layers.
 
@@ -178,7 +188,9 @@ not see bc and cancels configuration by configuration, so
 This needs no solve and no φ. `action_table` returns the relative table S(U_b; bc_k) − S(U_b; bc_b),
 which gives the same swaps as the absolute table. Labels move, configurations do not. The
 ladder increases, with rung 0 the most open and the top rung bc = 1. An optional periodic
-translation of the bc = 1 replica is exact for antiperiodic fermions as well.
+translation of the bc = 1 replica is exact for antiperiodic fermions as well; it requires a
+periodic top rung (guarded). The swap uniforms come from a separate CPU generator
+(`swap_generator` or `swap_seed`), so REX works with the fields on any device.
 
 ## 3. Module map (`src/neoqcd/fermions/`)
 
@@ -192,13 +204,14 @@ translation of the bc = 1 replica is exact for antiperiodic fermions as well.
 | `staggered.py` | `staggered_phases`, `staggered_epsilon`, `StaggeredDirac`, `StaggeredEvenOdd`, `solve_staggered`, `staggered_dense_matrix`, `free_staggered_(normal_)eigenvalues` |
 | `hmc.py` | `ActionTerm`, `WilsonGaugeAction`, `Hamiltonian`, `WilsonGaugeHamiltonian`, `HMC`, `random_momenta`, `kinetic_energy`, `(batched_)defect_plaquette_weights`, `INTEGRATORS`, `OMELYAN_LAMBDA` |
 | `pseudofermion.py` | `hopping_derivative`, `TwoFlavourWilson` (action/refresh/force/stats), `TwoFlavourHamiltonian` |
+| `hasenbusch.py` | `HeavyWilsonTerm`, `RatioWilsonTerm`, `HasenbuschHamiltonian` (layouts `nested`, `shared` or explicit levels), `LEVEL_LAYOUTS` |
 | `staggered_pseudofermion.py` | `staggered_hopping_derivative`, `StaggeredPseudofermion`, `StaggeredHamiltonian` |
 | `exact.py` | `log_det_two_flavour`, `assemble_hopping`, `assemble_even_odd`, `ExactMetropolis` |
 | `staggered_exact.py` | `assemble_staggered_hopping`, `assemble_staggered_even_odd`, `log_det_staggered`, `ExactStaggeredMetropolis` |
-| `action.py` | `QCDAction`, `ParametricTwoFlavourWilson`, `JointHamiltonian`, `bc_link_couplings`, `bc_plaquette_weights`, `PARAMETER_NAMES` |
+| `action.py` | `QCDAction` (`fermions="wilson"|"staggered"`, `mass`), `ParametricTwoFlavourWilson`, `ParametricStaggeredPseudofermion`, `JointHamiltonian`, `bc_link_couplings`, `bc_plaquette_weights`, `PARAMETER_NAMES`, `STAGGERED_PARAMETER_NAMES`, `FERMION_TYPES` |
 | `snf.py` | `FieldState`, `HMCBlock`, `FermionNEMCMC`, `jarzynski_free_energy`, `effective_sample_size`, `OBSERVABLES` |
-| `snf_layers.py` | `PseudofermionAction`, `pseudofermion_action`, `joint_action`, `FermionLayerBlock`, `FermionSNF`, `make_gauge_layers` |
-| `rex.py` | `swap_action_difference`, `FermionREXTarget`, `distributed_rex_step`, `FermionREX` |
+| `snf_layers.py` | `PseudofermionAction`, `pseudofermion_action`, `joint_action`, `FermionLayerBlock`, `FermionSNF`, `make_gauge_layers` (default ρ = 1e-3) |
+| `rex.py` | `swap_action_difference`, `FermionREXTarget`, `distributed_rex_step`, `FermionREX` (`swap_generator`, `swap_seed`) |
 | `io.py` | `save_state`/`load_state` (`.pt` + `.json` sidecar), `restore_generator`, `ObservableWriter`, `read_observables`, `write_npz`, `atomic_json_save`, `n_flavours` |
 
 ## 4. How to test
@@ -216,7 +229,8 @@ NEOQCD_TEST_VERBOSE=1 NEOQCD_SKIP_GLOO=1 OMP_NUM_THREADS=1 .sunenv/bin/python -m
   statistical tests. It is read by `hmc`, `hmc_fermions`, `staggered_hmc` and `rex`.
 - `NEOQCD_SKIP_GLOO=1` skips the three-rank Gloo test in `test_fermions_rex`.
 
-Runtimes are wall times per file on the Mac (one thread), measured on 2026-11-07, all passing; the whole suite takes about 5 min, dominated by nemcmc, staggered_hmc, hmc_fermions and hmc.
+Runtimes are wall times per file on the Mac (one thread), measured on 2026-11-07 before the
+Hasenbusch and staggered-action files (their times not yet measured), all passing; the whole suite takes about 5 min, dominated by nemcmc, staggered_hmc, hmc_fermions and hmc.
 
 | File | What it pins | Time |
 |---|---|---|
@@ -229,10 +243,12 @@ Runtimes are wall times per file on the Mac (one thread), measured on 2026-11-07
 | `pseudofermion` | dense assembly = sparse, refresh distribution, ⟨e^{−ΔS_pf}⟩ = exact det ratio (4D, 2D; pins N_f = 2), force against finite differences, hopping-derivative bilinear, ⟨force⟩ = −∇log det (pins the normalisation) | 21s |
 | `hmc_fermions` | reversibility, ΔH ∝ ε², SU(N) and solver bookkeeping, HMC against `ExactMetropolis` on 2D 4×4 at κ = 0.12 and 0.22 (plaquette, log det, ⟨e^{−ΔH}⟩) | 44s |
 | `staggered_hmc` | the same chain for staggered: assembly/log det, refresh, det ratios, force (finite differences, autograd, expectation), reversibility, ΔH ∝ ε², HMC against `ExactStaggeredMetropolis` (m = 0.3, 0.1) | 49s |
+| `hasenbusch` | heavy/ratio refresh gives η†η, det ratio against the exact dense det (2D), forces against finite differences and autograd, reversibility, ΔH ∝ ε², HMC against single-term HMC (plaquette, ⟨e^{−ΔH}⟩, force magnitudes, cost at equal acceptance) | – |
 | `action` | S after refresh = η†η, β/κ/bc jumps against `Wilson_action`, `DefectMCMCAdapter` and dense det, Hamiltonian parameters | 2s |
+| `action_staggered` | parameter names, S after refresh, β/mass/bc jumps, refresh cache after a mass change, Hamiltonian parameters, Jarzynski in mass against exact determinants, β/bc bookkeeping, staggered REX smoke test and shift invariance of the det | – |
 | `nemcmc` | Jarzynski in κ (against exact det ratio) and β (against a quenched reference), W + Q bookkeeping, low-acceptance bookkeeping, constant protocol W = 0 | 57s |
-| `snf` | autograd Function value and group derivative, gradient through a layer, force saved at forward, refresh-cache version key, layer work, Jarzynski with stout layers, ρ = 0 equals NE-MCMC, 20-step training smoke test | 35s |
-| `rex` | local swap ΔS = full action difference, translation keeps the weight, rung plaquette = plain HMC (bc = 0 and 1), history and round trips, three Gloo ranks with `ParallelTempering` | 30s |
+| `snf` | autograd Function value and group derivative, gradient through a layer, force saved at forward, refresh-cache version key, layer work, exact Haar log-Jacobian (SU(3), 1e-14), Jarzynski with stout layers, ρ = 0 equals NE-MCMC, 20-step training smoke test | 35s |
+| `rex` | local swap ΔS = full action difference, translation keeps the weight, rung plaquette = plain HMC (bc = 0 and 1), history and round trips, three-rung detailed balance, translation needs a periodic top rung, three Gloo ranks with `ParallelTempering` | 30s |
 | `main_hmc` | Wilson outputs and bitwise resume, rows past the checkpoint dropped, quenched and staggered runs, argument checks | 3s |
 | `main_snf_rex` | NE-MCMC in κ, SNF in bc with training and resume, interrupted SNF resumes identically, residual layers, REX outputs and resume (outputs only, not physics) | 7s |
 
@@ -265,7 +281,8 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 
 - Protocol: `--protocol beta|kappa|bc` with `--initial --final --n-step` (linear) or
   `--protocol-file`.
-- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|residual --rho-init --train-steps --lr
+- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|residual --rho-init` (default 1e-3;
+  ρ = 0 cannot train) `--train-steps --lr
   --grad-clip --load-flow`.
 - Sampling: `--batch --eval-samples`, `--n-traj` (HMC trajectories per block), `--n-between`
   (pool trajectories at λ_0 between flow runs).
@@ -291,7 +308,9 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   - `run_meta.json`: round trips, flux, τ_int on the bottom and top rungs, swap acceptance per
     pair.
   - `checkpoint.*` and `rex_state.pt`.
-- The swap uniforms use a separate CPU generator (seed + 1).
+- The swap uniforms use `FermionREX`'s separate CPU generator (`swap_seed` = seed + 1); the
+  former `DeviceREX` workaround is gone.
+- Staggered fermions are not yet exposed by the SNF/REX drivers (library only); `main_hmc.py` has them.
 
 **Debug jobs** (one A100, fp64, 30 min). Each resumes automatically if its checkpoint exists:
 
@@ -300,7 +319,7 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   - w8: 8^4, β = 5.6, κ = 0.153, 100 + 200 trajectories.
 - `job/debug_snf_fermions.sh` (`POINTS="nemcmc snf"`), 4^4, β = 5.6, κ 0.153 → 0.1545 in 8 steps:
   - nemcmc: 100 thermalisation trajectories and 256 samples.
-  - snf: starts from the nemcmc pool, 20 Adam steps with stout layers, then 128 samples.
+  - snf: starts from the nemcmc pool, 20 Adam steps with stout layers (ρ_init = 1e-3), then 128 samples.
 - `job/debug_rex_fermions.sh`: 4^4, β = 5.6, κ = 0.153, a 2-link line defect, ladder bc = 0, 0.5, 1,
   4 ladders, DEO swaps with translation, 50 + 200 steps. It starts from the SNF nemcmc pool if
   present.
@@ -317,10 +336,11 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   errors use snapshots 3 trajectories apart on the same chains and may be slightly underestimated.
 - **Reversibility with warm start.** With `reuse_guess=True` (the default) CG starts from the
   last solution. The trajectory is then reversible only to the solver tolerance.
-  `--no-reuse-guess` starts CG from zero. The review in progress notes that even then
-  reversibility is only O(tol) in general: CG iterates stop being smooth in U once orthogonality
-  is lost. The reversibility to rounding seen in the tests relies on CG converging in about 20
-  iterations.
+  `--no-reuse-guess` starts CG from zero. Even then reversibility is only O(solver tolerance) in
+  general: CG iterates stop being smooth in U once orthogonality is lost. The reversibility to
+  rounding seen in the tests relies on CG converging in about 20 iterations. The staggered action
+  solves in a fixed, warm-started order, so its results do not depend on call order beyond the
+  tolerance.
 - **Batch cost.** The batched solvers iterate until the slowest sample converges, and
   `cg_iterations` counts that maximum. Per-sample counts are kept separately.
 - **Staggered refresh.** It costs one extra solve per trajectory (S_pf at the refresh links is not
@@ -329,12 +349,11 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   over the whole lattice of (w_old − w_new) Re tr U_p. The terms vanish beyond the plaquettes that
   touch the defect, so this is O(n_rungs·V) work that could be restricted to the defect halo.
   It is cheap compared with a solve, but it scales with V.
-- **`rex.py` on CUDA.**
-  - `FermionREX` keeps labels, ladder, counters and history on the CPU. `swap_round` draws its
-    uniforms on the CPU and compares them with a device table.
-  - The driver works around this with `DeviceREX` (table moved to the CPU, separate CPU swap
-    generator).
-  - The distributed path (`FermionREXTarget`) is tested only on Gloo/CPU.
+- **`rex.py` on CUDA.** `FermionREX` is device-safe (bookkeeping and swap uniforms on the CPU,
+  table moved there), but untested on a GPU. The distributed path (`FermionREXTarget`) is tested
+  only on Gloo/CPU.
+- **Hasenbusch.** On 2D 4×4 the two-term HMC gives no cost saving at equal acceptance; the
+  choice of κ' and of the layout is to be measured on 4^4/8^4. Not yet wired into the drivers.
 - **CUDA in general.** No fermion code has run on a GPU yet. Generators must be on the device
   (`torch.Generator(device=U.device)`). `stats["acceptance"]` syncs once per trajectory.
 - **Exact tools.** `ExactMetropolis` recomputes a dense determinant per proposal, which is
@@ -344,12 +363,12 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   - Only pure-gauge layers; φ is held fixed across a layer and resampled per trajectory, with no
     flow on φ.
   - `FermionLayerBlock` raises if a layer returns a nonzero dQ.
-  - The legacy SU(2) stout log-Jacobian is doubled, as in `Flow._full_logdet`. The review in
-    progress measured this as not the exact Haar log-Jacobian (relative error ~1e-3), so SU(2)
-    stout SNF is only approximately Jarzynski-exact. SU(3) is exact to ~1e-14.
-  - The stout layer without hyper-smearing uses |ρ| (`Smearing._mask_rho`), whose gradient vanishes at ρ = 0. Layers built with ρ = 0 cannot
-    train, and that includes `make_gauge_layers` at its committed default and `--rho-init 0.0`
-    in `job/debug_snf_fermions.sh`. The uncommitted review fix changes the default to 1e-3.
+  - Staggered SNF with layers is in progress (`snf_layers.py`); NE-MCMC and REX already take
+    staggered fermions.
+  - The legacy SU(2) stout log-Jacobian is doubled, as in `Flow._full_logdet`. This is not the
+    exact Haar log-Jacobian (relative error ~1e-3 at ρ = 0.01-0.1), so SU(2) stout SNF is only
+    approximately Jarzynski-exact. SU(3) is exact to ~1e-14 (unit test).
+  - The stout layer uses |ρ|, whose gradient vanishes at ρ = 0, hence the default ρ = 1e-3.
   - The protocol is a list of floats; per-configuration (B,) protocols are accepted by the
     NE-MCMC only.
 - **Pool correlation.** The SNF driver's consecutive batches are correlated through the pool's
@@ -360,5 +379,5 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   3. When to add clover.
   4. Whether to run the 12^3×24, κ = 0.156 check (about 1 A100 day), after the phase-1 cost
      measurement.
-  5. Further work: Hasenbusch, DD-HMC, RHMC, openQCD/Grid reference runs, and the
+  5. Further work: Hasenbusch on larger lattices, DD-HMC, RHMC, openQCD/Grid reference runs, and the
      convention-alignment checklist (κ, plaquette normalisation, τ_int).
