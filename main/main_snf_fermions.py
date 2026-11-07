@@ -162,7 +162,11 @@ def parse_args(argv=None):
     p.add_argument("--mode", choices=("nemcmc", "snf"), default="nemcmc")
     p.add_argument("--layers", choices=("none", "smearing", "residual"), default=None,
                    help="Default: none for nemcmc, smearing for snf.")
-    p.add_argument("--rho-init", type=float, default=0.0, help="Initial stout rho of the smearing layers.")
+    p.add_argument("--rho-init", type=float, default=1e-3,
+                   help="Initial stout rho of the smearing layers (default 1e-3). Must be nonzero for "
+                        "training: the stout layer uses |rho|, so at rho = 0 exactly its parameter gradient "
+                        "is identically zero and the layers never move. Unused with --layers none or "
+                        "--mode nemcmc.")
     p.add_argument("--load-flow", type=str, default=None, help="flow.pt of a previous snf run (layer weights).")
     p.add_argument("--train-steps", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)

@@ -56,7 +56,7 @@ for point in $POINTS; do
     nemcmc) run_point "$NEMCMC_OUT" "${COMMON[@]}" --mode nemcmc --therm 100 --eval-samples 256 "${@}" ;;
     snf)
       if [[ ! -f "${NEMCMC_OUT}/pool.json" ]]; then echo "snf needs ${NEMCMC_OUT}/pool.json" >&2; exit 2; fi
-      run_point "$SNF_OUT" "${COMMON[@]}" --mode snf --layers smearing --rho-init 0.0 --lr 1e-3 \
+      run_point "$SNF_OUT" "${COMMON[@]}" --mode snf --layers smearing --rho-init 1e-3 --lr 1e-3 \
         --train-steps 20 --eval-samples 128 --start-config "${NEMCMC_OUT}/pool" "${@}" ;;
     *) echo "unknown point $point" >&2; exit 2 ;;
   esac
