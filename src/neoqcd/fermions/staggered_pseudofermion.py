@@ -114,6 +114,7 @@ class StaggeredPseudofermion(ActionTerm):
         self.phi = None
         self.X = None
         self._refresh_links = None
+        self._refresh_version = None
         self._refresh_action = None
         self.reset_stats()
 
@@ -168,6 +169,7 @@ class StaggeredPseudofermion(ActionTerm):
         self.phi = op.prepare_rhs(chi)
         self.X = None
         self._refresh_links = U
+        self._refresh_version = U._version  # in-place changes of U bump it (cache key below)
         self._refresh_action = None
         self.stats["refresh_calls"] += 1
 
@@ -178,14 +180,21 @@ class StaggeredPseudofermion(ActionTerm):
         return (self.phi.conj() * X).real.reshape(X.shape[0], -1).sum(1)
 
     def action_difference(self, U_old, U_new):
-        """S_pf(U_new) - S_pf(U_old) at fixed phi; S_pf at the refresh links is solved once and cached."""
-        if U_old is self._refresh_links:
+        """S_pf(U_new) - S_pf(U_old) at fixed phi.
+
+        S_pf(U_new) is solved first, warm-started (with `reuse_guess`) from the last force solution
+        at the end of the trajectory. S_pf at the refresh links is solved once and cached; the
+        cache is used only if U_old is (the same tensor object as) the refresh links and has not
+        been modified in place since (same `_version`).
+        """
+        S_new = self.action(U_new)
+        if U_old is self._refresh_links and U_old._version == self._refresh_version:
             if self._refresh_action is None:
                 self._refresh_action = self.action(U_old)
             S_old = self._refresh_action
         else:
             S_old = self.action(U_old)
-        return self.action(U_new) - S_old
+        return S_new - S_old
 
     def force(self, U):
         """Algebra gradient of S_pf: F = 2 * staggered_hopping_derivative(X, K X), X = M_ee^-1 phi."""

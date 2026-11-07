@@ -131,6 +131,27 @@ class RefreshTest(unittest.TestCase):
                 self.assertLess((S.action_difference(U, U)).abs().max().item(), 1e-9)
 
 
+class ActionCacheTest(unittest.TestCase):
+    """The cached S_pf at the refresh links is used only while those links are unchanged: after an
+    in-place `U.copy_(U2)` (same object, new `_version`) `action_difference` re-solves."""
+
+    def test_cache_invalidated_by_in_place_change(self):
+        U, gen = haar_links(G4, 2, 21)
+        U2, _ = haar_links(G4, 2, 22)
+        V, _ = haar_links(G4, 2, 23)
+        S = StaggeredPseudofermion(MASSES, G4, action_tol=1e-13)
+        S.refresh(U, gen)
+        d1 = S.action_difference(U, V)
+        self.assertLess((d1 - (S.action(V) - S.action(U.clone()))).abs().max().item(), 1e-9)
+        U.copy_(U2)
+        d2 = S.action_difference(U, V)
+        honest = S.action(V) - S.action(U2)
+        if VERBOSE:
+            print(f"\nafter U.copy_: action_difference {d2.tolist()}, honest {honest.tolist()}")
+        self.assertGreater((d1 - honest).abs().max().item(), 1e-3)
+        self.assertLess((d2 - honest).abs().max().item(), 1e-9)
+
+
 class StochasticEstimatorTest(unittest.TestCase):
     """1. <exp(-[S_pf(U') - S_pf(U)])>_{phi drawn at U} = det M_ee(U') / det M_ee(U), exact from
     dense determinants. U' = exp(i c X) U with X a unit-norm force-averaged direction; c is chosen
@@ -285,13 +306,12 @@ class ForceExpectationTest(unittest.TestCase):
 class ReversibilityTest(unittest.TestCase):
     """4. Forward, momentum flip, forward returns to (U, -P), on 2^3 x 4 SU(3) and 2D 4 x 4 SU(2).
 
-    With `reuse_guess=False` the force is a deterministic function of U. Unlike the Wilson test
-    (solver_tol 1e-8 there), the tolerance here is 1e-14: on 2^3 x 4 M_ee has dimension 48 and
-    on these Haar-random links CG takes 50-60 iterations, i.e. it runs past the dimension in the
-    loss-of-orthogonality regime where the residual is erratic; at a loose tolerance the
-    iteration count of one solve then flips by 1-2 between the forward and the reversed run
-    (seen at 1e-8: [52, 38] forward vs [52, 40] backward), which breaks reversibility at the 1e-9
-    level. At 1e-14 the counts coincide and the round trip closes to ~1e-15.
+    With `reuse_guess=False` the CG starts from zero, but the force is still a smooth function of
+    U only up to the solver tolerance: in finite precision, once CG has lost orthogonality its
+    iterates are not a smooth function of the operator, so the reversed run does not retrace the
+    forward one beyond O(tol), even with identical forward and backward iteration counts. This
+    is generic, not specific to these tiny lattices (on 4^4: |U2 - U| = 1.2e-10 at tol 1e-8,
+    1.7e-15 at 1e-14). Hence tol = 1e-14 here, which closes the round trip to ~1e-15.
     """
 
     def test_reversibility(self):

@@ -92,8 +92,11 @@ class TwoFlavourWilson(ActionTerm):
             min(solver_tol, 1e-12).
         max_iter: CG iteration cap per solve.
         reuse_guess: start each CG from the last solution X (chronological guess of order one).
-            The trajectory is then reversible only up to the solver tolerance; with False the
-            force is a deterministic function of U and the integrator is reversible to rounding.
+            The trajectory is then reversible only up to the solver tolerance. With False the CG
+            starts from zero, but reversibility still holds only to O(tol) in general: once CG
+            loses orthogonality, its finite-precision iterates are not a smooth function of U.
+            (Reversibility to rounding at a loose tolerance, as for Wilson at kappa = 0.12, relies
+            on CG converging in ~20 iterations, well before that regime.)
 
     State: `phi` (the pseudofermion field, set by `refresh`) and `X` (the last solution of
     M X = phi). `stats` counts calls, solves and CG iterations; `cg_iterations` adds the
