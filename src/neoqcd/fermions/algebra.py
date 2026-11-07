@@ -101,7 +101,13 @@ def expi(Q, method="auto"):
     if method == "closed":
         if N != 2:
             raise ValueError("the closed-form exponential is for SU(2) only")
-        q = torch.sqrt(0.5 * trace_product(Q, Q))
+        # guarded sqrt: d sqrt(q2)/d q2 is infinite at q2 = 0, which made autograd return nan at
+        # Q = 0; the masked branch has zero gradient there, which is exact to first order since
+        # d q2 / dQ = 0 at Q = 0 (and torch.sinc has derivative 0 at 0). Values are unchanged.
+        q2 = 0.5 * trace_product(Q, Q)
+        positive = q2 > 0
+        q = torch.where(positive, torch.sqrt(torch.where(positive, q2, torch.ones_like(q2))),
+                        torch.zeros_like(q2))
         sinc = torch.sinc(q / math.pi)  # sin(q) / q, finite at q = 0
         return _scal(torch.cos(q)) * eye + 1j * _scal(sinc) * Q
     if method == "cayley_hamilton":

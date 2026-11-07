@@ -77,6 +77,22 @@ def defect_plaquette_weights(defect_mask, defect_par, D):
     return {(mu, nu): plaquette_weight(kappa, mu, nu, D) for nu in range(1, D) for mu in range(nu)}
 
 
+def batched_defect_plaquette_weights(defect_mask, defect_par, D):
+    """Plaquette weights {(mu, nu): field} for a (B,) tensor of defect parameters.
+
+    Entry b of each field (shape (B,) + lattice) equals the field of
+    `defect_plaquette_weights(defect_mask, defect_par[b], D)`, i.e. `theory.plaquette_weight` of
+    kappa_b = defect_mask[0] + defect_mask[1] * defect_par[b]; this is the per-configuration layout
+    accepted by `WilsonGaugeAction`. A scalar (0-dim) defect_par gives B = 1.
+    """
+    c = torch.as_tensor(defect_par, dtype=defect_mask.dtype, device=defect_mask.device).reshape(-1)
+    n_lattice = defect_mask.dim() - 2  # defect_mask is (2, D) + lattice
+    # kappa of shape (D, B) + lattice, so that plaquette_weight's kappa[mu] is (B,) + lattice and its
+    # rolls act on the trailing lattice dimensions
+    kappa = defect_mask[0][:, None] + defect_mask[1][:, None] * c.reshape((1, -1) + (1,) * n_lattice)
+    return {(mu, nu): plaquette_weight(kappa, mu, nu, D) for nu in range(1, D) for mu in range(nu)}
+
+
 class ActionTerm:
     """Base class of the action terms; subclasses define action(U) and force(U)."""
 
@@ -335,6 +351,12 @@ class HMC:
 
         Returns (U_new, accepted (B,) bool, delta_H (B,), stats). stats holds exp(-dH), the
         acceptance rate, the force evaluations per level and the mean plaquette of U_new.
+
+        `generator` is used for the pseudofermion refresh, the momenta and the Metropolis uniforms,
+        all drawn on U.device: on CUDA it must be a `torch.Generator(device=U.device)` (a CPU
+        generator makes torch.rand/randn on a CUDA device raise). stats["acceptance"] is a Python
+        float obtained with `.item()`, i.e. one host-device synchronisation per trajectory; the
+        returned `accepted` tensor is the sync-free alternative.
         """
         B = U.shape[0]
         self.hamiltonian.refresh(U, generator)

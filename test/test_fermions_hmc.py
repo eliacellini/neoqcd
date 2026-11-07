@@ -4,6 +4,7 @@ CPU, complex128, fixed seeds, 2^4 lattices with SU(2) and SU(3).
 """
 
 import math
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -33,6 +34,7 @@ from neoqcd.fermions.algebra import (
 from neoqcd.fermions.lattice import Geometry
 
 GROUPS = (2, 3)
+VERBOSE = bool(os.environ.get("NEOQCD_TEST_VERBOSE"))  # print the end-to-end summaries
 
 
 def geometry(N):
@@ -80,6 +82,24 @@ class AlgebraTest(unittest.TestCase):
                 Q = scale * random_algebra((200, N, N), generator=gen)
                 ref = torch.linalg.matrix_exp(1j * Q)
                 self.assertLess((expi(Q) - ref).abs().max().item(), 1e-13, msg=f"N={N} scale={scale}")
+            # around the threshold itself: Q normalised so that c1 = tr(Q^2)/2 is exactly 2.9, 3.0, 3.1
+            for c1 in (2.9, 3.0, 3.1):
+                Q = random_algebra((200, N, N), generator=gen)
+                Q = Q * torch.sqrt(c1 / (0.5 * trace_product(Q, Q)))[..., None, None]
+                self.assertLess((0.5 * trace_product(Q, Q) - c1).abs().max().item(), 1e-13)
+                ref = torch.linalg.matrix_exp(1j * Q)
+                self.assertLess((expi(Q) - ref).abs().max().item(), 1e-13, msg=f"N={N} c1={c1}")
+
+    def test_su2_closed_exponential_gradient_at_zero(self):
+        # the SU(2) closed form must be differentiable at Q = 0: d exp(iQ)/dQ = i at Q = 0
+        Q = torch.zeros((5, 2, 2), dtype=torch.cdouble, requires_grad=True)
+        X = random_algebra((5, 2, 2), generator=torch.Generator().manual_seed(13))
+        out = trace_product(expi(Q, method="closed"), 1j * X).sum()  # Re tr(exp(iQ) i X)
+        (grad,) = torch.autograd.grad(out, Q)
+        self.assertTrue(torch.isfinite(grad.real).all() and torch.isfinite(grad.imag).all())
+        # first order: Re tr(i Q i X) = -tr(Q X) for hermitian Q, X, so d out / dQ = -X^T (conj grad)
+        dir_deriv = (grad.conj() * X).sum().real.item()
+        self.assertLess(abs(dir_deriv + trace_product(X, X).sum().item()), 1e-12)
 
     def test_unitarize_projects_onto_sun(self):
         gen = torch.Generator().manual_seed(12)
@@ -100,7 +120,10 @@ class MomentumTest(unittest.TestCase):
             with self.subTest(N=N):
                 g = geometry(N)
                 gen = torch.Generator().manual_seed(100 + N)
-                P = H.random_momenta(g.link_shape(64), generator=gen)
+                # B = 4096 configurations of 2^4 x 4 links: M = 262144 links, so the 5 sigma
+                # tolerance on the unit covariance, 5 sqrt(2 / M), is about 1.4%
+                B = 4096
+                P = H.random_momenta(g.link_shape(B), generator=gen)
                 self.assertLess((P - SUN_dagger(P)).abs().max().item(), 1e-15)
                 self.assertLess(SUN_trace(P).abs().max().item(), 1e-14)
 
@@ -122,8 +145,8 @@ class MomentumTest(unittest.TestCase):
                                 5 * math.sqrt(2.0 / M))
                 # kinetic energy = (1/2) sum tr P^2 per configuration
                 K = H.kinetic_energy(P)
-                self.assertEqual(K.shape, (64,))
-                self.assertLess((K.sum() - 0.5 * trP2.sum()).abs().item(), 1e-9)
+                self.assertEqual(K.shape, (B,))
+                self.assertLess((K.sum() - 0.5 * trP2.sum()).abs().item(), 1e-8)
 
 
 class GaugeForceTest(unittest.TestCase):
@@ -137,34 +160,61 @@ class GaugeForceTest(unittest.TestCase):
         return (-f(2 * t) + 8 * f(t) - 8 * f(-t) + f(-2 * t)) / (12 * t)
 
     def cases(self, N):
+        """(name, geometry, WilsonGaugeAction, reference action V -> (3,)), batch B = 3."""
         g = geometry(N)
         beta = torch.tensor([5.0, 2.3, 6.7], dtype=torch.double)
-        yield "plain", g, beta, None, 1.0
-        yield "defect", g, beta[1], defect_mask(g), 0.37
+        mask = defect_mask(g)
+        yield "plain", g, H.WilsonGaugeAction(beta, g), lambda V: wilson_reference(g, beta)(V, None)
+        w = H.defect_plaquette_weights(mask, 0.37, g.D)
+        yield ("defect", g, H.WilsonGaugeAction(beta[1], g, w),
+               lambda V: wilson_reference(g, beta[1], 0.37)(V, mask))
+        # per-batch beta (B,) together with (lattice-shaped) defect weights
+        yield ("batch-beta+defect", g, H.WilsonGaugeAction(beta, g, w),
+               lambda V: wilson_reference(g, beta, 0.37)(V, mask))
+        # per-entry plaquette weights (B,) + lattice: one defect parameter per configuration,
+        # reference = Wilson_action entry by entry
+        c = torch.tensor([0.37, 0.8, 0.05], dtype=torch.double)
+        wb = H.batched_defect_plaquette_weights(mask, c, g.D)
+
+        def per_entry(V):
+            return torch.cat([wilson_reference(g, beta[b].item(), c[b].item())(V[b:b + 1], mask)
+                              for b in range(V.shape[0])])
+        yield "per-entry-weights", g, H.WilsonGaugeAction(beta, g, wb), per_entry
+
+    def test_batched_defect_weights_match_scalar_helper(self):
+        for N in GROUPS:
+            g = geometry(N)
+            mask = defect_mask(g)
+            c = torch.tensor([0.37, 1.0, 0.0, 0.8], dtype=torch.double)
+            wb = H.batched_defect_plaquette_weights(mask, c, g.D)
+            self.assertEqual(len(wb), g.D * (g.D - 1) // 2)
+            for b in range(c.numel()):
+                ws = H.defect_plaquette_weights(mask, c[b].item(), g.D)
+                self.assertEqual(set(wb), set(ws))
+                for plane in ws:
+                    self.assertEqual(wb[plane].shape, (c.numel(),) + g.lattice)
+                    self.assertTrue(torch.equal(wb[plane][b], ws[plane]), msg=f"N={N} b={b} {plane}")
+            # the defect is visible (weights != 1 somewhere) and absent for c = 1
+            self.assertLess(min(w[0].min().item() for w in wb.values()), 1.0)
+            self.assertTrue(all(torch.equal(w[1], torch.ones_like(w[1])) for w in wb.values()))
 
     def test_action_matches_wilson_action(self):
         for N in GROUPS:
-            for name, g, beta, mask, c in self.cases(N):
+            for name, g, S, ref_action in self.cases(N):
                 with self.subTest(N=N, case=name):
                     U, _ = haar_links(g, 3, 20 + N)
-                    weights = None if mask is None else H.defect_plaquette_weights(mask, c, g.D)
-                    S = H.WilsonGaugeAction(beta, g, weights)
-                    ref = wilson_reference(g, beta, c)(U, mask)
+                    ref = ref_action(U)
                     self.assertLess((S.action(U) - ref).abs().max().item(), 1e-12 * ref.abs().max().item())
                     V, _ = haar_links(g, 3, 30 + N)
                     diff = S.action_difference(U, V)
-                    ref_diff = wilson_reference(g, beta, c)(V, mask) - ref
+                    ref_diff = ref_action(V) - ref
                     self.assertLess((diff - ref_diff).abs().max().item(), 1e-10)
 
     def test_force_against_finite_differences(self):
         for N in GROUPS:
-            for name, g, beta, mask, c in self.cases(N):
+            for name, g, S, action in self.cases(N):
                 with self.subTest(N=N, case=name):
                     U, gen = haar_links(g, 3, 40 + N)
-                    weights = None if mask is None else H.defect_plaquette_weights(mask, c, g.D)
-                    S = H.WilsonGaugeAction(beta, g, weights)
-                    ref = wilson_reference(g, beta, c)
-                    action = lambda V: ref(V, mask)
                     F = S.force(U)
                     self.assertLess((F - SUN_dagger(F)).abs().max().item(), 1e-12)
                     self.assertLess(SUN_trace(F).abs().max().item(), 1e-12)
@@ -212,6 +262,31 @@ class ReversibilityTest(unittest.TestCase):
                         self.assertLess((P2 + P).abs().max().item(), 1e-10)
                         H0, H2 = ham.energy(U, P), ham.energy(U2, P2)
                         self.assertLess(((H2 - H0).abs() / H0.abs()).max().item(), 1e-13)
+
+    def test_per_level_integrators_reversibility_and_force_counts(self):
+        # level 0: n_substeps 2, n_steps 4 -> n = 8 outer steps; level 1: n_substeps 3.
+        # Merged kicks: an outer leapfrog step costs 1 level-0 force and has 1 drift, an outer
+        # Omelyan step costs 2 and has 2 drifts; each drift runs 3 inner steps (1 force each for
+        # leapfrog, 2 for Omelyan); inner kicks merge across outer drifts (no move in between),
+        # so every level gets one extra evaluation at the very end:
+        #   [leapfrog, omelyan]: [8 + 1, 8 * 3 * 2 + 1] = [9, 49]
+        #   [omelyan, leapfrog]: [2 * 8 + 1, 16 * 3 * 1 + 1] = [17, 49]
+        expected = {("leapfrog", "omelyan"): [9, 49], ("omelyan", "leapfrog"): [17, 49]}
+        for N in GROUPS:
+            g = geometry(N)
+            U, gen = haar_links(g, 4, 80 + N)
+            P = H.random_momenta(U.shape, generator=gen)
+            ham = H.Hamiltonian([(H.WilsonGaugeAction(1.5, g), 2), (H.WilsonGaugeAction(3.5, g), 3)])
+            for integrator, counts in expected.items():
+                with self.subTest(N=N, integrator=integrator):
+                    hmc = H.HMC(g, ham, tau=1.0, n_steps=4, integrator=list(integrator))
+                    U1, P1, evals = hmc.integrate(U, P)
+                    self.assertEqual(evals, counts)
+                    U2, P2, evals2 = hmc.integrate(U1, -P1)
+                    self.assertEqual(evals2, counts)
+                    self.assertGreater((U1 - U).abs().max().item(), 0.1)
+                    self.assertLess((U2 - U).abs().max().item(), 1e-10)
+                    self.assertLess((P2 + P).abs().max().item(), 1e-10)
 
 
 class EnergyScalingTest(unittest.TestCase):
@@ -322,7 +397,8 @@ class EndToEndTest(unittest.TestCase):
         msg = (f"SU({N}) beta={beta} {integrator}: <P>_HMC = {p_hmc:.5f}({e_hmc:.5f}), "
                f"<P>_HB = {p_hb:.5f}({e_hb:.5f}), <exp(-dH)> = {x_mean:.5f}({x_err:.5f}), "
                f"acceptance {sum(acc) / len(acc):.3f}")
-        print("\n" + msg)
+        if VERBOSE:
+            print("\n" + msg)
         self.assertGreater(sum(acc) / len(acc), 0.8, msg=msg)
         self.assertLess(abs(x_mean - 1.0), 4 * x_err, msg=msg)
         self.assertLess(abs(p_hmc - p_hb), 4 * sigma, msg=msg)
