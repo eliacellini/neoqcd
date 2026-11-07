@@ -41,7 +41,7 @@ added silently on top. dlogJ goes into the logJ accumulator (and into W with a m
 Cost per step (one solve = one CG solve of D_hat^dagger D_hat):
 - layer: one solve, S_pf(U', phi; kappa_i); the force for the gradient comes from the same solve;
   S(x_{i-1}; lambda_i) is known (from the end of the previous block and the jump);
-- jump: beta and bc no solve, kappa one solve (as in FermionNEMCMC);
+- jump: beta and bc no solve, kappa (or staggered mass) one solve (as in FermionNEMCMC);
 - HMC block: as in FermionNEMCMC (S at its end recomputed from scratch, one solve).
 
 Gradient for training. With the HMC blocks under no_grad and their outputs detached, the work of
@@ -67,6 +67,13 @@ part (which a dense autograd would also produce) does not matter, because the la
 exactly SU(N) as functions of their inputs and parameters, so every vector-Jacobian product
 through them annihilates it. Conversely F = project_hermitian_traceless(-i G U^dagger) recovers
 the force from any gradient G with the same tangent part (G = i F U + normal part).
+
+Staggered fermions (`QCDAction(..., fermions="staggered", mass=m)`): the same construction with
+S_pf = phi^dagger M_ee(m)^-1 phi of `StaggeredPseudofermion` (one even-site field, N_f = 2^(D/2)),
+kappa replaced by the mass (`QCDAction.fermion_parameter_name`), and the force from the same solve,
+F = 2 staggered_hopping_derivative(op, X, K_oe X) with X = M_ee^-1 phi (its algebra gradient
+convention is that of `TwoFlavourWilson.force`, so the backward G = i F U is unchanged). A mass
+jump costs one solve, as a kappa jump. The fermion term type is dispatched by isinstance.
 """
 
 import warnings
@@ -76,15 +83,36 @@ import torch
 from neoqcd.fermions._gauge import (CouplingLayer, ResidualCouplingLayer, mean_plaquette,
                                     plaquette_fields)
 from neoqcd.fermions.action import _as_parameter, _same_parameter
-from neoqcd.fermions.pseudofermion import hopping_derivative
+from neoqcd.fermions.pseudofermion import TwoFlavourWilson, hopping_derivative
+from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion, staggered_hopping_derivative
 from neoqcd.fermions.snf import OBSERVABLES, FieldState, HMCBlock
 
 __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "FermionLayerBlock",
            "FermionSNF", "make_gauge_layers"]
 
 
+def _fermion_kind(fermion):
+    """"wilson" or "staggered" from the type of the fermion term (dispatch of this module)."""
+    if isinstance(fermion, StaggeredPseudofermion):
+        return "staggered"
+    if isinstance(fermion, TwoFlavourWilson):
+        return "wilson"
+    raise TypeError(f"unsupported fermion term {type(fermion).__name__}: PseudofermionAction handles "
+                    "TwoFlavourWilson and StaggeredPseudofermion (and their parametric subclasses)")
+
+
+def _staggered_force_from_solution(op, X):
+    """The force of `StaggeredPseudofermion.force` from X = M_ee^-1 phi (no new solve):
+    F = 2 staggered_hopping_derivative(op, X, W), W = K_oe X."""
+    W = op.odd(op.staggered.hopping(X))
+    return 2.0 * staggered_hopping_derivative(op, X, W)
+
+
 def _force_from_solution(fermion, op, X):
-    """The force of `TwoFlavourWilson.force` from a given solution X = M^-1 phi (no new solve)."""
+    """The force of `TwoFlavourWilson.force` (or `StaggeredPseudofermion.force`) from a given
+    solution X = M^-1 phi (no new solve)."""
+    if _fermion_kind(fermion) == "staggered":
+        return _staggered_force_from_solution(op, X)
     if fermion.even_odd:
         w = op.wilson
         Y = op.apply(X)
@@ -104,7 +132,10 @@ class PseudofermionAction(torch.autograd.Function):
 
     `PseudofermionAction.apply(U, fermion)`: `fermion` is a `TwoFlavourWilson` (or the
     `ParametricTwoFlavourWilson` of a `QCDAction`) with phi set; its current kappa and phi are
-    used. Forward: one CG solve at `fermion.action_tol`, S = Re phi^dagger X, (B,) float64; if U
+    used. Staggered: `fermion` a `StaggeredPseudofermion` (or `ParametricStaggeredPseudofermion`),
+    S = phi^dagger M_ee(m)^-1 phi at its current mass, force F = 2 staggered_hopping_derivative(
+    op, X, K_oe X) from the same solve X = M_ee^-1 phi (`staggered_pseudofermion` module doc); any
+    other fermion type raises TypeError. Forward: one CG solve at `fermion.action_tol`, S = Re phi^dagger X, (B,) float64; if U
     requires grad, the force F at U is computed from the same X and saved (so later changes of
     fermion.phi or kappa do not affect the backward). Backward: dS/dU = grad_out * i F U
     (module doc), no backpropagation through CG.
@@ -112,6 +143,7 @@ class PseudofermionAction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, U, fermion):
+        _fermion_kind(fermion)  # TypeError for unknown fermion terms
         op = fermion.operator(U)
         fermion.stats["action_calls"] += 1
         X = fermion._solve(op, fermion.action_tol)
@@ -133,17 +165,30 @@ def pseudofermion_action(U, fermion):
     return PseudofermionAction.apply(U, fermion)
 
 
+def _fermion_parameter_accessors(action):
+    """(get, set) of the fermion parameter named `action.fermion_parameter_name` ("kappa" for
+    Wilson, "mass" for staggered) on `action.fermion`."""
+    name = getattr(action, "fermion_parameter_name", "kappa")
+    fermion = action.fermion
+    if name == "kappa":
+        return (lambda: fermion.kappa), fermion.set_kappa
+    if name == "mass":
+        return (lambda: fermion.mass), fermion.set_mass
+    raise ValueError(f"unknown fermion parameter {name!r}")
+
+
 def joint_action(action, U, parameter=None):
     """S(U, phi; parameter) of a `QCDAction`, differentiable in U: S_g by autograd, S_pf by
-    `PseudofermionAction` (one solve) at the kappa of `parameter`; the current kappa is kept."""
-    _, kappa, _ = action._couplings(parameter)
-    fermion = action.fermion
-    saved = fermion.kappa
-    fermion.set_kappa(kappa)
+    `PseudofermionAction` (one solve) at the kappa (Wilson) or mass (staggered) of `parameter`;
+    the current kappa or mass is kept."""
+    _, value, _ = action._couplings(parameter)
+    get, set_ = _fermion_parameter_accessors(action)
+    saved = get()
+    set_(value)
     try:
-        S_pf = pseudofermion_action(U, fermion)
+        S_pf = pseudofermion_action(U, action.fermion)
     finally:
-        fermion.set_kappa(saved)
+        set_(saved)
     return action.gauge_action(U, parameter) + S_pf
 
 
@@ -289,7 +334,7 @@ class FermionSNF(torch.nn.Module):
         """(dW, S(x; p_new)) at fixed fields, as `FermionNEMCMC._jump`."""
         if _same_parameter(p_old, p_new):
             return torch.zeros_like(S_cur), S_cur
-        if self.action.parameter_name == "kappa":
+        if self.action.parameter_name in ("kappa", "mass"):
             S_new = self.action.action(U, p_new)
             return S_new - S_cur, S_new
         dW = self.action.action_difference(U, p_old, p_new)
