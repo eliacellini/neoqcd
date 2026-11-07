@@ -137,8 +137,8 @@ def plain_hmc(bc, n_chains, n_therm, n_meas, seed):
 
 
 class REXDetailedBalanceTest(unittest.TestCase):
-    """2. REX with fermionic HMC against plain fermionic HMC at fixed bc: the plaquette on the
-    periodic (bc = 1) and open (bc = 0) rungs within 4 sigma, <exp(-dH)> = 1 on every rung, swap
+    """2. REX with fermionic HMC against plain fermionic HMC at fixed bc: the plaquette on every
+    rung (bc = 1, 0.5, 0) within 4 sigma, <exp(-dH)> = 1 on every rung, swap
     acceptances in (0.1, 0.9). 16 independent ladders; errors from the spread of the chain means."""
 
     THERM = 15
@@ -147,7 +147,7 @@ class REXDetailedBalanceTest(unittest.TestCase):
         rex, _ = rex_run()
         labels, plaq, traj_labels, x = rex.history_arrays(start=self.THERM)
         lines = []
-        for rung, bc in ((2, 1.0), (0, 0.0)):
+        for rung, bc in ((2, 1.0), (1, 0.5), (0, 0.0)):
             p_rex, e_rex = chain_mean_error(rex.rung_series(plaq, labels, rung))
             ref_plaq, ref_x = plain_hmc(bc, 16, self.THERM, 80, seed=7 + rung)
             p_ref, e_ref = chain_mean_error(ref_plaq)
@@ -194,9 +194,22 @@ class ReplicaHistoryTest(unittest.TestCase):
                   f"top {summary['plaquette_top']['tau_int']:.2f}")
         self.assertGreaterEqual(summary["round_trips"], 1)
         self.assertEqual(summary["walkers"], 48)
-        self.assertEqual(summary["flux_fraction"][0], 1.0)
-        self.assertEqual(summary["flux_fraction"][-1], 0.0)
+        # flux_fraction is 1 on rung 0 and 0 on the top rung by construction; the middle rung is
+        # visited by walkers going both ways
+        self.assertGreater(summary["round_trips"], 0)
+        self.assertGreater(summary["flux_fraction"][1], 0.0)
+        self.assertLess(summary["flux_fraction"][1], 1.0)
         self.assertEqual(summary["plaquette_top"]["status"], "ok")
+
+
+class DistributedREXStepCheckTest(unittest.TestCase):
+    """distributed_rex_step refuses periodic_translation without bc = 1 on the top rung."""
+
+    def test_translation_needs_periodic_top(self):
+        from types import SimpleNamespace
+        pt = SimpleNamespace(ladder=torch.tensor([0.0, 0.5, 0.9], dtype=torch.float64))
+        with self.assertRaises(ValueError):
+            distributed_rex_step(pt, None, None, periodic_translation=True)
 
 
 # ---- 4. three Gloo ranks ------------------------------------------------------------------------

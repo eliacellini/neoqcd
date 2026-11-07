@@ -27,9 +27,8 @@ Output directory (--out, default output/rex_fermions/<auto name>):
     rex_state.pt        labels, step count, swap counters, swap-generator state.
 
 Two generators: the run generator (on the device: pseudofermions, momenta, Metropolis, translation)
-and a CPU generator for the swap uniforms (seed + 1), so that the driver also runs on CUDA
-(`FermionREX.swap_round` draws its uniforms on the CPU). The driver's `DeviceREX` subclass only
-routes the swaps to that generator and keeps the per-step history on the CPU.
+and a CPU generator for the swap uniforms (seed + 1), passed to `FermionREX(swap_generator=...)`
+(which keeps labels, swaps and history on the CPU, so the driver also runs on CUDA).
 
 Resume: --resume restores links, labels, counters, both generators and the history (truncated to
 the checkpoint) and continues; the continuation repeats an uninterrupted run with the same seed.
@@ -146,27 +145,6 @@ def physics_key(args):
     }
 
 
-class DeviceREX(FermionREX):
-    """`FermionREX` with the swap uniforms from a CPU generator and the history kept on the CPU
-    (the base class is unchanged on the CPU apart from the separate swap generator)."""
-
-    def __init__(self, *args, swap_generator=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.swap_generator = swap_generator
-
-    def swap_round(self, table, parity, generator=None):
-        return super().swap_round(table.cpu(), parity, self.swap_generator)
-
-    def _per_rung(self, values, labels):
-        return super()._per_rung(values.cpu(), labels)
-
-    def step(self, generator=None):
-        stats = super().step(generator)
-        self.plaquette_history[-1] = self.plaquette_history[-1].cpu()
-        self.exp_minus_dH_history[-1] = self.exp_minus_dH_history[-1].cpu()
-        return stats
-
-
 def save_history(path, rex, therm):
     labels, plaq, tlabels, emdH = rex.history_arrays() if rex.labels_history else (np.zeros((0,) + tuple(rex.labels.shape)),) * 4
 
@@ -263,11 +241,11 @@ def main(argv=None):
             p.unlink()
         U, source = start_links(args, geometry, device, B, args.beta, args.kappa, 1.0)
 
-    rex = DeviceREX(geometry, args.beta, args.kappa, defect_mask, args.ladder_values, n_chains=args.n_chains,
-                    tau=args.tau, n_steps=args.n_steps, integrator=args.integrator_levels,
-                    n_gauge_substeps=args.n_gauge_substeps, swap_parity=args.swap_parity,
-                    periodic_translation=args.periodic_translation, U=U, swap_generator=swap_generator,
-                    **fermion_kwargs(args))
+    rex = FermionREX(geometry, args.beta, args.kappa, defect_mask, args.ladder_values, n_chains=args.n_chains,
+                     tau=args.tau, n_steps=args.n_steps, integrator=args.integrator_levels,
+                     n_gauge_substeps=args.n_gauge_substeps, swap_parity=args.swap_parity,
+                     periodic_translation=args.periodic_translation, U=U, swap_generator=swap_generator,
+                     **fermion_kwargs(args))
     writer = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
     if args.resume:
         rex.labels = rex_state["labels"].clone()

@@ -50,6 +50,8 @@ carries bc = 1 is shifted by one site along a random direction (`utils.translate
 PTBC). Exact for fermions too: the gauge action at bc = 1 and det(D^dagger D) with antiperiodic time
 boundary conditions are translation invariant (the antiperiodic sign moves with a change of
 variables psi(t0) -> -psi(t0) on one time slice), and phi is drawn afresh at the next trajectory.
+Between the translation and the next trajectory `qcd.phi` belongs to the untranslated U: callers
+must not evaluate the full action (S_g + S_pf) in that window (the next trajectory refreshes phi).
 """
 
 import torch
@@ -172,8 +174,12 @@ def distributed_rex_step(pt, target, U, generator=None, periodic_translation=Fal
     pt.step(local_actions=table) (gather, swaps on rank 0, scatter) -> the new labels are set on
     the target -> optional periodic translation of the configurations at bc = 1.
     Returns (U, swap stats of pt.step, HMC stats). pt.config.acceptance_rule must be "exact" or
-    "auto".
+    "auto". `periodic_translation=True` needs bc = 1 on the top rung of pt.ladder (ValueError
+    otherwise); after the translation `target.qcd.phi` belongs to the untranslated U, so the full
+    action must not be evaluated before the next trajectory refreshes phi.
     """
+    if periodic_translation and float(pt.ladder[-1]) != 1.0:
+        raise ValueError(f"periodic_translation needs bc = 1 on the top rung, got {float(pt.ladder[-1])}")
     target.set_parameter(pt.local_parameters.to(torch.float64).cpu())
     U, accepted, dH, hmc_stats = target.trajectory(U, generator)
     hmc_stats = dict(hmc_stats, accepted=accepted, dH=dH)
@@ -199,7 +205,15 @@ class FermionREX:
             "even_odd" (both rounds every step), as `PTConfig.swap_parity`.
         periodic_translation: translate the bc = 1 configurations after the swaps (module doc).
         U: initial links (B = n_rungs * n_chains); default cold start.
+        swap_generator: CPU `torch.Generator` for the swap uniforms (kept apart from the generator
+            of the trajectories, which may live on the device). If None, a CPU generator is seeded
+            with `swap_seed`, or, if that is None too, at the first `step` with one int64 drawn
+            from the step's generator (from the global RNG if that is None). A resumable run
+            passes its own generator and saves its state.
         Extra keyword arguments go to `TwoFlavourWilson` (via QCDAction).
+
+    Device: U and the HMC may live on CUDA; labels, swap table, swap uniforms and history are kept
+    on the CPU (per-rung reductions run on the device, values are moved to the CPU when stored).
 
     State: `U` (B, D, lattice, N, N), entry b = slot * n_chains + chain; `labels` (n_rungs,
     n_chains) rung carried by each slot; `labels_history` (after the swaps of each step),
@@ -209,7 +223,7 @@ class FermionREX:
 
     def __init__(self, geometry, beta, kappa, defect_mask, ladder, n_chains=1, tau=1.0, n_steps=2,
                  integrator="omelyan", n_gauge_substeps=3, swap_parity="alternating",
-                 periodic_translation=False, U=None, **fermion_kwargs):
+                 periodic_translation=False, U=None, swap_generator=None, swap_seed=None, **fermion_kwargs):
         if swap_parity not in ("alternating", "even_odd"):
             raise ValueError(f"swap_parity must be 'alternating' or 'even_odd', got {swap_parity!r}")
         self.geometry = geometry
@@ -231,6 +245,11 @@ class FermionREX:
         if U.shape[0] != self.B:
             raise ValueError(f"U must hold n_rungs * n_chains = {self.B} configurations, got {U.shape[0]}")
         self.U = U
+        if swap_generator is None and swap_seed is not None:
+            swap_generator = torch.Generator().manual_seed(int(swap_seed))
+        if swap_generator is not None and swap_generator.device.type != "cpu":
+            raise ValueError("swap_generator must be a CPU generator")
+        self.swap_generator = swap_generator
         self.n_steps_done = 0
         self.link_accepted = torch.zeros(self.n_rungs - 1, dtype=torch.long)
         self.link_proposed = torch.zeros(self.n_rungs - 1, dtype=torch.long)
@@ -261,8 +280,12 @@ class FermionREX:
 
         `table` is the (B, n_rungs) relative action table (`swap_action_difference`) of the
         current configurations; it stays valid across rounds (the configurations do not move).
+        The uniforms come from the CPU `generator` (default `self.swap_generator`).
         Returns per-pair (accepted, proposed) counts, length n_rungs - 1, and dS of the attempts.
         """
+        if generator is None:
+            generator = self.swap_generator
+        table = table.cpu()
         C = self.n_chains
         chains = torch.arange(C)
         accepted = torch.zeros(self.n_rungs - 1, dtype=torch.long)
@@ -288,16 +311,25 @@ class FermionREX:
     # ---- one REX step ----------------------------------------------------------------------
     @torch.no_grad()
     def step(self, generator=None):
-        """Trajectory of every replica at its bc, swap round(s), optional translation; stats."""
+        """Trajectory of every replica at its bc, swap round(s), optional translation; stats.
+
+        `generator` drives the trajectory and the translation (on the device of U); the swaps use
+        `self.swap_generator` (class doc). After the translation `self.qcd.phi` belongs to the
+        untranslated U: do not evaluate the full action before the next step refreshes phi.
+        """
+        if self.swap_generator is None:
+            device = generator.device if generator is not None else "cpu"
+            seed = int(torch.randint(0, 2**62, (1,), generator=generator, device=device))
+            self.swap_generator = torch.Generator().manual_seed(seed)
         traj_labels = self.labels.clone()
         self.target.set_parameter(self.parameters())
         U, accepted, dH, hmc_stats = self.target.trajectory(self.U, generator)
-        table = swap_action_difference(self.qcd, U, self.parameters(), self.ladder)
+        table = swap_action_difference(self.qcd, U, self.parameters(), self.ladder).cpu()
         acc = torch.zeros(self.n_rungs - 1, dtype=torch.long)
         prop = torch.zeros(self.n_rungs - 1, dtype=torch.long)
         delta = {}
         for parity in self._parities():
-            a, p, d = self.swap_round(table, parity, generator)
+            a, p, d = self.swap_round(table, parity)
             acc += a
             prop += p
             delta.update(d)
@@ -314,21 +346,21 @@ class FermionREX:
         x = hmc_stats["exp_minus_dH"].to(torch.float64).view(shape)
         self.labels_history.append(self.labels.clone())
         self.trajectory_labels_history.append(traj_labels)
-        self.plaquette_history.append(plaq.clone())
-        self.exp_minus_dH_history.append(x.clone())
+        self.plaquette_history.append(plaq.cpu().clone())
+        self.exp_minus_dH_history.append(x.cpu().clone())
         return {
             "hmc_acceptance": float(accepted.to(torch.float64).mean()),
             "link_accepted": acc.tolist(),
             "link_proposed": prop.tolist(),
             "swap_dS": delta,
-            "plaquette_per_rung": [float(v) for v in self._per_rung(plaq, self.labels)],
-            "exp_minus_dH_per_rung": [float(v) for v in self._per_rung(x, traj_labels)],
+            "plaquette_per_rung": self._per_rung(plaq, self.labels).cpu().tolist(),
+            "exp_minus_dH_per_rung": self._per_rung(x, traj_labels).cpu().tolist(),
         }
 
     def _per_rung(self, values, labels):
-        """Mean over chains of the value carried by each rung, (n_rungs,)."""
-        out = torch.zeros(self.n_rungs, dtype=torch.float64)
-        out.scatter_add_(0, labels.reshape(-1), values.reshape(-1))
+        """Mean over chains of the value carried by each rung, (n_rungs,), on the device of values."""
+        out = torch.zeros(self.n_rungs, dtype=torch.float64, device=values.device)
+        out.scatter_add_(0, labels.reshape(-1).to(values.device), values.reshape(-1).to(torch.float64))
         return out / self.n_chains
 
     def run(self, n_steps, generator=None):
@@ -343,7 +375,7 @@ class FermionREX:
     def history_arrays(self, start=0):
         """numpy (labels, plaquette, trajectory_labels, exp_minus_dH), each (steps, n_rungs, n_chains),
         in the layout of `neoqcd.replica_history` (world_size -> slot, B -> chain)."""
-        stack = lambda xs: torch.stack(xs[start:], dim=0).numpy()
+        stack = lambda xs: torch.stack(xs[start:], dim=0).cpu().numpy()
         return (stack(self.labels_history), stack(self.plaquette_history),
                 stack(self.trajectory_labels_history), stack(self.exp_minus_dH_history))
 

@@ -48,7 +48,7 @@ class ReversibilityTest(unittest.TestCase):
     """5a. Forward, momentum flip, forward: back to (U, -P), phi fixed within the trajectory.
 
     With `reuse_guess=False` the force is a deterministic function of U, so the integrator is
-    reversible to rounding whatever the CG tolerance; with the chronological guess the force
+    reversible to O(solver tolerance); to rounding only when CG converges in few iterations; with the chronological guess the force
     depends on the history at the level of the solver tolerance.
     """
 
