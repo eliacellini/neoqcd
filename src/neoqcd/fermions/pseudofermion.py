@@ -169,6 +169,7 @@ class TwoFlavourWilson(ActionTerm):
         self.phi = op.apply_dagger(eta)
         self.X = None  # no useful guess for the new phi
         self._refresh_links = U
+        self._refresh_version = U._version  # in-place changes of U bump it (cache key below)
         self._refresh_action = (eta.conj() * eta).real.reshape(eta.shape[0], -1).sum(1)
         self.stats["refresh_calls"] += 1
 
@@ -181,10 +182,12 @@ class TwoFlavourWilson(ActionTerm):
     def action_difference(self, U_old, U_new):
         """S_pf(U_new) - S_pf(U_old) at fixed phi.
 
-        If U_old is (the same tensor object as) the links of the last refresh, S_pf(U_old) is
-        eta^dagger eta from the refresh and no solve is needed for it.
+        If U_old is (the same tensor object as) the links of the last refresh and has not been
+        modified in place since (same `_version`), S_pf(U_old) is eta^dagger eta from the refresh
+        and no solve is needed for it.
         """
-        if U_old is self._refresh_links and self._refresh_action is not None:
+        if (U_old is self._refresh_links and self._refresh_action is not None
+                and U_old._version == getattr(self, "_refresh_version", None)):
             S_old = self._refresh_action
         else:
             S_old = self.action(U_old)
