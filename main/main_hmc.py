@@ -21,6 +21,12 @@ traj = therm + n_traj. Summaries use the therm = 0 rows only.
 trajectories (field empty otherwise); the cheap per-trajectory data (plaquette, dH, cost) are
 always written.
 
+--fast (Wilson only, default off) uses neoqcd.fermions.fast.FastTwoFlavourWilson: the same
+action, heat bath and force through the half-lattice even-odd operator and lean_cg;
+--precision mixed (with --fast) solves with complex64 inner CG and complex128 residuals to the
+same tolerances; --colour-product picks the SU(N) x spinor product (auto: broadcast on CUDA,
+matmul on CPU). All are recorded in run_meta.json ("parameters" and "run").
+
 Resume: --resume reads <out>/checkpoint.*, checks that the physics parameters agree, drops CSV
 rows past the checkpoint and continues with the stored generator state: the continuation is
 bitwise identical to an uninterrupted run with the same seed (same device and thread count).
@@ -57,6 +63,7 @@ from neoqcd.fermions.io import (  # noqa: E402
     save_state,
     write_npz,
 )
+from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_product  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian  # noqa: E402
 from neoqcd.fermions.staggered_pseudofermion import StaggeredHamiltonian  # noqa: E402
@@ -107,6 +114,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-iter", type=int, default=5000, help="CG iteration cap per solve.")
     p.add_argument("--no-reuse-guess", dest="reuse_guess", action="store_false",
                    help="Start every CG from zero (exactly reversible trajectories).")
+    p.add_argument("--fast", action="store_true",
+                   help="Wilson only: half-lattice operator and lean CG (neoqcd.fermions.fast); same physics.")
+    p.add_argument("--precision", choices=("double", "mixed"), default="double",
+                   help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
+    p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default="auto",
+                   help="With --fast: SU(N) x spinor product; auto = broadcast on CUDA, matmul on CPU.")
+    p.add_argument("--check-every", type=int, default=10,
+                   help="With --fast: host convergence check of the CG every k iterations.")
     p.add_argument("--start", choices=("cold", "hot"), default="cold")
     p.add_argument("--therm", type=int, default=0, help="Thermalisation trajectories (recorded with therm = 1).")
     p.add_argument("--n-traj", type=int, default=100, help="Measured trajectories after thermalisation.")
@@ -151,6 +166,12 @@ def validate_args(args):
         raise SystemExit("even-odd pseudofermions need even T and L")
     if args.exact_logdet and args.fermions == "none":
         raise SystemExit("--exact-logdet needs fermions")
+    if args.fast and args.fermions != "wilson":
+        raise SystemExit("--fast is for --fermions wilson")
+    if args.precision != "double" and not args.fast:
+        raise SystemExit("--precision mixed needs --fast")
+    if args.check_every < 1:
+        raise SystemExit("--check-every must be >= 1")
     if args.resume and args.overwrite:
         raise SystemExit("--resume and --overwrite exclude each other")
     levels = 1 if args.fermions == "none" else 2
@@ -202,6 +223,11 @@ def build_hamiltonian(args, geometry):
     """Hamiltonian and its fermion term (None for --fermions none)."""
     kw = dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
               max_iter=args.max_iter, reuse_guess=args.reuse_guess)
+    if args.fermions == "wilson" and args.fast:
+        ham = FastTwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps,
+                                        precision=args.precision, check_every=args.check_every,
+                                        colour_product=args.colour_product, **kw)
+        return ham, ham.fermion
     if args.fermions == "wilson":
         ham = TwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps, **kw)
         return ham, ham.fermion
@@ -390,6 +416,9 @@ def main(argv=None):
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "torch_threads": torch.get_num_threads(),
         "n_flavours": n_flavours(args.fermions, args.D), "lattice": list(geometry.lattice),
         "volume": geometry.volume, "dtype": "complex128", "obs_fields": list(OBS_FIELDS),
+        "fermion_operator": "half_lattice_fast" if args.fast else "reference",
+        "precision": args.precision,
+        "colour_product": resolve_colour_product(args.colour_product, device) if args.fast else None,
     }
 
     def checkpoint(final=False):

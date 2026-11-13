@@ -27,6 +27,25 @@ and a device synchronisation around each timed block:
                        normal() and is divided by the iterations actually performed), a bare CG
                        loop without syncs or masks (package operator, gather_spinproj operator)
                        and the bare loop captured in one CUDA graph (CUDA only)
+    half_lattice       neoqcd.fermions.fast (opt-in package path), checked against the reference:
+                         eo_normal    half_lattice_<mode>      HalfLatticeWilson.normal in the config
+                                                        dtype, error vs EvenOddWilsonDirac, for every
+                                                        colour product mode (matmul, broadcast,
+                                                        broadcast_sum; `auto` = broadcast on CUDA,
+                                                        matmul on CPU);
+                                      half_lattice_<mode>_c64  the same operators cast to complex64
+                                                        (complex128 configurations only; error vs
+                                                        complex128 in `notes`, not in max_rel_error);
+                         (lean_cg_half and the solve rows use colour_product="auto"; the
+                         resolved mode is in `notes`)
+                         cg_iteration lean_cg_half      lean_cg (host check every --check-every
+                                                        iterations, no masking) on the half-lattice
+                                                        normal operator, tol = 0, per loop iteration;
+                                      lean_cg_reference lean_cg on EvenOddWilsonDirac.normal;
+                         solve        solver_cg_reference / lean_cg_double / mixed_precision: total
+                                      time of one solve of the same right-hand side to --solve-tol
+                                      (complex128 configurations; "call" = one solve; iterations and
+                                      outer steps in `iterations` / `notes`)
     pf_force           pseudofermion force given the solution X (the post-solve part of
                        TwoFlavourWilson.force, even-odd), and hopping_derivative alone
     gauge_force        WilsonGaugeAction.force
@@ -75,6 +94,15 @@ if str(ROOT / "src") not in sys.path:
 from neoqcd.fermions._gauge import SUN_haar, SUN_mul  # noqa: E402
 from neoqcd.fermions.algebra import expi, random_algebra  # noqa: E402
 from neoqcd.fermions.dirac import WilsonDirac  # noqa: E402
+from neoqcd.fermions.fast import (  # noqa: E402
+    HalfLatticeWilson,
+    lean_cg,
+    mixed_precision_cg,
+    resolve_colour_product,
+    to_half,
+)
+
+COLOUR_MODES = ("matmul", "broadcast", "broadcast_sum")
 from neoqcd.fermions.hmc import WilsonGaugeAction  # noqa: E402
 from neoqcd.fermions.lattice import Geometry, shift  # noqa: E402
 from neoqcd.fermions.pseudofermion import hopping_derivative  # noqa: E402
@@ -112,11 +140,12 @@ def parse_config(spec):
 
 def estimate_bytes(geo, batch, dtype):
     """Rough peak memory of one configuration: link copies (U, boundary links, gathered link
-    stacks, staggered, gauge-force temporaries) and fields (CG vectors, 2D gathered neighbours)."""
+    stacks, half-lattice link tables, staggered, gauge-force temporaries) and fields (CG vectors,
+    2D gathered neighbours)."""
     elt = 16 if dtype == torch.complex128 else 8
     links = batch * geo.D * geo.volume * geo.N * geo.N
     field = batch * geo.volume * geo.spin * geo.N
-    return (6 * links + (8 * geo.D + 8) * field) * elt
+    return (8 * links + (8 * geo.D + 8) * field) * elt
 
 
 def git_info():
@@ -368,6 +397,7 @@ class Bench:
         self.meta_variants = {}
         self.meta_compile = {}
         self.meta_kernels = {}
+        self.meta_fast = {}
 
     def emit(self, ctx, measurement, variant, status="ok", t=None, t_min=None, repeats=None,
              iterations=None, error=None, out_dtype=None, kernels=None, notes=""):
@@ -517,6 +547,9 @@ class Bench:
                 self.emit(ctx, "cg_iteration", "bare_cudagraph", status="error", notes=_short(exc))
             torch.cuda.synchronize()
 
+        # (d') half-lattice operator and solvers of neoqcd.fermions.fast
+        self._half_lattice(ctx, geo, eo, U, psi_e, ref_normal, b, n_iter, tol)
+
         # (e) pseudofermion force given the solution
         X = eo.even(torch.randn(geo.wilson_shape(batch), dtype=torch.complex128, generator=g).to(device=device,
                                                                                                   dtype=dtype))
@@ -527,8 +560,15 @@ class Bench:
         # (f) gauge force and link update
         gauge = WilsonGaugeAction(args.beta, geo)
         self.timed(ctx, "gauge_force", "reference", lambda: gauge.force(U))
-        P = random_algebra(U.shape, generator=g, dtype=torch.complex128).to(device=device, dtype=dtype)
-        self.timed(ctx, "expi_update", "cayley_hamilton", lambda: SUN_mul(expi(0.05 * P), U))
+        try:
+            P = random_algebra(U.shape, generator=g, dtype=torch.complex128).to(device=device, dtype=dtype)
+        except RuntimeError as exc:  # OOM while building the momenta: a row, not a crash
+            P = None
+            self._free()
+            self.emit(ctx, "expi_update", "cayley_hamilton",
+                      status="oom" if "out of memory" in str(exc).lower() else "error", notes=_short(exc))
+        if P is not None:
+            self.timed(ctx, "expi_update", "cayley_hamilton", lambda: SUN_mul(expi(0.05 * P), U))
         del P, gauge
 
         # (g) staggered M_ee
@@ -542,6 +582,95 @@ class Bench:
             self._breakdown(ctx, key, w, var, eo, psi, psi_e, good, fast_normal)
         del U, psi, psi_e, w, eo, var, ref, ref_normal, b, X, a2
         self._free()
+
+    def _half_lattice(self, ctx, geo, eo, U, psi_e, ref_normal, b_full, n_iter, tol):
+        """Rows of the half-lattice operator, lean_cg and the mixed-precision solve (module doc)."""
+        args = self.args
+        dtype = U.dtype
+        key = f"{self.lattice_name(geo)}:{ctx[1]}:{ctx[2]}"
+        x = to_half(psi_e, geo)
+        ref_half = to_half(ref_normal, geo)
+        auto = resolve_colour_product("auto", U.device)
+        half = half64 = None
+        for mode in COLOUR_MODES:
+            try:
+                op = HalfLatticeWilson(U, args.kappa, geo, colour_product=mode)
+            except RuntimeError as exc:
+                self._free()
+                self.emit(ctx, "eo_normal", f"half_lattice_{mode}", status="error", notes=_short(exc))
+                continue
+            out = op.normal(x)
+            err = rel_error(out, ref_half)
+            self.meta_fast[f"{key}:half_lattice_{mode}"] = err
+            if not err <= tol:
+                self.emit(ctx, "eo_normal", f"half_lattice_{mode}", status="mismatch", error=err)
+                continue
+            self.timed(ctx, "eo_normal", f"half_lattice_{mode}", lambda op=op: op.normal(x), out=out, error=err,
+                       notes=f"colour_product={mode}")
+            op64 = None
+            if dtype == torch.complex128:
+                op64 = op.to(torch.complex64)
+                x64 = x.to(torch.complex64)
+                out64 = op64.normal(x64)
+                err64 = rel_error(out64, ref_half)
+                self.meta_fast[f"{key}:half_lattice_{mode}_c64"] = err64
+                if err64 <= TOLERANCE[torch.complex64] and out64.dtype == torch.complex64:
+                    self.timed(ctx, "eo_normal", f"half_lattice_{mode}_c64", lambda op64=op64: op64.normal(x64),
+                               out=out64, notes=f"colour_product={mode}; err vs complex128 {err64:.1e}")
+                else:
+                    self.emit(ctx, "eo_normal", f"half_lattice_{mode}_c64", status="mismatch",
+                              notes=f"err vs complex128 {err64:.1e}; out {out64.dtype}")
+                    op64 = None
+            if mode == auto:
+                half, half64 = op, op64
+        if half is None:
+            return
+        bh = to_half(b_full, geo)
+        for variant, normal in (("lean_cg_half", half.normal), ("lean_cg_reference", eo.normal)):
+            rhs = bh if variant == "lean_cg_half" else b_full
+            info = {}
+            res = lean_cg(normal, rhs, tol=0.0, max_iter=n_iter, check_every=args.check_every, info=info)
+            loops = max(info["loop_iterations"], 1)
+            self.timed(ctx, "cg_iteration", variant,
+                       lambda normal=normal, rhs=rhs: lean_cg(normal, rhs, tol=0.0, max_iter=n_iter,
+                                                             check_every=args.check_every),
+                       out=res.x, divide=loops, iterations=loops, warmup=1, min_repeats=1,
+                       notes=f"tol=0; check_every={args.check_every}; colour_product={auto}; "
+                             "includes the final true-residual normal()")
+        if dtype != torch.complex128:
+            return
+        # one solve of the same right-hand side to --solve-tol: reference, lean double, mixed
+        st, mi = args.solve_tol, args.solve_max_iter
+        ref = cg(eo.normal, b_full, tol=st, max_iter=mi)
+        it = int(ref.iterations.max().item())
+        self.timed(ctx, "solve", "solver_cg_reference", lambda: cg(eo.normal, b_full, tol=st, max_iter=mi),
+                   out=ref.x, iterations=it, warmup=1, min_repeats=1,
+                   notes=f"tol={st:g}; residual {ref.residual.max().item():.1e}")
+        info = {}
+        dbl = lean_cg(half.normal, bh, tol=st, max_iter=mi, check_every=args.check_every, info=info)
+        self.timed(ctx, "solve", "lean_cg_double",
+                   lambda: lean_cg(half.normal, bh, tol=st, max_iter=mi, check_every=args.check_every),
+                   out=dbl.x, iterations=info["loop_iterations"], warmup=1, min_repeats=1,
+                   notes=f"tol={st:g}; colour_product={auto}; residual {dbl.residual.max().item():.1e}")
+        if half64 is None:
+            return
+        info = {}
+        mix = mixed_precision_cg(half, half64, bh, tol=st, inner_tol=args.inner_tol, max_iter=mi,
+                                 check_every=args.check_every, info=info)
+        diff = rel_error(mix.x, dbl.x)
+        status_note = (f"tol={st:g}; colour_product={auto}; inner_tol={args.inner_tol:g}; outer={info['outer']}; "
+                       f"inner max per outer={info['inner_iterations']}; residual {mix.residual.max().item():.1e}; "
+                       f"rel diff vs double {diff:.1e}").replace(",", ";")
+        self.meta_fast[f"{key}:mixed_precision"] = {"outer": info["outer"], "inner": info["inner_iterations"],
+                                                    "loops": info["loop_iterations"],
+                                                    "residual": mix.residual.max().item(), "diff": diff}
+        if not mix.residual.max().item() <= st:
+            self.emit(ctx, "solve", "mixed_precision", status="not_converged", notes=status_note)
+            return
+        self.timed(ctx, "solve", "mixed_precision",
+                   lambda: mixed_precision_cg(half, half64, bh, tol=st, inner_tol=args.inner_tol, max_iter=mi,
+                                              check_every=args.check_every),
+                   out=mix.x, iterations=info["loop_iterations"], warmup=1, min_repeats=1, notes=status_note)
 
     def _compiled(self, ctx, key, measurement, fns, x, ref, tol):
         if not hasattr(torch, "compile"):
@@ -693,6 +822,10 @@ def build_parser():
     p.add_argument("--cg-iters", type=int, default=50, help="CG iterations per timed solve (maximum)")
     p.add_argument("--cg-min-iters", type=int, default=5,
                    help="minimum CG iterations when --target-time shortens the solve on large lattices")
+    p.add_argument("--check-every", type=int, default=10, help="lean_cg host convergence check interval")
+    p.add_argument("--solve-tol", type=float, default=1e-10, help="tolerance of the 'solve' rows")
+    p.add_argument("--solve-max-iter", type=int, default=5000, help="iteration cap of the 'solve' rows")
+    p.add_argument("--inner-tol", type=float, default=1e-6, help="complex64 inner tolerance of mixed_precision_cg")
     p.add_argument("--compile-configs", nargs="*", default=["8^4:4", "16^4:4"],
                    help="lattice:batch pairs (complex128) where torch.compile is tried; none to skip")
     p.add_argument("--no-compile", action="store_true")
@@ -715,6 +848,9 @@ def main(argv=None):
     else:
         device = torch.device(args.device)
     if device.type == "cuda":
+        # torch 2.0: set_device(torch.device("cuda")) raises without an index, so resolve one
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -790,6 +926,7 @@ def main(argv=None):
         "variant_errors": bench.meta_variants,
         "compile": bench.meta_compile,
         "kernel_counts": bench.meta_kernels,
+        "fast_path": bench.meta_fast,
         "wall_seconds": round(time.perf_counter() - start, 1),
         "finished": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "csv": str(csv_path),
