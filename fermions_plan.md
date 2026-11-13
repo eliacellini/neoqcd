@@ -325,3 +325,8 @@ Decisione del 13 novembre: CUDA graph e kernel Triton entrano nel piano, ma solo
 2. Ottimizzazioni a costo zero di rischio, ammesse anche prima: batch più grandi, CG senza sincronizzazioni a ogni iterazione, operatore even-odd su metà reticolo.
 3. Dopo la validazione: CUDA graph per l'applicazione dell'operatore e per l'iterazione del CG (come già fatto per gli sweep di pura gauge), poi kernel Triton per il termine di hopping fuso (shift, moltiplicazione SU(3), proiezione di spin in un solo kernel) e per l'aggiornamento dei link. Ogni variante veloce resta dietro un'opzione e ha un test di uguaglianza con la versione di riferimento.
 4. Precisione mista (solve in complex64 con correzione in complex128) e supporto complex64 degli operatori, oggi assente.
+
+### Dopo la fase P (decisione del 13 novembre)
+
+1. **DD-HMC** (Lüscher 2005): da fare, non più opzionale. Blocchi con bc di Dirichlet, link attivi, complemento di Schur; blocco attivo sulla regione del difetto per avere un aggiornamento locale anche con i fermioni. Viene dopo la validazione e le ottimizzazioni.
+2. **Condizioni al bordo aperte con i fermioni.** Oggi il difetto agisce solo sull'azione di gauge e i fermioni restano (anti)periodici. Da aggiungere: bc aperte anche per l'operatore di Dirac (hopping nullo attraverso il bordo, alla Lüscher-Schaefer), prima sull'intero bordo temporale, poi sul difetto, con il parametro bc che interpola anche nel settore fermionico. Conseguenze da trattare: il determinante dipende da bc, quindi lo swap del REX e il lavoro del protocollo in bc non sono più di sola gauge e costano solve; le traslazioni periodiche della replica a bc = 1 restano valide solo su quel gradino; servono i coefficienti di miglioramento di bordo se si usa il clover.
