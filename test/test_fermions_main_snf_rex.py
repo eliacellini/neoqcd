@@ -232,5 +232,69 @@ class MainREXFermionsTest(unittest.TestCase):
         self.assertIsNone(side.get("kappa"))
 
 
+class REXDefectAndLadderTest(unittest.TestCase):
+    """The drivers build the defect of size L_d exactly as main_pt_obc.py (`utils.Defect`), and a
+    fermionic REX run feeds the optimal-ladder machinery of the pure-gauge code unchanged."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_defect_mask_equals_pure_gauge(self):
+        from neoqcd.fermions._gauge import Defect
+        from neoqcd.fermions.lattice import Geometry
+        DIST = _load("main_rex_fermions_distributed")
+        for D in (4, 2):
+            lattice = ["--D", str(D), "--T", "4", "--L", "4", "--N", "3", "--kappa", "0.18", "--device", "cpu"]
+            for spelling in (["--time-slice", "1", "--space-slice", "2"],
+                             ["--defect-time-slice", "1", "--defect-space-slice", "2"]):
+                reference = Defect(D, 4, 4, 2, time_slice=1, space_slice=2).create_defect_mask()
+                for module, extra in ((REX, ["--ladder", "0,1"]), (DIST, [])):
+                    with self.subTest(D=D, spelling=spelling[0], driver=module.__name__):
+                        args = module.parse_args(lattice + ["--defect-size", "2"] + spelling + extra)
+                        self.assertEqual(args.defect_shape, "cube")
+                        mask = SNF.build_defect_mask(args, Geometry(D, 4, 4, 3))
+                        self.assertEqual(mask.dtype, torch.float64)
+                        self.assertTrue(torch.equal(mask, reference.to(torch.float64)))
+
+    def test_optimal_ladder_from_fermionic_run(self):
+        from neoqcd.fermions._gauge import (optimal_ladder, parse_ladder, rung_moments, thermodynamic_length,
+                                            validate_ladder)
+        run = self.tmp / "run"
+        therm, steps = 2, 16
+        REX.main(LATTICE + ["--ladder", "0,0.5,1", "--defect-size", "2", "--time-slice", "1", "--space-slice", "1",
+                            "--n-chains", "3", "--therm", str(therm), "--steps", str(steps), "--seed", "4",
+                            "--periodic-translation", "--out", str(run)])
+        with np.load(run / "replica_history.npz") as h:
+            self.assertEqual(h["defect_action"].shape, h["labels"].shape)
+            np.testing.assert_allclose(h["parameter_ladder"], [0.0, 0.5, 1.0])
+            labels, sd, c = h["labels"].astype(np.int64), h["defect_action"], h["parameter_ladder"]
+        meta = json.loads((run / "run_meta.json").read_text())
+        self.assertEqual(meta["swap"]["link_parameter_left"], [0.0, 0.5])
+        self.assertEqual(sum(meta["swap"]["link_proposed"]), steps * 3)
+        self.assertEqual(len(meta["replica_history"]["defect_action"]["variance"]), 3)
+        # the functions of neoqcd.ladder, through the _gauge re-exports
+        moments = rung_moments(labels, sd, 3, discard_fraction=therm / (therm + steps))
+        var = np.asarray(moments["variance"])
+        self.assertTrue(np.all(var > 0))
+        lam = thermodynamic_length(c, var)
+        new = optimal_ladder(c, lam, 4)
+        self.assertEqual(validate_ladder(new, 4, 0.0, 1.0), [float(v) for v in new])
+        # main/optimal_ladder.py on the directory, unchanged, and the result back through --ladder-file
+        target = self.tmp / "ladder.json"
+        _load("optimal_ladder").main([str(run), "--n-rep", "4", "--output", str(target)])
+        ladder = parse_ladder(str(target))
+        self.assertEqual(len(ladder), 4)
+        again = self.tmp / "again"
+        REX.main(LATTICE + ["--ladder-file", str(target), "--n-chains", "1", "--steps", "2", "--out", str(again)])
+        meta = json.loads((again / "run_meta.json").read_text())
+        self.assertEqual(meta["parameters"]["ladder_values"], ladder)
+        with self.assertRaises(SystemExit):  # --ladder and --n-rep exclude each other
+            REX.parse_args(LATTICE + ["--ladder", "0,0.5", "--n-rep", "3"])
+
+
 if __name__ == "__main__":
     unittest.main()

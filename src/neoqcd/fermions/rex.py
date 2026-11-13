@@ -52,7 +52,18 @@ boundary conditions are translation invariant (the antiperiodic sign moves with 
 variables psi(t0) -> -psi(t0) on one time slice), and phi is drawn afresh at the next trajectory.
 Between the translation and the next trajectory `qcd.phi` belongs to the untranslated U: callers
 must not evaluate the full action (S_g + S_pf) in that window (the next trajectory refreshes phi).
+
+Optimal ladder: `defect_action` is S_D = dS/dc per configuration, the five-point formula of
+`mcmc.DefectMCMCAdapter.defect_action` on the gauge-only `action_difference` (S_pf does not depend
+on bc, so dS/dc = dS_g/dc and costs no solve). Its per-rung variance is the metric of
+`neoqcd.ladder` / main/optimal_ladder.py; `FermionREX` records it after every step and the drivers
+store it as the `defect_action` array of replica_history.npz.
+
+Swap uniforms of the distributed step: `ParallelTempering` draws them on rank 0 from the global
+generator of pt.device; `GlobalRNGStream` turns that into a private, checkpointable stream.
 """
+
+from contextlib import nullcontext
 
 import torch
 
@@ -66,7 +77,8 @@ from neoqcd.fermions._gauge import (
 from neoqcd.fermions.action import QCDAction
 from neoqcd.fermions.hmc import HMC
 
-__all__ = ["FermionREXTarget", "FermionREX", "distributed_rex_step", "swap_action_difference"]
+__all__ = ["FermionREXTarget", "FermionREX", "distributed_rex_step", "swap_action_difference", "defect_action",
+           "GlobalRNGStream"]
 
 
 def _check_name(parameter_name):
@@ -96,6 +108,75 @@ def swap_action_difference(qcd, U, parameters, ladder):
     columns = [qcd.action_difference(U, parameters, torch.full((B,), float(v), dtype=torch.float64))
                for v in ladder.tolist()]
     return torch.stack(columns, dim=1).to(torch.float64)
+
+
+def defect_action(qcd, U, parameters, step=0.125):
+    """S_D = dS/dc per configuration at its own bc, (B,) float64: the metric of the optimal ladder.
+
+    Same five-point formula as `mcmc.DefectMCMCAdapter.defect_action`, on the gauge-only
+    `QCDAction.action_difference` (bc parameter): each plaquette weight is a product of four
+    couplings linear in bc, a polynomial of degree <= 4, so the formula is exact for any `step`.
+    With the gauge-only defect dS/dc = dS_g/dc (S_pf does not depend on bc): no solve.
+    """
+    B = U.shape[0]
+    p = torch.as_tensor(parameters, dtype=torch.float64).reshape(-1).cpu()
+    if p.numel() == 1:
+        p = p.expand(B)
+    h = float(step)
+    near = qcd.action_difference(U, p - h, p + h)
+    far = qcd.action_difference(U, p - 2.0 * h, p + 2.0 * h)
+    return ((8.0 * near - far) / (12.0 * h)).to(torch.float64)
+
+
+class GlobalRNGStream:
+    """A private stream of the default generator of one device, swapped in only inside `with`.
+
+    `distributedPT.ParallelTempering` draws the swap uniforms of rank 0 with
+    `torch.rand(B, device=pt.device)`, i.e. from the default (global) generator of pt.device, and
+    takes no generator argument. To make those draws reproducible across a checkpoint and independent
+    of anything else that touches the global generator, the driver runs `pt.step` inside
+    `with stream:`: on entry the global state of the device is saved and replaced by the stream's
+    state, on exit the stream's advanced state is kept and the global state put back.
+    `get_state` / `set_state` checkpoint the stream (a CPU ByteTensor, the format of
+    `torch.get_rng_state` or `torch.cuda.get_rng_state`).
+    """
+
+    def __init__(self, device, seed):
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            raise ValueError("GlobalRNGStream needs an explicit CUDA index (cuda:K)")
+        if self.device.type not in ("cpu", "cuda"):
+            raise ValueError(f"unsupported device {self.device}")
+        self.state = torch.Generator(device=self.device).manual_seed(int(seed)).get_state().cpu().clone()
+        self._saved = None
+
+    def _get(self):
+        if self.device.type == "cuda":
+            return torch.cuda.get_rng_state(self.device).clone()
+        return torch.get_rng_state().clone()
+
+    def _set(self, state):
+        if self.device.type == "cuda":
+            torch.cuda.set_rng_state(state.cpu(), self.device)
+        else:
+            torch.set_rng_state(state.cpu())
+
+    def __enter__(self):
+        self._saved = self._get()
+        self._set(self.state)
+        return self
+
+    def __exit__(self, *exc):
+        self.state = self._get()
+        self._set(self._saved)
+        self._saved = None
+        return False
+
+    def get_state(self):
+        return self.state.clone()
+
+    def set_state(self, state):
+        self.state = torch.as_tensor(state).cpu().clone()
 
 
 class FermionREXTarget:
@@ -167,7 +248,7 @@ class FermionREXTarget:
 
 
 @torch.no_grad()
-def distributed_rex_step(pt, target, U, generator=None, periodic_translation=False):
+def distributed_rex_step(pt, target, U, generator=None, periodic_translation=False, swap_rng=None):
     """One REX step of a rank of `distributedPT.ParallelTempering` with a `FermionREXTarget`.
 
     trajectory at the current labels -> relative action table at pt.ladder (no solve) ->
@@ -177,6 +258,8 @@ def distributed_rex_step(pt, target, U, generator=None, periodic_translation=Fal
     "auto". `periodic_translation=True` needs bc = 1 on the top rung of pt.ladder (ValueError
     otherwise); after the translation `target.qcd.phi` belongs to the untranslated U, so the full
     action must not be evaluated before the next trajectory refreshes phi.
+    `swap_rng`: optional `GlobalRNGStream` of pt.device; pt.step then draws rank 0's swap uniforms
+    from that stream (checkpointable) instead of the bare global generator.
     """
     if periodic_translation and float(pt.ladder[-1]) != 1.0:
         raise ValueError(f"periodic_translation needs bc = 1 on the top rung, got {float(pt.ladder[-1])}")
@@ -184,7 +267,8 @@ def distributed_rex_step(pt, target, U, generator=None, periodic_translation=Fal
     U, accepted, dH, hmc_stats = target.trajectory(U, generator)
     hmc_stats = dict(hmc_stats, accepted=accepted, dH=dH)
     table = target.action_table(U, pt.ladder.cpu())
-    stats = pt.step(local_actions=table.to(device=pt.device))
+    with (swap_rng if swap_rng is not None else nullcontext()):
+        stats = pt.step(local_actions=table.to(device=pt.device))
     target.set_parameter(pt.local_parameters.to(torch.float64).cpu())
     if periodic_translation:
         U = translate_periodic_replica(U, pt.local_parameters.cpu(), 1.0, target.qcd.geometry.D, generator)
@@ -257,6 +341,7 @@ class FermionREX:
         self.trajectory_labels_history = []
         self.plaquette_history = []
         self.exp_minus_dH_history = []
+        self.defect_action_history = []  # S_D = dS/dc of each slot's configuration at its bc after the step
 
     # ---- labels ----------------------------------------------------------------------------
     def parameters(self):
@@ -344,6 +429,8 @@ class FermionREX:
         shape = (self.n_rungs, self.n_chains)
         plaq = mean_plaquette(plaquette_fields(U, self.geometry.D), self.geometry.N).to(torch.float64).view(shape)
         x = hmc_stats["exp_minus_dH"].to(torch.float64).view(shape)
+        sd = defect_action(self.qcd, U, self.parameters()).view(shape)
+        self.defect_action_history.append(sd.cpu().clone())
         self.labels_history.append(self.labels.clone())
         self.trajectory_labels_history.append(traj_labels)
         self.plaquette_history.append(plaq.cpu().clone())
@@ -379,12 +466,21 @@ class FermionREX:
         return (stack(self.labels_history), stack(self.plaquette_history),
                 stack(self.trajectory_labels_history), stack(self.exp_minus_dH_history))
 
+    def defect_action_array(self, start=0):
+        """numpy (steps, n_rungs, n_chains) S_D = dS/dc after each step (`defect_action`), layout of
+        `history_arrays`: the `defect_action` array of main/optimal_ladder.py."""
+        return torch.stack(self.defect_action_history[start:], dim=0).cpu().numpy()
+
     def rung_series(self, values, labels, rung):
         """(steps, n_chains) series of the replica carrying `rung` (`replica_observable_series`)."""
         return replica_observable_series(labels, values, rung)
 
     def summarize(self, start=0):
         """`replica_history.summarize_history` of the run: round trips, flux, plaquette tau_int on
-        the bottom (bc = ladder[0]) and top (bc = ladder[-1]) rungs."""
+        the bottom (bc = ladder[0]) and top (bc = ladder[-1]) rungs, and the mean and variance of the
+        defect action on every rung when its history covers every step."""
         labels, plaq, _, _ = self.history_arrays(start)
-        return summarize_history(labels, plaq, self.n_rungs)
+        sd = None
+        if len(self.defect_action_history) == len(self.labels_history):
+            sd = self.defect_action_array(start)
+        return summarize_history(labels, plaq, self.n_rungs, defect_action=sd)

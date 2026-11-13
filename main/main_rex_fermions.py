@@ -7,7 +7,20 @@ one fermionic HMC trajectory of every replica at its bc + swap round(s) between 
 (--swap-parity alternating: DEO, even pairs at even steps; even_odd: both rounds every step), with
 the solve-free gauge-only swap dS of `rex.swap_action_difference`; optional translation of the
 bc = 1 replicas (--periodic-translation). The defect is that of main_snf_fermions.py
-(--defect-shape cube|line, --defect-size, --defect-time-slice, --defect-space-slice).
+(--defect-shape cube|line, --defect-size, --defect-time-slice, --defect-space-slice). The default
+--defect-shape cube is `utils.Defect(D, T, L, L_d, time_slice, space_slice)`, built exactly as
+main/main_pt_obc.py builds it for --defect-size L_d (the pure-gauge spellings --time-slice and
+--space-slice are accepted too); "line" is a fermion-only test shape.
+
+Ladder: --ladder (aliases --ladder-file, --parameter-ladder) takes a comma-separated list or the JSON
+file written by main/optimal_ladder.py, parsed and validated by `neoqcd.ladder` as in main_pt_obc.py;
+or --n-rep values evenly spaced in [--bc-min, --bc-max].
+
+Optimal ladder: replica_history.npz holds `defect_action` (S_D = dS/dc of each slot's configuration
+at its bc, `rex.defect_action`) and `parameter_ladder`, and run_meta.json the "swap" block of
+main_pt_obc.py, so main/optimal_ladder.py reads this directory unchanged (--metric variance or
+acceptance). Unlike main_pt_obc.py, the history here includes the --therm steps (flagged by
+`therm` in the file): pass optimal_ladder.py a --discard of at least therm / (therm + steps).
 
 Output directory (--out, default output/rex_fermions/<auto name>):
     observables.csv     one row per (step, rung) (OBS_FIELDS): rung-averaged plaquette (mean over
@@ -16,10 +29,12 @@ Output directory (--out, default output/rex_fermions/<auto name>):
                         pair (rung, rung + 1) in this step, cost of the step;
     replica_history.npz labels (steps, n_rungs, n_chains): rung carried by each slot after the
                         swaps; plaquette (same shape): plaquette of each slot's configuration;
-                        trajectory_labels, exp_minus_dH; ladder; therm (number of leading
-                        thermalisation steps). Layout of `neoqcd.replica_history` (world_size ->
-                        slot, B -> chain);
-    run_meta.json       parameters + summary of the steps after --therm: `FermionREX.summarize()`
+                        defect_action (same shape): S_D = dS/dc at the slot's bc after the step;
+                        trajectory_labels, exp_minus_dH; ladder = parameter_ladder; swap_every (1);
+                        therm (number of leading thermalisation steps). Layout of
+                        `neoqcd.replica_history` (world_size -> slot, B -> chain);
+    run_meta.json       algorithm, parameters, "swap" and "replica_history" blocks in the layout of
+                        main_pt_obc.py (steps after --therm), and the summary: `FermionREX.summarize()`
                         (round trips, mean round-trip time, flux, plaquette tau_int on the bottom
                         and top rungs), swap acceptance per pair, plaquette per rung, HMC
                         acceptance, solves / CG iterations / seconds per step;
@@ -74,6 +89,7 @@ from neoqcd.fermions.io import (  # noqa: E402
     restore_generator,
     save_state,
 )
+from neoqcd.fermions._gauge import parse_ladder, validate_ladder  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.rex import FermionREX  # noqa: E402
 
@@ -98,9 +114,8 @@ STATE_NAME = "checkpoint"
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="REX on the gauge-only defect with N_f = 2 Wilson fermions.")
     add_physics_args(p)
-    p.add_argument("--ladder", type=str, default=None, help="Comma-separated increasing bc values, top = 1.")
-    p.add_argument("--n-rep", type=int, default=None, help="Uniform ladder of n values in [--bc-min, 1].")
-    p.add_argument("--bc-min", type=float, default=0.0)
+    add_rex_args(p)
+    p.add_argument("--n-rep", type=int, default=None, help="Uniform ladder of n values in [--bc-min, --bc-max].")
     p.add_argument("--n-chains", type=int, default=1)
     p.add_argument("--steps", type=int, default=100, help="Measured REX steps after --therm.")
     p.add_argument("--swap-parity", choices=("alternating", "even_odd"), default="alternating")
@@ -111,24 +126,75 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     validate_common(args)
     if (args.ladder is None) == (args.n_rep is None):
-        raise SystemExit("give exactly one of --ladder and --n-rep")
-    if args.ladder is not None:
-        try:
-            args.ladder_values = [float(x) for x in args.ladder.split(",") if x.strip()]
-        except ValueError:
-            raise SystemExit(f"--ladder: cannot parse {args.ladder!r}")
-    else:
-        if args.n_rep < 2:
-            raise SystemExit("--n-rep must be >= 2")
-        args.ladder_values = [float(v) for v in np.linspace(args.bc_min, 1.0, args.n_rep)]
-    lad = args.ladder_values
-    if len(lad) < 2 or any(b <= a for a, b in zip(lad, lad[1:])):
-        raise SystemExit(f"the ladder must be strictly increasing with >= 2 rungs, got {lad}")
-    if args.periodic_translation and lad[-1] != 1.0:
-        raise SystemExit("--periodic-translation needs bc = 1 on the top rung")
+        raise SystemExit("give exactly one of --ladder (--ladder-file) and --n-rep")
+    if args.ladder is None and args.n_rep < 2:
+        raise SystemExit("--n-rep must be >= 2")
+    args.ladder_values = resolve_ladder(args, args.n_rep)
     if args.n_chains < 1 or args.steps < 0 or args.checkpoint_every < 0:
         raise SystemExit("--n-chains >= 1, --steps >= 0, --checkpoint-every >= 0")
     return args
+
+
+# ---- options and outputs shared with main_rex_fermions_distributed.py ---------------------------
+def add_rex_args(p):
+    """Ladder options and the pure-gauge spellings of the defect options (main/main_pt_obc.py).
+
+    --ladder, --ladder-file and --parameter-ladder are one option: a comma-separated list or the
+    JSON file of main/optimal_ladder.py (`neoqcd.ladder.parse_ladder`, as --parameter-ladder of
+    main_pt_obc.py). --time-slice / --space-slice are the pure-gauge names of --defect-time-slice /
+    --defect-space-slice (same destination: the last one given wins).
+    """
+    p.add_argument("--ladder", "--ladder-file", "--parameter-ladder", dest="ladder", type=str, default=None,
+                   help="Explicit increasing bc values: comma-separated, or a JSON file written by "
+                        "main/optimal_ladder.py (a list or a dict with key 'ladder'). Top rung bc = 1 for "
+                        "--periodic-translation.")
+    p.add_argument("--bc-min", type=float, default=0.0, help="Lowest bc of a uniform ladder.")
+    p.add_argument("--bc-max", type=float, default=1.0, help="Highest bc of a uniform ladder.")
+    p.add_argument("--time-slice", dest="defect_time_slice", type=int, default=argparse.SUPPRESS,
+                   help="Alias of --defect-time-slice (main_pt_obc.py name).")
+    p.add_argument("--space-slice", dest="defect_space_slice", type=int, default=argparse.SUPPRESS,
+                   help="Alias of --defect-space-slice (main_pt_obc.py name).")
+
+
+def resolve_ladder(args, n_rep):
+    """The ladder as a list of floats: --ladder (parsed and validated as main_pt_obc.py does,
+    `parse_ladder` + `validate_ladder` with n_rep rungs if n_rep is given), or n_rep values evenly
+    spaced in [--bc-min, --bc-max] (`np.linspace`; `distributedPT.ladder_values` gives the same
+    numbers up to rounding of the last bit)."""
+    try:
+        if args.ladder is not None:
+            lad = validate_ladder(parse_ladder(args.ladder), n_rep)
+        else:
+            if args.bc_min >= args.bc_max:
+                raise ValueError(f"--bc-min must be < --bc-max, got {args.bc_min} >= {args.bc_max}")
+            lad = validate_ladder([float(v) for v in np.linspace(args.bc_min, args.bc_max, int(n_rep))])
+    except (ValueError, KeyError, OSError) as exc:
+        raise SystemExit(f"--ladder: {exc}")
+    if args.periodic_translation and lad[-1] != 1.0:
+        raise SystemExit("--periodic-translation needs bc = 1 on the top rung")
+    return lad
+
+
+def swap_meta(ladder, accepted, proposed):
+    """The "swap" block of main_pt_obc.py's run_meta.json (read by main/optimal_ladder.py --metric
+    acceptance): per-link counts and acceptances, link k = (ladder[k], ladder[k + 1])."""
+    ladder = [float(v) for v in ladder]
+    accepted = [int(a) for a in accepted]
+    proposed = [int(p) for p in proposed]
+    acc = [a / p if p > 0 else float("nan") for a, p in zip(accepted, proposed)]
+    tot_a, tot_p = sum(accepted), sum(proposed)
+    return {
+        "acceptance_mean": tot_a / tot_p if tot_p > 0 else float("nan"),
+        "total_accepted": tot_a,
+        "total_proposed": tot_p,
+        "parameter_name": "bc",
+        "link_parameter_left": ladder[:-1],
+        "link_parameter_right": ladder[1:],
+        "link_delta_parameter": [b - a for a, b in zip(ladder[:-1], ladder[1:])],
+        "link_acceptance": acc,
+        "link_accepted": accepted,
+        "link_proposed": proposed,
+    }
 
 
 def default_name(args):
@@ -151,12 +217,15 @@ def physics_key(args):
 
 
 def save_history(path, rex, therm):
-    labels, plaq, tlabels, emdH = rex.history_arrays() if rex.labels_history else (np.zeros((0,) + tuple(rex.labels.shape)),) * 4
+    empty = np.zeros((0,) + tuple(rex.labels.shape))
+    labels, plaq, tlabels, emdH = rex.history_arrays() if rex.labels_history else (empty,) * 4
+    sd = rex.defect_action_array() if rex.defect_action_history else empty
 
     def write(tmp):
         with open(tmp, "wb") as handle:
             np.savez(handle, labels=labels, plaquette=plaq, trajectory_labels=tlabels, exp_minus_dH=emdH,
-                     ladder=rex.ladder.numpy(), therm=np.asarray(int(therm)))
+                     defect_action=sd, ladder=rex.ladder.numpy(), parameter_ladder=rex.ladder.numpy(),
+                     swap_every=np.asarray(1), therm=np.asarray(int(therm)))
     _atomic_write(path, write)
 
 
@@ -164,10 +233,15 @@ def load_history(path, rex, n_steps):
     with np.load(path) as h:
         if h["labels"].shape[0] < n_steps:
             raise SystemExit(f"--resume: {path} holds {h['labels'].shape[0]} steps, the checkpoint {n_steps}")
-        for name, attr in (("labels", "labels_history"), ("plaquette", "plaquette_history"),
-                           ("trajectory_labels", "trajectory_labels_history"),
-                           ("exp_minus_dH", "exp_minus_dH_history")):
+        names = [("labels", "labels_history"), ("plaquette", "plaquette_history"),
+                 ("trajectory_labels", "trajectory_labels_history"), ("exp_minus_dH", "exp_minus_dH_history")]
+        if "defect_action" in h.files:  # absent in files written before the optimal-ladder outputs
+            names.append(("defect_action", "defect_action_history"))
+        for name, attr in names:
             setattr(rex, attr, [torch.from_numpy(np.array(x)) for x in h[name][:n_steps]])
+        if "defect_action" not in h.files:  # unknown for the old steps: NaN, so the shapes stay aligned
+            rex.defect_action_history = [torch.full(tuple(rex.labels.shape), float("nan"), dtype=torch.float64)
+                                         for _ in range(n_steps)]
 
 
 def summarize(rex, csv_path, therm):
@@ -178,6 +252,8 @@ def summarize(rex, csv_path, therm):
     if n_meas <= 0:
         return summary
     summary["history"] = rex.summarize(start=therm)
+    if "defect_action" in summary["history"]:
+        summary["history"]["defect_action"]["parameter_ladder"] = rex.ladder.tolist()
     cols = read_observables(csv_path)
     keep = cols["therm"] == 0
     cols = {k: v[keep] for k, v in cols.items()}
@@ -185,6 +261,9 @@ def summarize(rex, csv_path, therm):
     acc = [float(np.nansum(cols["swap_accepted"][cols["rung"] == k]) /
                  max(np.nansum(cols["swap_proposed"][cols["rung"] == k]), 1)) for k in range(n_r - 1)]
     per_step = cols["rung"] == 0
+    summary["swap"] = swap_meta(rex.ladder.tolist(),
+                                [np.nansum(cols["swap_accepted"][cols["rung"] == k]) for k in range(n_r - 1)],
+                                [np.nansum(cols["swap_proposed"][cols["rung"] == k]) for k in range(n_r - 1)])
     summary.update({
         "swap_acceptance": acc,
         "plaquette_per_rung": [float(cols["plaquette"][cols["rung"] == k].mean()) for k in range(n_r)],
@@ -282,9 +361,13 @@ def main(argv=None):
                    **state_couplings(args, fpar),
                    extra={"physics": key, "source": source, "seed": args.seed, "final": bool(final)})
         summary = summarize(rex, csv_path, args.therm)
-        atomic_json_save(clean_json({"parameters": params_json, "run": info, "steps_done": rex.n_steps_done,
-                                     "finished": bool(final and rex.n_steps_done >= total), "summary": summary}),
-                         meta_path)
+        meta = {"algorithm": "rex_fermions", "parameters": params_json, "run": info, "steps_done": rex.n_steps_done,
+                "finished": bool(final and rex.n_steps_done >= total), "summary": summary}
+        if "swap" in summary:  # main_pt_obc.py layout, read by main/optimal_ladder.py --metric acceptance
+            meta["swap"] = summary["swap"]
+        if "history" in summary:
+            meta["replica_history"] = dict(summary["history"], path=str(hist_path))
+        atomic_json_save(clean_json(meta), meta_path)
         return summary
 
     fdesc = f"N_f=2 Wilson kappa={args.kappa}" if args.fermions == "wilson" else f"staggered mass={args.mass}"

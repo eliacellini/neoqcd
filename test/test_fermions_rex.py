@@ -25,7 +25,8 @@ from neoqcd.fermions._gauge import SUN_haar, rung_indices, translate_periodic_re
 from neoqcd.fermions.action import QCDAction
 from neoqcd.fermions.exact import log_det_two_flavour
 from neoqcd.fermions.lattice import Geometry
-from neoqcd.fermions.rex import FermionREX, FermionREXTarget, distributed_rex_step, swap_action_difference
+from neoqcd.fermions.rex import (FermionREX, FermionREXTarget, GlobalRNGStream, defect_action, distributed_rex_step,
+                                 swap_action_difference)
 
 G2 = Geometry(2, 4, 4, 3)  # 2D 4 x 4, SU(3)
 G4 = Geometry(4, 4, 2, 3)  # 2^3 x 4, SU(3)
@@ -105,6 +106,72 @@ class SwapActionDifferenceTest(unittest.TestCase):
         V = translate_periodic_replica(U, torch.tensor([1.0, 0.5], dtype=torch.float64), 1.0, G2.D)
         self.assertTrue(torch.equal(V[1], U[1]))
         self.assertFalse(torch.equal(V[0], U[0]))
+
+
+class SizedDefectTest(unittest.TestCase):
+    """The defect of size L_d of the pure-gauge code (`utils.Defect`, as main_pt_obc.py builds it):
+    the swap table from `QCDAction.action_difference` and the defect action S_D = dS/dc equal those
+    of `mcmc.DefectMCMCAdapter` (the pure-gauge REX) on that defect, 4^4 and 2D 4 x 4, L_d = 2."""
+
+    def test_table_and_defect_action_equal_pure_gauge(self):
+        from types import SimpleNamespace
+        from neoqcd.mcmc import DefectMCMCAdapter
+        from neoqcd.utils import Defect, create_mask
+        for g in (Geometry(4, 4, 4, 3), G2):
+            for time_slice, space_slice in ((0, 0), (1, 2)):
+                with self.subTest(D=g.D, time_slice=time_slice, space_slice=space_slice):
+                    mask = Defect(g.D, g.T, g.L, 2, time_slice=time_slice, space_slice=space_slice).create_defect_mask()
+                    self.assertEqual(int(mask[1, 0].sum()), 2 ** (g.D - 1))  # L_d^(D-1) time links
+                    self.assertEqual(int(mask[1, 1:].sum()), 0)
+                    B = 3
+                    U, _ = haar_links(g, B, 7 + g.D)
+                    params = torch.tensor([0.0, 0.37, 1.0], dtype=torch.float64)
+                    qcd = QCDAction(g, "bc", beta=BETA, kappa=KAPPA, bc=params, defect_mask=mask.to(torch.float64))
+                    pars = SimpleNamespace(D=g.D, N=g.N, T=g.T, L=g.L, device=torch.device("cpu"), orsteps=1,
+                                           mask=create_mask(g.D, g.T, g.L), defect=None)
+                    adapter = DefectMCMCAdapter(pars, BETA, mask, B)
+                    ladder = torch.tensor([0.0, 0.25, 0.5, 0.8, 1.0], dtype=torch.float64)
+                    solves = qcd.fermion.stats["solves"]
+                    table = swap_action_difference(qcd, U, params, ladder)
+                    self.assertEqual(qcd.fermion.stats["solves"], solves)
+                    for full_lattice in (False, True):
+                        ref = torch.stack([adapter.action_difference(U, params, torch.full((B,), float(v), dtype=torch.float64),
+                                                                     full_lattice=full_lattice)
+                                           for v in ladder.tolist()], dim=1)
+                        self.assertLess((table - ref).abs().max().item(), 1e-10)
+                    self.assertGreater(table.abs().max().item(), 1e-2)
+                    s_d = defect_action(qcd, U, params)
+                    self.assertLess((s_d - adapter.defect_action(U, params)).abs().max().item(), 1e-10)
+                    # exact for any step (polynomial weights), and the derivative of the table
+                    self.assertLess((defect_action(qcd, U, params, step=0.01) - s_d).abs().max().item(), 1e-10)
+                    h = 1e-6
+                    fd = qcd.action_difference(U, params - h, params + h) / (2 * h)
+                    self.assertLess((fd - s_d).abs().max().item(), 1e-6 * max(1.0, s_d.abs().max().item()))
+
+
+class GlobalRNGStreamTest(unittest.TestCase):
+    """The private swap stream draws what a generator with its seed draws, advances only inside
+    `with`, leaves the global generator untouched and resumes from a saved state."""
+
+    def test_stream(self):
+        torch.manual_seed(5)
+        stream = GlobalRNGStream("cpu", 123)
+        before = torch.get_rng_state()
+        with stream:
+            a = torch.rand(4, dtype=torch.float64)
+        self.assertTrue(torch.equal(torch.get_rng_state(), before))
+        self.assertTrue(torch.equal(a, torch.rand(4, generator=torch.Generator().manual_seed(123), dtype=torch.float64)))
+        saved = stream.get_state()
+        with stream:
+            b = torch.rand(4, dtype=torch.float64)
+        other = GlobalRNGStream("cpu", 0)
+        other.set_state(saved)
+        with other:
+            c = torch.rand(4, dtype=torch.float64)
+        self.assertTrue(torch.equal(b, c))
+        self.assertFalse(torch.equal(a, b))
+        with self.assertRaises(ValueError):
+            GlobalRNGStream("cuda", 1)  # no index
 
 
 _RUN = {}
