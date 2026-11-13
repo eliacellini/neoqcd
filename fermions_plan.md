@@ -308,3 +308,20 @@ Da fare, in ordine:
 3. Fase 4 passo 3: training SNF nei tre protocolli ai punti di benchmark; confronto con HMC e con i flussi MIT; costo in solve per configurazione.
 4. SNF con strati per staggered (in corso), RHMC N_f = 2 staggered, clover, DD-HMC (opzionale), protocollo a fisica costante.
 5. Rilievo ereditato dal codice puro gauge: la regola "2x" di `Flow._full_logdet` per SU(2) non è il Jacobiano di Haar esatto (errore relativo ~1e-3 a ρ = 0.01-0.1); per SU(3) il log det dello strato è esatto a 1e-14.
+
+## Aggiornamento del 13 novembre 2026
+
+Fatto dal 7 novembre: Hasenbusch e parte staggered di azione/SNF confutati e rifiniti; RHMC per staggered con radice (CG multishift, Zolotarev e Remez); termine clover per Wilson; job di debug spostati sul worktree di test di Leonardo (`neoqcd_test`, mai il checkout di produzione).
+
+Primo run su GPU (A100, complex128, job 64423735, commit 4a95cca): il codice gira su CUDA senza modifiche.
+- 4^4, β = 1, κ = 0.1: accettanza 0.9925(25), <exp(-dH)> = 1.00021(59), <P> = 0.06091(19), <log det> = 0.9295(50), 0.81 s per traiettoria.
+- 8^4, β = 5.6, κ = 0.153: incompleto (30 minuti finiti in termalizzazione); accettanza 0.957, 154 iterazioni CG per solve, 5.8 ms per iterazione, 20.6 s per traiettoria.
+- Il costo per iterazione cresce solo di 2 volte per 16 volte il volume: il kernel è dominato dal lancio delle operazioni, non dall'aritmetica. Le stime di costo della tabella dei benchmark erano troppo ottimistiche di circa un ordine di grandezza a 8^4.
+
+### Fase P: prestazioni (solo dopo la validazione)
+
+Decisione del 13 novembre: CUDA graph e kernel Triton entrano nel piano, ma solo quando la correttezza è chiusa (benchmark 4^4 e 8^4 contro determinante esatto e openQCD/Grid). Fino ad allora si misura soltanto.
+1. Misura: `main/bench_fermions.py` (operatori, CG con e senza sincronizzazioni con l'host, forze, varianti del termine di hopping con tabelle di indici e proiezione di spin, replay con CUDA graph, conteggio dei kernel).
+2. Ottimizzazioni a costo zero di rischio, ammesse anche prima: batch più grandi, CG senza sincronizzazioni a ogni iterazione, operatore even-odd su metà reticolo.
+3. Dopo la validazione: CUDA graph per l'applicazione dell'operatore e per l'iterazione del CG (come già fatto per gli sweep di pura gauge), poi kernel Triton per il termine di hopping fuso (shift, moltiplicazione SU(3), proiezione di spin in un solo kernel) e per l'aggiornamento dei link. Ogni variante veloce resta dietro un'opzione e ha un test di uguaglianza con la versione di riferimento.
+4. Precisione mista (solve in complex64 con correzione in complex128) e supporto complex64 degli operatori, oggi assente.
