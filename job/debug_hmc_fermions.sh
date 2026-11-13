@@ -10,7 +10,10 @@
 #SBATCH -p boost_usr_prod
 #SBATCH --qos=boost_qos_dbg
 #SBATCH --time=00:30:00
-#SBATCH --chdir=/leonardo_work/INF26_sft/ecellini/neoqcd
+#SBATCH --chdir=/leonardo_work/INF26_sft/ecellini/neoqcd_test
+
+# Runs in the test worktree; never in the production checkout.
+# reports/ must exist in the test worktree before sbatch (SLURM opens -o/-e before the script runs).
 
 # N_f = 2 Wilson HMC benchmarks of fermions_plan.md (phase 1, Benchmark and cost), one A100, fp64:
 #   w4  4^4 SU(3), beta = 1.0, kappa = 0.1, with the exact log det every trajectory (1536 x 1536);
@@ -25,7 +28,12 @@ set -euo pipefail
 
 module load profile/deeplrn
 module load cineca-ai/
-source .sunenv/bin/activate
+# The environment lives only in the production checkout: activate it by absolute path, but import
+# the package of the test worktree (PYTHONPATH first).
+source /leonardo_work/INF26_sft/ecellini/neoqcd/.sunenv/bin/activate
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+mkdir -p reports
+echo "=== worktree $PWD commit $(git rev-parse HEAD)"
 export OMP_NUM_THREADS=1
 
 POINTS="${POINTS:-w4 w8}"
