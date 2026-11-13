@@ -1,9 +1,11 @@
 """Tests of Hasenbusch mass preconditioning (neoqcd.fermions.hasenbusch) for the N_f = 2 even-odd
 Wilson HMC: exactness of the factorisation, forces of the heavy and ratio terms, HMC with the
-Hasenbusch Hamiltonian against the single-pseudofermion HMC, and the CG cost.
+Hasenbusch Hamiltonian against the exact-determinant Metropolis, argument and convergence guards,
+and a CG-cost printout.
 
 CPU, complex128, fixed seeds. Lattices: 2^3 x 4 SU(3) (even-odd dimension 192) and 2D 4 x 4 SU(3)
-(48). Set NEOQCD_TEST_VERBOSE=1 to print the diagnostics.
+(48). Set NEOQCD_TEST_VERBOSE=1 to print the diagnostics; NEOQCD_SLOW=1 enables the
+discriminating Hasenbusch HMC against the exact Metropolis (~3 min).
 """
 
 import math
@@ -13,9 +15,9 @@ import unittest
 import torch
 
 from neoqcd.fermions import hmc as H
-from neoqcd.fermions._gauge import SUN_dagger, SUN_haar, SUN_identity, SUN_mul, SUN_trace, mean_plaquette, plaquette_fields
+from neoqcd.fermions._gauge import SUN_dagger, SUN_haar, SUN_identity, SUN_mul, SUN_trace
 from neoqcd.fermions.algebra import algebra_basis, expi, random_algebra, trace_product
-from neoqcd.fermions.exact import assemble_even_odd, log_det_two_flavour
+from neoqcd.fermions.exact import ExactMetropolis, assemble_even_odd, log_det_two_flavour
 from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian, HeavyWilsonTerm, RatioWilsonTerm
 from neoqcd.fermions.hmc import link_sum
 from neoqcd.fermions.lattice import Geometry, parity
@@ -25,6 +27,7 @@ G4 = Geometry(4, 4, 2, 3)  # 2^3 x 4, SU(3)
 G2 = Geometry(2, 4, 4, 3)  # 2D 4 x 4, SU(3)
 C = torch.complex128
 VERBOSE = bool(os.environ.get("NEOQCD_TEST_VERBOSE"))
+SLOW = bool(os.environ.get("NEOQCD_SLOW"))
 
 
 def haar_links(geometry, batch, seed):
@@ -97,7 +100,7 @@ class ExactnessTest(unittest.TestCase):
                     self.assertLess(abs(est - exact[name]), 4 * err)
 
 
-def dense_actions(U, phi_h, phi_r, kappa, kappa_h, geo):
+def dense_actions(U, phi_h, phi_r, kappa, kappa_h, geo, time_sign=-1.0):
     """S_1 = |D_hat'^-dagger phi_1|^2 and S_2 = |D_hat^-dagger D_hat'^dagger phi_2|^2 from dense
     even-odd matrices (differentiable in U by autograd), shape (B,) each."""
     B = U.shape[0]
@@ -106,8 +109,8 @@ def dense_actions(U, phi_h, phi_r, kappa, kappa_h, geo):
     def ev(phi):
         return phi.reshape(B, geo.volume, -1)[:, even].reshape(B, -1, 1)
 
-    Dl = assemble_even_odd(U, kappa, geo)
-    Dh = assemble_even_odd(U, kappa_h, geo)
+    Dl = assemble_even_odd(U, kappa, geo, time_sign)
+    Dh = assemble_even_odd(U, kappa_h, geo, time_sign)
     dag = lambda A: A.conj().transpose(-1, -2)
     y1 = torch.linalg.solve(dag(Dh), ev(phi_h))
     y2 = torch.linalg.solve(dag(Dl), torch.matmul(dag(Dh), ev(phi_r)))
@@ -165,8 +168,6 @@ class ForceTest(unittest.TestCase):
 
     def test_force_against_autograd(self):
         for name, geo, k, kh, ts, seed in self.cases():
-            if ts != -1.0:
-                continue  # assemble_even_odd is called with the default antiperiodic sign
             U, gen = haar_links(geo, 2, seed + 10)
             kt, kht, terms = self.terms(geo, k, kh, ts)
             for S in terms.values():
@@ -174,7 +175,7 @@ class ForceTest(unittest.TestCase):
             T = algebra_basis(geo.N)
             omega = torch.zeros(U.shape[:-2] + (T.shape[0],), dtype=torch.float64, requires_grad=True)
             Uw = U + 1j * torch.matmul(torch.einsum("...a,aij->...ij", omega.to(C), T), U)
-            s1, s2 = dense_actions(Uw, terms["heavy"].phi, terms["ratio"].phi, kt, kht, geo)
+            s1, s2 = dense_actions(Uw, terms["heavy"].phi, terms["ratio"].phi, kt, kht, geo, ts)
             # the dense actions agree with the sparse ones
             with torch.no_grad():
                 self.assertLess(((s1 - terms["heavy"].action(U)).abs() / s1).max().item(), 1e-11)
@@ -190,6 +191,33 @@ class ForceTest(unittest.TestCase):
                     self.assertLess(dev, 1e-10 * max(scale, 1.0))
 
 
+class GuardTest(unittest.TestCase):
+    """Refresh convergence check and argument validation of HasenbuschHamiltonian."""
+
+    def test_refresh_raises_when_heavy_solve_not_converged(self):
+        U, gen = haar_links(G2, 2, 211)
+        S = RatioWilsonTerm(0.20, 0.15, G2, max_iter=3)
+        with self.assertRaisesRegex(RuntimeError, "not converged, relative residual"):
+            S.refresh(U, gen)
+        RatioWilsonTerm(0.20, 0.15, G2).refresh(U, gen)  # default max_iter converges
+
+    def test_rejects_inconsistent_arguments(self):
+        args = (5.0, 0.12, 0.09, G4)
+        for kwargs, pattern in (
+                (dict(time_sign=-1.0, heavy_kwargs={"time_sign": 1.0}), "time_sign"),
+                (dict(heavy_kwargs={"geometry": G2}), "geometry"),
+                (dict(layout="shared", n_heavy_substeps=2), "n_heavy_substeps"),
+                (dict(layout=((("ratio",), 1), (("heavy", "gauge"), 2)), n_gauge_substeps=2), "explicit levels"),
+                (dict(layout=(("ratio", 1), (("heavy", "gauge"), 2))), "bare string")):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, pattern):
+                HasenbuschHamiltonian(*args, **kwargs)
+        ham = HasenbuschHamiltonian(*args, time_sign=1.0, heavy_kwargs={"time_sign": 1.0, "solver_tol": 1e-8},
+                                    layout="shared", n_ratio_substeps=2, n_gauge_substeps=3)
+        self.assertEqual(ham.heavy.time_sign, 1.0)
+        self.assertEqual(ham.heavy.solver_tol, 1e-8)
+        self.assertEqual([s for _, s in ham.layout], [2, 3])
+
+
 class IntegratorTest(unittest.TestCase):
     """3a. Reversibility and |dH| ~ eps^2 with the Hasenbusch Hamiltonian, 2^3 x 4 SU(3), both the
     nested (three-level) and the shared (two-level) layouts."""
@@ -198,8 +226,9 @@ class IntegratorTest(unittest.TestCase):
         U, gen = haar_links(G4, 3, 401)
         P = H.random_momenta(U.shape, generator=gen)
         for layout in ("nested", "shared"):
-            ham = HasenbuschHamiltonian(5.0, 0.12, 0.09, G4, n_heavy_substeps=2, n_gauge_substeps=2,
-                                        layout=layout, reuse_guess=False, solver_tol=1e-12)
+            nh = {"n_heavy_substeps": 2} if layout == "nested" else {}  # shared has no heavy level
+            ham = HasenbuschHamiltonian(5.0, 0.12, 0.09, G4, n_gauge_substeps=2, layout=layout,
+                                        reuse_guess=False, solver_tol=1e-12, **nh)
             ham.refresh(U, gen)
             with self.subTest(layout=layout):
                 hmc = H.HMC(G4, ham, tau=0.5, n_steps=3, integrator="omelyan")
@@ -235,62 +264,114 @@ class IntegratorTest(unittest.TestCase):
         self.assertLess(slope, 2.2, msg=f"dH={dH}")
 
 
-class HMCComparisonTest(unittest.TestCase):
-    """3b, 4. 2D 4 x 4 SU(3), beta = 5.0, kappa = 0.22 (kappa' = 0.18), B = 32 chains from a cold
-    start: <exp(-dH)> = 1 and <P> equal to the single-pseudofermion HMC within errors; rms forces of
-    the ratio and heavy terms against the single-term force on the thermalised configurations; CG
-    iterations per trajectory with and without preconditioning (reported, not asserted)."""
+class _ExactComparison:
+    """2D 4 x 4 SU(3), beta = 5.0, kappa = 0.22 (kappa' = 0.18), B = 32 chains from a cold start.
+    Hasenbusch HMC (nested, n_steps = 2) against the exact-determinant Metropolis (`ExactMetropolis`,
+    eps = 0.45) at kappa, observable <log det(D_hat^dagger D_hat)(kappa)> (exact, on every sampled
+    configuration): the plaquette cannot be used, the whole fermion effect on <P> is below its
+    errors. A second exact reference sampled at the wrong coupling kappa' (the heavy-only theory, i.e.
+    a Hasenbusch HMC without its ratio term) gives the scale of the fermion effect, the gap
+    |l_exact(kappa) - l_exact(kappa')| ~ 0.11.
+
+    Errors: spread of the 32 independent chain means / sqrt(32). This is unbiased whatever the
+    autocorrelation inside a chain (each chain mean carries it); measured tau_int of log det along the
+    Metropolis chains is 3.3 sweeps, and the chain-mean error of a 160-sweep window (0.0149) matches
+    sqrt(2 tau_int var / (n B)) = 0.0152 and the spread over 10 independent seeds (0.010). Metropolis
+    thermalisation: 30 sweeps (log det equilibrates in ~25 from cold); HMC: 15 trajectories."""
 
     BETA, KAPPA, KAPPA_H, B = 5.0, 0.22, 0.18, 32
-    N_THERM, N_MEAS = 15, 50
+    N_THERM, M_THERM = 15, 30
 
     @classmethod
-    def run_chain(cls, ham, n_steps, seed):
+    def chain_stats(cls, x):
+        m = torch.stack(x).mean(0)
+        return m.mean().item(), (m.std() / math.sqrt(cls.B)).item()
+
+    @classmethod
+    def log_det(cls, U):
+        return log_det_two_flavour(U, cls.KAPPA, G2, method="assembled")
+
+    @classmethod
+    def run_chain(cls, ham, n_steps, n_meas, seed):
         gen = torch.Generator().manual_seed(seed)
         U = SUN_identity(G2.link_shape(cls.B)[:-1], dtype=torch.cdouble)
         hmc = H.HMC(G2, ham, tau=1.0, n_steps=n_steps, integrator="omelyan")
-        plaq, expdH, acc = [], [], []
-        for i in range(cls.N_THERM + cls.N_MEAS):
+        logdet, expdH, acc = [], [], []
+        for i in range(cls.N_THERM + n_meas):
             if i == cls.N_THERM:
                 for t in ham.terms:
                     if hasattr(t, "reset_stats"):
                         t.reset_stats()
             U, accepted, dH, stats = hmc.trajectory(U, gen)
             if i >= cls.N_THERM:
-                plaq.append(mean_plaquette(plaquette_fields(U, G2.D), G2.N))
+                logdet.append(cls.log_det(U))
                 expdH.append(stats["exp_minus_dH"])
                 acc.append(stats["acceptance"])
-
-        def chain_stats(x):
-            m = torch.stack(x).mean(0)
-            return m.mean().item(), (m.std() / math.sqrt(cls.B)).item()
-
         cg = sum(t.stats["cg_iterations"] for t in ham.terms if hasattr(t, "stats"))
-        return {"U": U, "plaq": chain_stats(plaq), "expdH": chain_stats(expdH), "acc": sum(acc) / len(acc),
-                "cg_per_traj": cg / cls.N_MEAS}
+        return {"U": U, "logdet": cls.chain_stats(logdet), "expdH": cls.chain_stats(expdH),
+                "acc": sum(acc) / len(acc), "cg_per_traj": cg / n_meas,
+                "cg_ratio": ham.ratio.stats["cg_iterations"] / n_meas, "cg_heavy": ham.heavy.stats["cg_iterations"] / n_meas}
+
+    @classmethod
+    def run_metropolis(cls, kappa, n_meas, seed):
+        """Exact sampler at `kappa`; <log det> always at the target cls.KAPPA."""
+        gen = torch.Generator().manual_seed(seed)
+        m = ExactMetropolis(cls.BETA, kappa, G2, eps=0.45, links_per_update=1)
+        m.reset(SUN_identity(G2.link_shape(cls.B)[:-1], dtype=torch.cdouble))
+        logdet = []
+        for sweep in range(cls.M_THERM + n_meas):
+            for _ in range(G2.D * G2.volume):
+                m.step(gen)
+            if sweep >= cls.M_THERM:
+                logdet.append(cls.log_det(m.U))
+        return {"U": m.U, "logdet": cls.chain_stats(logdet), "acc": m.acceptance}
+
+    @classmethod
+    def run_all(cls, n_meas, m_meas, m_meas_wrong, seeds):
+        hb = HasenbuschHamiltonian(cls.BETA, cls.KAPPA, cls.KAPPA_H, G2, n_heavy_substeps=2, n_gauge_substeps=2)
+        return (cls.run_chain(hb, 2, n_meas, seeds[0]), cls.run_metropolis(cls.KAPPA, m_meas, seeds[1]),
+                cls.run_metropolis(cls.KAPPA_H, m_meas_wrong, seeds[2]))
+
+    def check(self, res_hb, res_exact, res_wrong, gap_ratio):
+        """Asserts acceptance, <exp(-dH)> = 1, HMC-exact within 4 sigma and, if `gap_ratio`,
+        |l_hmc - l_exact| < gap_ratio * |l_exact - l_exact(kappa')|."""
+        b, e, w = res_hb, res_exact, res_wrong
+        (l_h, e_h), (l_e, e_e), (l_w, e_w) = b["logdet"], e["logdet"], w["logdet"]
+        sig = abs(l_h - l_e) / math.hypot(e_h, e_e)
+        gap_sig = abs(l_e - l_w) / math.hypot(e_e, e_w)
+        ratio = abs(l_h - l_e) / abs(l_e - l_w)
+        msg = (f"<log det(kappa={self.KAPPA})>: Hasenbusch HMC {l_h:.4f}({e_h:.4f}), exact Metropolis "
+               f"{l_e:.4f}({e_e:.4f}), exact at kappa'={self.KAPPA_H} {l_w:.4f}({e_w:.4f}); "
+               f"HMC-exact {sig:.2f} sigma, gap {gap_sig:.2f} sigma, |l_hmc - l_exact| / gap = {ratio:.3f}\n"
+               f"Hasenbusch: <exp(-dH)> = {b['expdH'][0]:.4f}({b['expdH'][1]:.4f}), acceptance {b['acc']:.3f}, "
+               f"CG iterations / trajectory {b['cg_per_traj']:.0f} (ratio {b['cg_ratio']:.0f}, heavy "
+               f"{b['cg_heavy']:.0f}); Metropolis acceptance {e['acc']:.3f}, {w['acc']:.3f}")
+        if VERBOSE:
+            print("\n" + msg)
+        self.assertGreater(b["acc"], 0.9, msg=msg)  # long-run mean 0.97 at n_steps = 2
+        self.assertGreater(min(e["acc"], w["acc"]), 0.3, msg=msg)
+        self.assertLess(abs(b["expdH"][0] - 1.0), 4 * b["expdH"][1], msg=msg)
+        self.assertLess(sig, 4.0, msg=msg)
+        if gap_ratio is not None:
+            self.assertLess(ratio, gap_ratio, msg=msg)
+
+
+class HMCComparisonTest(_ExactComparison, unittest.TestCase):
+    """3b, 4. Fast version of the exact comparison (`_ExactComparison`): 30 HMC trajectories, 160
+    Metropolis sweeps at kappa and 80 at kappa'. Asserted: HMC-exact within 4 sigma, <exp(-dH)> = 1,
+    acceptance. Not asserted: the gap ratio. At this statistics the gap (~0.11) is only ~3-6 sigma and
+    0.3 of it ~1.5 sigma of the difference, so it cannot resolve kappa from kappa' robustly: in a scan
+    of 5 other seeds the correct code failed |l_hmc - l_exact| < 0.3 gap three times (ratios 0.90,
+    0.45, 0.50), while a mutant sampling kappa' fails the 4 sigma check only marginally (3.3-6.3 sigma).
+    The discriminating version is SlowHMCComparisonTest (NEOQCD_SLOW=1). Then rms forces of the ratio
+    and heavy terms against the single-term force, and a CG-cost printout."""
 
     @classmethod
     def setUpClass(cls):
-        cls.plain = TwoFlavourHamiltonian(cls.BETA, cls.KAPPA, G2, n_gauge_substeps=3)
-        cls.hb = HasenbuschHamiltonian(cls.BETA, cls.KAPPA, cls.KAPPA_H, G2, n_heavy_substeps=2, n_gauge_substeps=2)
-        cls.res_plain = cls.run_chain(cls.plain, 2, 501)
-        cls.res_hb = cls.run_chain(cls.hb, 1, 502)
+        cls.res_hb, cls.res_exact, cls.res_wrong = cls.run_all(30, 160, 80, (502, 401, 402))
 
-    def test_plaquette_and_exp_dH(self):
-        a, b = self.res_plain, self.res_hb
-        sig = abs(a["plaq"][0] - b["plaq"][0]) / math.hypot(a["plaq"][1], b["plaq"][1])
-        msg = (f"plain:     <P> = {a['plaq'][0]:.4f}({a['plaq'][1]:.4f}), <exp(-dH)> = {a['expdH'][0]:.4f}"
-               f"({a['expdH'][1]:.4f}), acceptance {a['acc']:.3f}, CG iterations / trajectory {a['cg_per_traj']:.0f}\n"
-               f"Hasenbusch: <P> = {b['plaq'][0]:.4f}({b['plaq'][1]:.4f}), <exp(-dH)> = {b['expdH'][0]:.4f}"
-               f"({b['expdH'][1]:.4f}), acceptance {b['acc']:.3f}, CG iterations / trajectory {b['cg_per_traj']:.0f}"
-               f" (ratio {self.hb.ratio.stats['cg_iterations'] / self.N_MEAS:.0f}, heavy "
-               f"{self.hb.heavy.stats['cg_iterations'] / self.N_MEAS:.0f}); <P> difference {sig:.2f} sigma")
-        if VERBOSE:
-            print("\n" + msg)
-        for r in (a, b):
-            self.assertGreater(r["acc"], 0.7, msg=msg)
-            self.assertLess(abs(r["expdH"][0] - 1.0), 4 * r["expdH"][1], msg=msg)
-        self.assertLess(sig, 4.0, msg=msg)
+    def test_log_det_against_exact(self):
+        self.check(self.res_hb, self.res_exact, self.res_wrong, gap_ratio=None)
 
     def test_force_magnitudes(self):
         gen = torch.Generator().manual_seed(503)
@@ -309,11 +390,15 @@ class HMCComparisonTest(unittest.TestCase):
             print("\n" + msg)
         self.assertLess(rms["ratio"], rms["single"], msg=msg)
 
-    def test_cost_at_equal_acceptance(self):
-        """Mean min(1, exp(-dH)) and CG iterations per trajectory against n_steps on the thermalised
-        configurations of the plain chain (same U, P for every setting). Reported only."""
+    def test_cost_printout(self):
+        """Cost printout, not a check: mean min(1, exp(-dH)) and CG iterations per trajectory against
+        n_steps on the thermalised configurations of the exact sampler at kappa (same U, P for every
+        setting). Runs and prints only with NEOQCD_TEST_VERBOSE=1 (skipped otherwise); it asserts
+        only that dH is finite."""
+        if not VERBOSE:
+            self.skipTest("cost printout only: set NEOQCD_TEST_VERBOSE=1")
         gen = torch.Generator().manual_seed(504)
-        U = self.res_plain["U"]
+        U = self.res_exact["U"]
         P = H.random_momenta(U.shape, generator=gen)
         lines = []
         settings = [("plain", lambda: TwoFlavourHamiltonian(self.BETA, self.KAPPA, G2, n_gauge_substeps=3), n)
@@ -340,6 +425,16 @@ class HMCComparisonTest(unittest.TestCase):
             self.assertTrue(math.isfinite(acc))
         if VERBOSE:
             print("\n" + "\n".join(lines))
+
+
+@unittest.skipUnless(SLOW, "set NEOQCD_SLOW=1: Hasenbusch HMC against the exact Metropolis at 5x statistics (~3 min)")
+class SlowHMCComparisonTest(_ExactComparison, unittest.TestCase):
+    """The discriminating exact comparison (`_ExactComparison`) at 5x the statistics of
+    HMCComparisonTest: 150 HMC trajectories, 800 Metropolis sweeps at kappa and 400 at kappa'.
+    Asserted in addition: |l_hmc - l_exact| < 0.3 |l_exact - l_exact(kappa')|."""
+
+    def test_log_det_against_exact_discriminating(self):
+        self.check(*self.run_all(150, 800, 400, (512, 411, 412)), gap_ratio=0.3)
 
 
 if __name__ == "__main__":

@@ -72,7 +72,8 @@ class RatioWilsonTerm(TwoFlavourWilson):
         kappa_heavy: heavier-quark hopping parameter kappa' (float or (B,) tensor), kappa' < kappa.
         geometry, time_sign, solver_tol, action_tol, max_iter, reuse_guess: as `TwoFlavourWilson`
             (the light solves of `action` and `force`); the heavy solve of `refresh` runs at
-            `action_tol`, so that S_2(U) = eta^dagger eta to that accuracy (the cached old action).
+            `action_tol`, so that S_2(U) = eta^dagger eta to that accuracy (the cached old action),
+            and raises RuntimeError if its true residual exceeds 10 max(action_tol, 1e3 eps).
 
     State: `phi` (phi_2), `X` (last solution of M X = chi, the chronological guess), and the
     refresh cache as in `TwoFlavourWilson`. `stats` as there; `solves` and `cg_iterations` also
@@ -123,6 +124,13 @@ class RatioWilsonTerm(TwoFlavourWilson):
         self._count(res)
         self.stats["refresh_solves"] += 1
         self.stats["refresh_cg_iterations"] += int(res.iterations.max().item())
+        # an unconverged solve would leave phi_2 with the wrong law and S_old != eta^dagger eta;
+        # the true residual may sit slightly above tol at roundoff, hence the slack
+        limit = 10.0 * max(self.action_tol, 1e3 * torch.finfo(U.real.dtype).eps)
+        worst = res.residual.max().item()
+        if not worst <= limit:
+            raise RuntimeError(f"RatioWilsonTerm.refresh: heavy CG not converged, relative residual {worst:.3e} "
+                               f"> {limit:.1e} (action_tol {self.action_tol:.1e}, max_iter {self.max_iter})")
         self.phi = heavy.apply(res.x)
         self.X = None
         self._refresh_links = U
@@ -169,31 +177,56 @@ class HasenbuschHamiltonian(Hamiltonian):
         "nested" (default): [ratio] (n_ratio_substeps) > [heavy] (n_heavy_substeps) > [gauge]
                             (n_gauge_substeps), three levels;
         "shared":           [ratio, heavy] (n_ratio_substeps) > [gauge] (n_gauge_substeps);
-    or an explicit sequence of (names, n_substeps), e.g. ((("ratio",), 1), (("heavy", "gauge"), 3)).
-    n_ratio_substeps sits on the outermost level, so it multiplies the HMC n_steps.
+    or an explicit sequence of (names, n_substeps), e.g. ((("ratio",), 1), (("heavy", "gauge"), 3)),
+    names being a tuple of term names (a bare string is rejected).
+    n_ratio_substeps sits on the outermost level, so it multiplies the HMC n_steps. The n_*
+    arguments default to 1; passing one that the layout does not use (n_heavy_substeps with
+    "shared", any of them with explicit levels) raises ValueError instead of being ignored.
 
     `fermion_kwargs` go to both fermion terms (solver_tol, action_tol, max_iter, reuse_guess,
-    time_sign); `heavy_kwargs` override them for the heavy term only.
+    time_sign); `heavy_kwargs` override them for the heavy term only, except `time_sign`, which
+    must agree with the ratio term's (else the heavy factor would belong to another theory), and
+    `kappa`/`geometry`, which are fixed by the arguments (both raise ValueError).
     """
 
-    def __init__(self, beta, kappa, kappa_heavy, geometry, n_ratio_substeps=1, n_heavy_substeps=1,
-                 n_gauge_substeps=1, layout="nested", plaquette_weights=None, heavy_kwargs=None,
+    def __init__(self, beta, kappa, kappa_heavy, geometry, n_ratio_substeps=None, n_heavy_substeps=None,
+                 n_gauge_substeps=None, layout="nested", plaquette_weights=None, heavy_kwargs=None,
                  **fermion_kwargs):
+        heavy_kwargs = dict(heavy_kwargs or {})
+        for key in ("kappa", "kappa_heavy", "geometry"):
+            if key in heavy_kwargs:
+                raise ValueError(f"heavy_kwargs may not set {key!r}: it is fixed by the HasenbuschHamiltonian arguments")
         self.ratio = RatioWilsonTerm(kappa, kappa_heavy, geometry, **fermion_kwargs)
+        if "time_sign" in heavy_kwargs and float(heavy_kwargs["time_sign"]) != self.ratio.time_sign:
+            raise ValueError(f"heavy_kwargs time_sign {heavy_kwargs['time_sign']} differs from the ratio term's "
+                             f"{self.ratio.time_sign}: the two factors must describe the same theory")
         hk = dict(fermion_kwargs)
-        hk.update(heavy_kwargs or {})
+        hk.update(heavy_kwargs)
         self.heavy = HeavyWilsonTerm(kappa_heavy, geometry, **hk)
         self.gauge = WilsonGaugeAction(beta, geometry, plaquette_weights)
         terms = {"ratio": self.ratio, "heavy": self.heavy, "gauge": self.gauge}
+        given = {"n_ratio_substeps": n_ratio_substeps, "n_heavy_substeps": n_heavy_substeps,
+                 "n_gauge_substeps": n_gauge_substeps}
         if isinstance(layout, str):
             if layout not in LEVEL_LAYOUTS:
                 raise ValueError(f"unknown layout {layout!r}: use one of {tuple(LEVEL_LAYOUTS)} or explicit levels")
-            names = LEVEL_LAYOUTS[layout]
-            subs = (n_ratio_substeps, n_heavy_substeps, n_gauge_substeps) if layout == "nested" else (
-                n_ratio_substeps, n_gauge_substeps)
-            spec = list(zip(names, subs))
+            used_n = (("n_ratio_substeps", "n_heavy_substeps", "n_gauge_substeps") if layout == "nested"
+                      else ("n_ratio_substeps", "n_gauge_substeps"))
+            ignored = [k for k, v in given.items() if v is not None and k not in used_n]
+            if ignored:
+                raise ValueError(f"{', '.join(ignored)} not used by layout {layout!r}")
+            spec = list(zip(LEVEL_LAYOUTS[layout], (1 if given[k] is None else given[k] for k in used_n)))
         else:
-            spec = [(tuple(n), s) for n, s in layout]
+            ignored = [k for k, v in given.items() if v is not None]
+            if ignored:
+                raise ValueError(f"{', '.join(ignored)} not used with explicit levels: give n_substeps per level")
+            spec = []
+            for entry in layout:
+                n, s = entry
+                if isinstance(n, str):
+                    raise ValueError(f"layout level {entry!r}: the names must be a tuple of term names, "
+                                     f"e.g. (({n!r},), {s!r}), not a bare string")
+                spec.append((tuple(n), s))
         used = [n for names, _ in spec for n in names]
         if sorted(used) != sorted(terms):
             raise ValueError(f"every term must appear exactly once in the layout, got {used}")
