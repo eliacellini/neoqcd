@@ -18,23 +18,45 @@ Normalisation (derived from openQCD, doc/dirac.pdf, and pinned by test_fermions_
       T(x) = i kappa c_sw sum_{mu<nu} sigma_{mu nu} (x) Fhat_{mu nu}(x)
            = (i/2) kappa c_sw sum_{mu,nu} sigma_{mu nu} (x) Fhat_{mu nu}(x),
   site-diagonal, hermitian (sigma hermitian, Fhat anti-hermitian), commuting with gamma_5.
-- Field strength: Fhat_{mu nu}(x) = (1/8) [Q_{mu nu}(x) - Q_{nu mu}(x)], projected on the traceless
-  part (openQCD stores it as an su(3) algebra element), with Q_{mu nu}(x) the sum of the four
-  plaquette leaves based at x, all oriented mu -> nu (counter-clockwise in the (mu, nu) plane):
+- Field strength: Fhat_{mu nu}(x) = (1/8) [Q_{mu nu}(x) - Q_{nu mu}(x)], with Q_{mu nu}(x) the sum
+  of the four plaquette leaves based at x, all oriented mu -> nu (counter-clockwise in the
+  (mu, nu) plane):
       L1 = U_mu(x) U_nu(x+mu) U_mu(x+nu)^+ U_nu(x)^+            (the sun_utils plaquette at x)
       L2 = U_nu(x) U_mu(x-mu+nu)^+ U_nu(x-mu)^+ U_mu(x-mu)
       L3 = U_mu(x-mu)^+ U_nu(x-mu-nu)^+ U_mu(x-mu-nu) U_nu(x-nu)
       L4 = U_nu(x-nu)^+ U_mu(x-nu) U_nu(x+mu-nu) U_mu(x)^+
-  Q_{nu mu} = Q_{mu nu}^+, so Fhat = P_tl[(Q - Q^+) / 8]. For U_mu(x) = exp(a A_mu) with
+  Q_{nu mu} = Q_{mu nu}^+, so Fhat = (Q - Q^+) / 8, anti-hermitian.
+  Two conventions, selected by `traceless` everywhere in this module:
+    traceless=False (default, openQCD): Fhat = (Q - Q^+) / 8 as it is, a u(N) algebra element
+      with tr Fhat = (i/4) Im tr Q (openQCD's ftensor.c returns a u3_alg element without trace
+      removal and sw_term.c uses it as is);
+    traceless=True: Fhat = (Q - Q^+) / 8 - tr[(Q - Q^+) / 8] / N, the su(N) projection.
+  They differ by a multiple of the identity in colour, O(a^6) on smooth fields, so the
+  continuum and tree-level statements below hold for both; for SU(2) tr Q is real and they
+  coincide exactly. For SU(3) the difference is small but not zero: on thermalised 2^4 at
+  beta = 5.5, kappa = 0.12, c_sw = 1, <log det(D^+ D)> (openQCD) - (traceless) = -0.014(1)
+  (-0.016(2) and -0.0143(2) in two independent measurements, the second printed by the slow test).
+  Everything else (hermiticity of T, chiral block structure, gamma_5-hermiticity, even-odd
+  identities, forces) holds in both, and the forces are su(N) projections of the gradient in
+  either case. One difference: in 4D the chiral blocks of sigma_{mu nu} are traceless, so each
+  chiral block of T is traceless in both conventions; in 2D the blocks are -/+ i kappa c_sw
+  Fhat_01 (sigma_01 = -sigma_3) and carry -/+ i kappa c_sw tr Fhat_01 when the trace is kept.
+  For U_mu(x) = exp(a A_mu) with
   anti-hermitian A (the same reading of the links as the hopping term), Fhat = a^2 [D_mu, D_nu]
   + O(a^4), and c_sw = 1 cancels the O(a) Pauli term of the Wilson term at tree level: the
   identity D_n^2 - sum_mu nabla*_mu nabla_mu = -i sum_{mu<nu} sigma_{mu nu} Fhat_{mu nu} + O(a^4)
   on smooth fields (D_n the naive operator) is checked numerically in the tests.
 - Boundary phase: every leaf contains either no time link or two time links at the same time
   slice, one of them daggered, so the antiperiodic sign of the t = 0 time links cancels in every
-  leaf for any T (including T = 2). `clover_term` builds Fhat from `fermion_boundary_links` anyway
-  (the same links as the hopping term); the tests check that the result does not depend on
-  `time_sign`.
+  leaf for any T (including T = 2). `clover_leaves`, `clover_field_strength` and `clover_term`
+  all default to time_sign = -1 (the links of the hopping term, `fermion_boundary_links`); the
+  tests check that the result does not depend on `time_sign`, and the operators and forces build
+  Fhat from the plain gauge links (time_sign = +1, no copy).
+- Singular A: `CloverWilsonDirac` computes the eigenvalues of the hermitian chiral blocks of
+  A = 1 + T and raises ValueError if the smallest |eigenvalue| on any site is below
+  `SINGULAR_THRESHOLD` = 1e-8 (A^-1, the Schur complement and the forces would lose more than
+  half of the double-precision digits). Negative eigenvalues alone are not an error: the N_f = 2
+  weight uses |det A| only.
 - Chiral blocks: sigma_{mu nu} commutes with gamma_5 = diag(1, 1, -1, -1) (D = 4) or sigma_3
   (D = 2), so A = 1 + T is block diagonal in the flattened (spin, colour) index s * N + c: two
   hermitian (S N / 2) x (S N / 2) blocks per site (6 x 6 for SU(3) in 4D). In 2D there is a single
@@ -103,7 +125,10 @@ __all__ = [
     "assemble_clover_even_odd",
     "log_det_clover_two_flavour",
     "ExactCloverMetropolis",
+    "SINGULAR_THRESHOLD",
 ]
+
+SINGULAR_THRESHOLD = 1e-8
 
 
 # ---- geometry of the planes and spin matrices -----------------------------------------------
@@ -138,8 +163,13 @@ def _bview(c, x):
     return c.view((-1,) + (1,) * (x.dim() - 1)).to(x.dtype)
 
 
+def _private(value):
+    """A private copy of a tensor coupling (in-place changes by the caller do not leak in)."""
+    return value.clone() if torch.is_tensor(value) else value
+
+
 # ---- field strength and clover term ---------------------------------------------------------
-def clover_leaves(U, geometry=None, time_sign=1.0):
+def clover_leaves(U, geometry=None, time_sign=-1.0):
     """Q_{mu nu}(x) = L1 + L2 + L3 + L4 (module docstring), shape (B, P, lattice, N, N).
 
     `time_sign` multiplies the t = 0 time links first (`fermion_boundary_links`).
@@ -162,30 +192,36 @@ def clover_leaves(U, geometry=None, time_sign=1.0):
     return torch.stack(out, dim=1)
 
 
-def clover_field_strength(U, geometry=None, time_sign=1.0):
+def clover_field_strength(U, geometry=None, time_sign=-1.0, traceless=False):
     """Clover-leaf field strength Fhat_{mu nu}(x), shape (B, P, lattice, N, N), P = D (D - 1) / 2.
 
-    Fhat = traceless part of (Q_{mu nu} - Q_{mu nu}^+) / 8, Q from `clover_leaves`;
-    anti-hermitian traceless. `time_sign` multiplies the t = 0 time links first
-    (`fermion_boundary_links`); the result does not depend on it (module docstring). The
-    function is differentiable in U (used by `clover_derivative`).
+    Fhat = (Q_{mu nu} - Q_{mu nu}^+) / 8, Q from `clover_leaves`, anti-hermitian; with
+    `traceless=True` its trace is removed (default False: openQCD, module docstring).
+    `time_sign` multiplies the t = 0 time links first (`fermion_boundary_links`); the result
+    does not depend on it (module docstring). Differentiable in U (used by `clover_derivative`).
     """
     geometry = _geometry(U, geometry)
     Q = clover_leaves(U, geometry, time_sign)
     F = (Q - SUN_dagger(Q)) / 8.0
+    if not traceless:
+        return F
     tr = torch.einsum("...ii->...", F)
     eye = torch.eye(geometry.N, dtype=U.dtype, device=U.device)
     return F - (tr / geometry.N)[..., None, None] * eye
 
 
-def clover_term(U, kappa, csw, geometry=None, time_sign=-1.0, field_strength=None):
+def clover_term(U, kappa, csw, geometry=None, time_sign=-1.0, field_strength=None, traceless=False):
     """T(x) = i kappa c_sw sum_{mu<nu} sigma_{mu nu} (x) Fhat_{mu nu}(x), shape (B, lattice, S N, S N).
 
     The (spin, colour) index is flattened as s * N + c (as the dense matrices). `kappa`, `csw` are
     floats or (B,) tensors. Hermitian and block diagonal in chirality (module docstring).
+    `traceless` selects the convention of Fhat (ignored if `field_strength` is given).
     """
     geometry = _geometry(U, geometry)
-    F = clover_field_strength(U, geometry, time_sign) if field_strength is None else field_strength
+    if field_strength is None:
+        F = clover_field_strength(U, geometry, time_sign, traceless)
+    else:
+        F = field_strength
     sig = sigma_matrices(geometry.D, dtype=U.dtype, device=U.device)
     S, N = geometry.spin, geometry.N
     T = torch.einsum("pst,bp...cd->b...sctd", sig, F)
@@ -194,7 +230,7 @@ def clover_term(U, kappa, csw, geometry=None, time_sign=-1.0, field_strength=Non
     return 1j * _bview(c, T) * T
 
 
-def clover_derivative(U, X, geometry=None):
+def clover_derivative(U, X, geometry=None, traceless=False):
     """Algebra gradient of f(U) = Re sum_x sum_{mu<nu} tr[X_{mu nu}(x) Fhat_{mu nu}(U)(x)].
 
     X: complex weights (B, P, lattice, N, N) (planes in the order of `planes(D)`), treated as
@@ -202,12 +238,13 @@ def clover_derivative(U, X, geometry=None):
     for every hermitian traceless T. Route: autograd vector-Jacobian product through
     `clover_field_strength`, F = P_ht(-i G_W U^+) with G_W the Wirtinger gradient (module doc).
     Works under `torch.no_grad()` (it enables grad locally) and never touches `U.grad`.
+    `traceless` selects the convention of Fhat (module doc); G is the su(N) projection either way.
     """
     geometry = _geometry(U, geometry)
     Xc = X.detach()
     with torch.enable_grad():
         V = U.detach().clone().requires_grad_(True)
-        F = clover_field_strength(V, geometry)
+        F = clover_field_strength(V, geometry, 1.0, traceless)
         f = (Xc * F.transpose(-1, -2)).real.sum()
         (G,) = torch.autograd.grad(f, V)
     return project_hermitian_traceless(-1j * SUN_mul(G, SUN_dagger(U.detach())))
@@ -264,26 +301,39 @@ class CloverWilsonDirac(WilsonDirac):
     Args:
         U, kappa, geometry, time_sign: as `WilsonDirac`.
         csw: Sheikholeslami-Wohlert coefficient, a float or a (B,) tensor (c_sw = 0 is WilsonDirac).
+        traceless: convention of Fhat (module doc); default False (openQCD).
     Attributes: `T` (B, lattice, S N, S N), `A_inv` = (1 + T)^-1 site by site (from the chiral
-    blocks), `log_det_A` (B, lattice) = log|det(1 + T)(x)|.
+    blocks), `log_det_A` (B, lattice) = log|det(1 + T)(x)|, `min_abs_eig_A` (B,) = smallest
+    |eigenvalue| of A over the lattice. Raises ValueError if it is below `SINGULAR_THRESHOLD`.
     """
 
-    def __init__(self, U, kappa, csw, geometry=None, time_sign=-1.0):
+    def __init__(self, U, kappa, csw, geometry=None, time_sign=-1.0, traceless=False):
         super().__init__(U, kappa, geometry, time_sign)
         self.csw = _coupling(csw, U.shape[0], U.device, "csw")
-        self.field_strength = clover_field_strength(U, self.geometry)
+        self.traceless = bool(traceless)
+        # Fhat does not depend on the boundary sign (module doc): plain links, no copy
+        self.field_strength = clover_field_strength(U, self.geometry, 1.0, self.traceless)
         self.T = clover_term(U, self.kappa, self.csw, self.geometry, self.time_sign,
                              field_strength=self.field_strength)
         SN = self.T.shape[-1]
         eye = torch.eye(SN, dtype=U.dtype, device=U.device)
         blocks = _chiral_blocks(self.T + eye)
+        with torch.no_grad():
+            eig = torch.linalg.eigvalsh(blocks.detach()).abs()
+            self.min_abs_eig_A = eig.reshape(eig.shape[0], -1).amin(1)
+        if bool((self.min_abs_eig_A < SINGULAR_THRESHOLD).any()):
+            raise ValueError(
+                f"A = 1 + T is (nearly) singular: smallest |eigenvalue| per configuration "
+                f"{self.min_abs_eig_A.tolist()} (threshold {SINGULAR_THRESHOLD:g}); "
+                f"kappa * c_sw too large for this gauge field?")
         self.A_inv = _from_chiral_blocks(torch.linalg.inv(blocks))
         self.log_det_A = torch.linalg.slogdet(blocks)[1].sum(-1)
 
     def batch_select(self, index):
         k = self.kappa if self.kappa.shape[0] == 1 else self.kappa[index:index + 1]
         c = self.csw if self.csw.shape[0] == 1 else self.csw[index:index + 1]
-        return CloverWilsonDirac(self.U[index:index + 1], k, c, self.geometry, self.time_sign)
+        return CloverWilsonDirac(self.U[index:index + 1], k, c, self.geometry, self.time_sign,
+                                 self.traceless)
 
     def _site(self, M, psi):
         """Site-diagonal (S N) x (S N) matrices M applied to a Wilson field psi (B, lattice, S, N)."""
@@ -349,15 +399,17 @@ class TwoFlavourClover(TwoFlavourWilson):
     Same arguments, state, refresh, action, action_difference and stats as `TwoFlavourWilson`,
     plus `csw`. With `even_odd=True` (default) the weight is det(D_hat^+ D_hat) only: the small
     determinant det(A_oo)^2 is a separate term (`CloverDeterminantTerm`). With `even_odd=False`
-    S_pf = phi^+ (D^+ D)^-1 phi is the whole N_f = 2 weight.
+    S_pf = phi^+ (D^+ D)^-1 phi is the whole N_f = 2 weight. `traceless`: convention of Fhat
+    (module doc), default False (openQCD). Tensor `kappa`, `csw` are copied.
     """
 
-    def __init__(self, kappa, csw, geometry, **kwargs):
-        self.csw = csw
-        super().__init__(kappa, geometry, **kwargs)
+    def __init__(self, kappa, csw, geometry, traceless=False, **kwargs):
+        super().__init__(_private(kappa), geometry, **kwargs)
+        self.csw = _private(csw)
+        self.traceless = bool(traceless)
 
     def wilson(self, U):
-        return CloverWilsonDirac(U, self.kappa, self.csw, self.geometry, self.time_sign)
+        return CloverWilsonDirac(U, self.kappa, self.csw, self.geometry, self.time_sign, self.traceless)
 
     def force(self, U):
         """Algebra gradient of S_pf (module doc), hermitian traceless, shape like U."""
@@ -372,12 +424,13 @@ class TwoFlavourClover(TwoFlavourWilson):
             k = _bview(w.kappa, Y)
             G_hop = hopping_derivative(w, Y + Z, X + W)
             weights = clover_bilinear_weights(Y + k * Z, X + k * W, self.geometry)
-            G_clv = clover_derivative(U, weights, self.geometry)
+            G_clv = clover_derivative(U, weights, self.geometry, self.traceless)
             return (_bview(2.0 * w.kappa ** 2, G_hop) * G_hop
                     - _bview(2.0 * w.kappa * w.csw, G_clv) * G_clv)
         Y = op.apply(X)
         G_hop = hopping_derivative(op, Y, X)
-        G_clv = clover_derivative(U, clover_bilinear_weights(Y, X, self.geometry), self.geometry)
+        G_clv = clover_derivative(U, clover_bilinear_weights(Y, X, self.geometry), self.geometry,
+                                  self.traceless)
         return _bview(2.0 * op.kappa, G_hop) * G_hop - _bview(2.0 * op.kappa * op.csw, G_clv) * G_clv
 
 
@@ -386,21 +439,24 @@ class CloverDeterminantTerm(ActionTerm):
 
     Together with `TwoFlavourClover(even_odd=True)` it gives the N_f = 2 weight
     det(A_oo)^2 det(D_hat^+ D_hat) = det(D^+ D). Force: tr(F T') = -2 kappa c_sw d/dt f with the
-    weights `clover_determinant_weights(A_inv on odd sites)`. `stats` counts calls.
+    weights `clover_determinant_weights(A_inv on odd sites)`. `stats` counts calls. `traceless`:
+    convention of Fhat (module doc), default False (openQCD). Tensor `kappa`, `csw` are copied.
     """
 
-    def __init__(self, kappa, csw, geometry, time_sign=-1.0):
-        self.kappa = kappa
-        self.csw = csw
+    def __init__(self, kappa, csw, geometry, time_sign=-1.0, traceless=False):
+        self.kappa = _private(kappa)
+        self.csw = _private(csw)
         self.geometry = geometry
         self.time_sign = float(time_sign)
+        self.traceless = bool(traceless)
         self.reset_stats()
 
     def reset_stats(self):
         self.stats = {"action_calls": 0, "force_calls": 0}
 
     def operator(self, U):
-        return CloverWilsonDirac(U, self.kappa, self.csw, self.geometry, self.time_sign).even_odd()
+        return CloverWilsonDirac(U, self.kappa, self.csw, self.geometry, self.time_sign,
+                                 self.traceless).even_odd()
 
     def site_action(self, U):
         """-2 log|det A(x)| on odd sites, 0 on even sites, shape (B, lattice)."""
@@ -424,7 +480,7 @@ class CloverDeterminantTerm(ActionTerm):
         w = eo.wilson
         odd = eo.odd_mask.reshape(self.geometry.lattice + (1, 1)).to(w.A_inv.dtype)
         weights = clover_determinant_weights(w.A_inv * odd, self.geometry)
-        G = clover_derivative(U, weights, self.geometry)
+        G = clover_derivative(U, weights, self.geometry, self.traceless)
         return -_bview(2.0 * w.kappa * w.csw, G) * G
 
 
@@ -434,24 +490,23 @@ class CloverHamiltonian(Hamiltonian):
     Levels: [pseudofermion] outside, [gauge, small determinant] inside with `n_gauge_substeps`
     (`det_level="gauge"`, the default; "fermion" puts S_det on the outer level). With
     `even_odd=False` the full-lattice pseudofermion carries the whole weight and there is no
-    determinant term. Extra keyword arguments go to `TwoFlavourClover`. Attributes `fermion`,
-    `determinant` (or None) and `gauge`.
+    determinant term (`det_level` is still validated). `traceless`: convention of Fhat (module
+    doc), default False (openQCD), used by both fermion terms. Extra keyword arguments go to
+    `TwoFlavourClover`. Attributes `fermion`, `determinant` (or None) and `gauge`.
     """
 
     def __init__(self, beta, kappa, csw, geometry, n_gauge_substeps=1, plaquette_weights=None,
-                 det_level="gauge", **fermion_kwargs):
-        self.fermion = TwoFlavourClover(kappa, csw, geometry, **fermion_kwargs)
+                 det_level="gauge", traceless=False, **fermion_kwargs):
+        if det_level not in ("gauge", "fermion"):
+            raise ValueError(f"det_level must be 'gauge' or 'fermion', got {det_level!r}")
+        self.fermion = TwoFlavourClover(kappa, csw, geometry, traceless=traceless, **fermion_kwargs)
         self.gauge = WilsonGaugeAction(beta, geometry, plaquette_weights)
         self.determinant = None
         outer, inner = [self.fermion], [self.gauge]
         if self.fermion.even_odd:
-            self.determinant = CloverDeterminantTerm(kappa, csw, geometry, self.fermion.time_sign)
-            if det_level == "gauge":
-                inner.append(self.determinant)
-            elif det_level == "fermion":
-                outer.append(self.determinant)
-            else:
-                raise ValueError(f"det_level must be 'gauge' or 'fermion', got {det_level!r}")
+            self.determinant = CloverDeterminantTerm(kappa, csw, geometry, self.fermion.time_sign,
+                                                     traceless)
+            (inner if det_level == "gauge" else outer).append(self.determinant)
         super().__init__([(outer, 1), (inner, n_gauge_substeps)])
 
 
@@ -463,7 +518,7 @@ def _block_diagonal(blocks):
     return torch.einsum("ij,bixy->bixjy", eye, blocks).reshape(B, n * m, n * m)
 
 
-def assemble_clover_even_odd(U, kappa, csw, geometry, time_sign=-1.0):
+def assemble_clover_even_odd(U, kappa, csw, geometry, time_sign=-1.0, traceless=False):
     """Dense D_hat = A_ee - kappa^2 H_eo A_oo^-1 H_oe (B, n, n) and log|det A_oo| (B,), batched.
 
     Built from `exact.assemble_hopping` and the site blocks of `CloverWilsonDirac`; even sites in
@@ -472,7 +527,7 @@ def assemble_clover_even_odd(U, kappa, csw, geometry, time_sign=-1.0):
     _, _, par = _site_tables(geometry, U.device)
     even = (par == 0).nonzero().squeeze(-1)
     odd = (par == 1).nonzero().squeeze(-1)
-    w = CloverWilsonDirac(U, kappa, csw, geometry, time_sign)
+    w = CloverWilsonDirac(U, kappa, csw, geometry, time_sign, traceless)
     B, V = U.shape[0], geometry.volume
     SN = w.T.shape[-1]
     eye = torch.eye(SN, dtype=U.dtype, device=U.device)
@@ -486,18 +541,19 @@ def assemble_clover_even_odd(U, kappa, csw, geometry, time_sign=-1.0):
     return D_hat, log_det_odd
 
 
-def log_det_clover_two_flavour(U, kappa, csw, geometry, time_sign=-1.0, method="dense_matrix"):
+def log_det_clover_two_flavour(U, kappa, csw, geometry, time_sign=-1.0, method="dense_matrix",
+                               traceless=False):
     """log det(D^+ D) = 2 log|det D| per gauge field, shape (B,), float64.
 
     method "dense_matrix": `dense_matrix` of the full sparse `CloverWilsonDirac` (the reference, no
     even-odd); "even_odd": 2 (log|det A_oo| + log|det D_hat|) with D_hat from `dense_matrix` of the
     sparse even-odd operator; "assembled": the same from `assemble_clover_even_odd`, batched (used
-    by the sampler).
+    by the sampler). `traceless`: convention of Fhat (module doc).
     """
     if method == "assembled":
-        D_hat, ld_odd = assemble_clover_even_odd(U, kappa, csw, geometry, time_sign)
+        D_hat, ld_odd = assemble_clover_even_odd(U, kappa, csw, geometry, time_sign, traceless)
         return 2.0 * (ld_odd + torch.linalg.slogdet(D_hat)[1])
-    w = CloverWilsonDirac(U, kappa, csw, geometry, time_sign)
+    w = CloverWilsonDirac(U, kappa, csw, geometry, time_sign, traceless)
     if method == "dense_matrix":
         out = [torch.linalg.slogdet(dense_matrix(w, geometry, batch_index=b))[1] for b in range(U.shape[0])]
         return 2.0 * torch.stack(out)
@@ -510,12 +566,15 @@ def log_det_clover_two_flavour(U, kappa, csw, geometry, time_sign=-1.0, method="
 
 class ExactCloverMetropolis(ExactMetropolis):
     """`ExactMetropolis` for N_f = 2 clover fermions: S_eff = S_g - log det(D^+ D), with
-    log det(D^+ D) = 2 (log|det A_oo| + log|det D_hat|) from `assemble_clover_even_odd`."""
+    log det(D^+ D) = 2 (log|det A_oo| + log|det D_hat|) from `assemble_clover_even_odd`.
+    `traceless`: convention of Fhat (module doc), default False (openQCD)."""
 
-    def __init__(self, beta, kappa, csw, geometry, time_sign=-1.0, eps=0.5, links_per_update=1):
+    def __init__(self, beta, kappa, csw, geometry, time_sign=-1.0, eps=0.5, links_per_update=1,
+                 traceless=False):
+        self.csw = _private(csw)
+        self.traceless = bool(traceless)
         super().__init__(beta, kappa, geometry, time_sign, eps, links_per_update)
-        self.csw = csw
 
     def log_det(self, U):
         return log_det_clover_two_flavour(U, self.kappa, self.csw, self.geometry, self.time_sign,
-                                          method="assembled")
+                                          method="assembled", traceless=self.traceless)
