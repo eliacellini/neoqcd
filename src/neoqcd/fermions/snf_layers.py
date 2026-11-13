@@ -93,6 +93,10 @@ __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "Fermi
 
 def _fermion_kind(fermion):
     """"wilson" or "staggered" from the type of the fermion term (dispatch of this module)."""
+    from neoqcd.fermions.hasenbusch import RatioWilsonTerm  # lazy: avoids an import cycle
+    if isinstance(fermion, RatioWilsonTerm):
+        raise TypeError(f"{type(fermion).__name__}: Hasenbusch terms are not supported in the SNF layers "
+                        "yet (PseudofermionAction would return the plain TwoFlavourWilson S_pf, which is wrong)")
     if isinstance(fermion, StaggeredPseudofermion):
         return "staggered"
     if isinstance(fermion, TwoFlavourWilson):

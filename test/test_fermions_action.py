@@ -164,6 +164,35 @@ class ActionDifferenceTest(unittest.TestCase):
                 self.assertLess((dSb - refb).abs().max().item(), 1e-12)
 
 
+    def test_refresh_cache_batched_kappa_in_place(self):
+        """A (B,) kappa tensor changed in place by the caller after set_parameter must not change the
+        stored kappa or the refresh tag (they are copies); a later set_parameter with the new values
+        stops the eta^dagger eta cache from being used."""
+        g, U, gen = self.cases[0]
+        U2, _ = haar_links(g, B, 22)
+        act = make(g, "kappa")
+        k = torch.tensor([0.15, 0.16, 0.17, 0.18], dtype=torch.double)
+        k0 = k.clone()
+        act.set_parameter(k)
+        act.refresh(U, gen)
+        act.fermion.action_difference(U, U2)  # uses the refresh cache at k0
+
+        def honest(kappa):  # two solves on an independent term
+            term = TwoFlavourWilson(kappa, g)
+            term.phi = act.phi
+            return term.action(U2) - term.action(U)
+
+        k.add_(0.03)  # the caller updates its tensor in place
+        self.assertTrue(torch.equal(act.fermion.kappa, k0))
+        ref0 = honest(k0)
+        d = act.fermion.action_difference(U, U2)
+        self.assertLess((d - ref0).abs().max().item(), TOL * ref0.abs().max().item())
+        act.set_parameter(k.clone())
+        ref = honest(k)
+        d = act.fermion.action_difference(U, U2)
+        self.assertLess((d - ref).abs().max().item(), TOL * ref.abs().max().item())
+
+
 class HamiltonianTest(unittest.TestCase):
     """2. The Hamiltonian at a parameter value has the matching beta, kappa and bc."""
 

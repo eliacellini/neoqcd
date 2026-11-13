@@ -183,6 +183,34 @@ class ActionValueTest(unittest.TestCase):
         # a new phi drops the cache
         act.phi = act.phi.clone()
         self.assertIsNone(act.fermion._refresh_action)
+        # an in-place change of the refresh links invalidates the cache (version guard, not identity)
+        Ur = U.clone()
+        act.refresh(Ur, torch.Generator().manual_seed(6))
+        act.fermion.action_difference(Ur, U2)  # fills the cache at Ur
+        Ur.copy_(haar_links(4, 13)[0])
+        d3 = act.fermion.action_difference(Ur, U2)
+        ref3 = fresh_pf(MASS, act.phi, U2) - fresh_pf(MASS, act.phi, Ur)
+        self.assertLess(rel(d3, ref3), TOL)
+
+    def test_refresh_cache_batched_mass_in_place(self):
+        """A (B,) mass tensor changed in place by the caller after set_parameter must not change the
+        stored mass or the cache tag (they are copies); a later set_parameter with the new values
+        invalidates the cache."""
+        U, U2 = self.U, self.U2
+        act = make("mass")
+        m = torch.tensor([0.25, 0.3, 0.35, 0.4], dtype=torch.double)
+        m0 = m.clone()
+        act.set_parameter(m)
+        act.refresh(U, self.gen)
+        act.fermion.action_difference(U, U2)  # fills the cache at m0
+        m.sub_(0.1)  # the caller updates its tensor in place
+        self.assertTrue(torch.equal(act.fermion.mass, m0))
+        d = act.fermion.action_difference(U, U2)
+        self.assertLess(rel(d, fresh_pf(m0, act.phi, U2) - fresh_pf(m0, act.phi, U)), TOL)
+        act.set_parameter(m.clone())
+        d = act.fermion.action_difference(U, U2)
+        ref = fresh_pf(m, act.phi, U2) - fresh_pf(m, act.phi, U)  # honest: two solves
+        self.assertLess(rel(d, ref), TOL)
 
 
 class HamiltonianTest(unittest.TestCase):
@@ -234,16 +262,42 @@ def linear_protocol(a, b, n):
     return [a + (b - a) * (i + 1) / n for i in range(n)]
 
 
+_ENSEMBLES = {}
+
+
+def mass_ensembles():
+    """(ref_ratio, starts) at MASS, computed once per process (shared with test_fermions_snf_staggered):
+    ref_ratio (20, B) = det M_ee(MASS2) / det M_ee(MASS) on 20 equilibrium configurations, starts 4
+    independent equilibrium batches."""
+    if not _ENSEMBLES:
+        ref = plain_hmc(MASS, 1001, N_THERM, 20)
+        _ENSEMBLES["ref_ratio"] = torch.stack([torch.exp(log_det_staggered(U, MASS2, G2)
+                                                         - log_det_staggered(U, MASS, G2)) for U in ref])
+        _ENSEMBLES["starts"] = plain_hmc(MASS, 2002, N_THERM, 4, every=3)
+    return _ENSEMBLES["ref_ratio"], _ENSEMBLES["starts"]
+
+
+def record_jump_solves(driver, fermion):
+    """Wrap driver._jump (FermionNEMCMC or FermionSNF) to record the solves of each jump call."""
+    solves = []
+    jump = driver._jump
+
+    def counted(*args, **kwargs):
+        before = fermion.stats["solves"]
+        out = jump(*args, **kwargs)
+        solves.append(fermion.stats["solves"] - before)
+        return out
+    driver._jump = counted
+    return solves
+
+
 class JarzynskiMassTest(unittest.TestCase):
     """3. <exp(-W)> = Z(m2)/Z(m1) for the mass protocol 0.3 -> 0.2 in 1 and 8 steps, and
     W + Q = S_final - S_0 per chain (S_final from an independent action object)."""
 
     @classmethod
     def setUpClass(cls):
-        ref = plain_hmc(MASS, 1001, N_THERM, 20)
-        cls.ref_ratio = torch.stack([torch.exp(log_det_staggered(U, MASS2, G2) - log_det_staggered(U, MASS, G2))
-                                     for U in ref])  # (20, B)
-        cls.starts = plain_hmc(MASS, 2002, N_THERM, 4, every=3)
+        cls.ref_ratio, cls.starts = mass_ensembles()
 
     def test_mass_protocol(self):
         m = self.ref_ratio.mean(0)
@@ -291,7 +345,9 @@ class JarzynskiMassTest(unittest.TestCase):
                 act = make(name, bc=1.0)
                 act.set_parameter(start)
                 ne = FermionNEMCMC(act, protocol, **HMC_KW)
+                jump_solves = record_jump_solves(ne, act.fermion)
                 state, W, Q, obs = ne.forward(FieldState(U0), torch.Generator().manual_seed(77))
+                self.assertEqual(jump_solves, [0, 0])  # gauge-only jumps
                 check = make(name, bc=1.0)
                 check.set_parameter(protocol[-1])
                 check.phi = state.phi
@@ -299,6 +355,15 @@ class JarzynskiMassTest(unittest.TestCase):
                 self.assertLess((W + Q + ne.last_run["S0"] - S_final).abs().max().item(),
                                 1e-10 * S_final.abs().max().item())
                 self.assertTrue(torch.equal(obs[:, -1, 0], W))
+
+    def test_mass_jump_one_solve(self):
+        """FermionNEMCMC._jump in the mass costs exactly one solve per step."""
+        U0 = self.starts[0][:8]
+        act = make("mass", bc=1.0)
+        ne = FermionNEMCMC(act, [0.25, 0.2], **HMC_KW)
+        jump_solves = record_jump_solves(ne, act.fermion)
+        ne.forward(FieldState(U0), torch.Generator().manual_seed(78))
+        self.assertEqual(jump_solves, [1, 1])
 
 
 class REXSmokeTest(unittest.TestCase):

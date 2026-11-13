@@ -20,14 +20,15 @@ import torch
 
 from neoqcd.fermions._gauge import FlowPars, create_mask
 from neoqcd.fermions.action import QCDAction
+from neoqcd.fermions.hasenbusch import RatioWilsonTerm
 from neoqcd.fermions.lattice import parity
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson
 from neoqcd.fermions.snf import FermionNEMCMC, FieldState, effective_sample_size, jarzynski_free_energy
 from neoqcd.fermions.snf_layers import FermionSNF, PseudofermionAction, joint_action, make_gauge_layers, pseudofermion_action
-from neoqcd.fermions.staggered_exact import assemble_staggered_even_odd, log_det_staggered
+from neoqcd.fermions.staggered_exact import assemble_staggered_even_odd
 from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion
 from test.test_fermions_action_staggered import (BETA, G2, HMC_KW, MASS, MASS2, N_SUB, defect_mask, haar_links,
-                                                 linear_protocol, plain_hmc)
+                                                 linear_protocol, mass_ensembles, record_jump_solves)
 
 
 def flow_pars(protocol, batch_size):
@@ -134,6 +135,69 @@ class StaggeredFunctionTest(unittest.TestCase):
         w = TwoFlavourWilson(0.18, G2, reuse_guess=False)
         w.refresh(self.U, torch.Generator().manual_seed(1))
         self.assertEqual(pseudofermion_action(self.U, w).shape, (4,))
+        # a Hasenbusch ratio term is a TwoFlavourWilson subclass but must not be taken for one
+        ratio = RatioWilsonTerm(0.18, 0.12, G2)
+        with self.assertRaisesRegex(TypeError, "Hasenbusch"):
+            PseudofermionAction.apply(self.U, ratio)
+
+    def test_joint_action_restores_mass_on_error(self):
+        """If the solve raises inside joint_action, the current mass is restored (try/finally)."""
+        act = make_action("mass")
+        act.phi = self.fermion.phi
+
+        def failing_solve(op, tol):
+            self.assertEqual(act.fermion.mass, 0.25)  # the solve runs at the mass of `parameter`
+            raise RuntimeError("solver failure")
+        act.fermion._solve = failing_solve
+        with self.assertRaisesRegex(RuntimeError, "solver failure"):
+            joint_action(act, self.U, 0.25)
+        self.assertEqual(act.fermion.mass, MASS)
+        self.assertEqual(act.parameter, MASS)
+
+
+class StaggeredSNFGradientTest(unittest.TestCase):
+    """dW/drho through a 2-step FermionSNF.forward, staggered: the backward of the last layer's
+    S_pf runs after the last HMC block has redrawn phi (and overwritten the CG solution X), so it
+    must use the force saved by the forward. Reference: 4th-order finite differences of W in the
+    last layer's rho, each evaluation a full run with the same seeds (the HMC blocks before the last
+    layer do not depend on it, and the last block does not enter W, so the runs differ only in the
+    last layer's work)."""
+
+    def test_last_layer_gradient_after_phi_redraw(self):
+        U0, _ = haar_links(4, 77)
+        protocol = [0.25, 0.2]
+
+        def run(rho_last=None, grad=False, saved_phi=None):
+            snf, act = make_snf("mass", MASS, protocol, 0.03, U0.shape[0], solver_tol=1e-13, action_tol=1e-14,
+                                reuse_guess=False)
+            layers = [b.layer for b in snf.blocks]
+            if rho_last is not None:
+                with torch.no_grad():
+                    layers[-1].rho_layer.copy_(rho_last)
+            if saved_phi is not None:
+                snf.blocks[-1].register_forward_pre_hook(lambda mod, args: saved_phi.append(args[0].phi))
+            with torch.set_grad_enabled(grad):
+                _, W, _, _, _ = snf(FieldState(U0), torch.Generator().manual_seed(5))
+            if not grad:
+                return W.sum().item()
+            g = torch.autograd.grad(W.sum(), layers[-1].rho_layer)[0]
+            return g.reshape(-1), layers[-1].rho_layer.detach().clone(), act.phi
+
+        phi_at_layer = []
+        g, rho0, phi_end = run(grad=True, saved_phi=phi_at_layer)
+        self.assertFalse(torch.equal(phi_at_layer[0], phi_end))  # phi redrawn after the last layer
+        g_fd = torch.zeros_like(g)
+        for k in range(g.numel()):
+            def f(h, k=k):
+                r = rho0.clone().reshape(-1)
+                r[k] += h
+                return run(r.view(rho0.shape))
+            g_fd[k] = fd4(f, 1e-3)
+        rel_fd = ((g - g_fd).abs() / g_fd.abs()).max().item()
+        print(f"\nstaggered dW/drho (last layer) through FermionSNF: autograd {g.tolist()}\n  FD {g_fd.tolist()}\n"
+              f"  max rel diff {rel_fd:.1e}")
+        self.assertTrue(bool((g.abs() > 1e-3).all()))
+        self.assertLess(rel_fd, 1e-6)
 
 
 class Ensembles:
@@ -142,12 +206,8 @@ class Ensembles:
 
     @classmethod
     def build(cls):
-        if cls.starts is not None:
-            return
-        ref = plain_hmc(MASS, 1001, 20, 20)
-        cls.ref_ratio = torch.stack([torch.exp(log_det_staggered(U, MASS2, G2) - log_det_staggered(U, MASS, G2))
-                                     for U in ref])  # (20, B)
-        cls.starts = plain_hmc(MASS, 2002, 20, 4, every=3)
+        if cls.starts is None:
+            cls.ref_ratio, cls.starts = mass_ensembles()  # shared with test_fermions_action_staggered
 
 
 class StaggeredSNFTest(unittest.TestCase):
@@ -161,8 +221,10 @@ class StaggeredSNFTest(unittest.TestCase):
         U0 = Ensembles.starts[0][:8]
         protocol = [0.25, 0.2]
         snf, act = make_snf("mass", MASS, protocol, 0.04, U0.shape[0])
+        jump_solves = record_jump_solves(snf, act.fermion)
         with torch.no_grad():
             state, W, Q, logJ, obs = snf(FieldState(U0), torch.Generator().manual_seed(11))
+        self.assertEqual(jump_solves, [1, 1])  # a mass jump costs exactly one solve
         S0 = snf.last_run["S0"]
         check = make_action("mass")
         check.set_parameter(protocol[-1])

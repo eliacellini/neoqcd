@@ -57,13 +57,17 @@ FERMION_TYPES = ("wilson", "staggered")
 
 
 def _as_parameter(value):
-    """A float for scalars (python numbers, 0-dim or one-element tensors), else a float64 (B,) tensor."""
+    """A float for scalars (python numbers, 0-dim or one-element tensors), else a float64 (B,) tensor.
+
+    The tensor is always a copy: it never shares storage with the caller's tensor, so an in-place
+    change of that tensor cannot change a stored parameter or a cache tag (the refresh caches of
+    `ParametricTwoFlavourWilson` and `ParametricStaggeredPseudofermion` are keyed by it)."""
     if torch.is_tensor(value):
         if value.numel() == 1:
             return float(value.reshape(-1)[0].item())
         if value.dim() != 1:
             raise ValueError(f"a parameter must be a scalar or a (B,) tensor, got shape {tuple(value.shape)}")
-        return value.detach().to(torch.float64)
+        return value.detach().to(torch.float64).clone()
     return float(value)
 
 
