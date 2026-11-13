@@ -5,6 +5,9 @@ approximations (neoqcd.fermions.rational) and the rooted pseudofermion term, HMC
 CPU, complex128, fixed seeds. Lattices: 2D 4 x 4 SU(3) (M_ee dimension 24), 2D 4 x 4 SU(2), 2^3 x 4
 SU(3) (48). Exponents gamma = 1/2 (N_f = 2 in 4D, N_f = 1 in 2D) and 1/4 (as n_pf = 2 fields of
 gamma = 1/2, or directly); gamma = 1 is checked against StaggeredPseudofermion.
+Small masses (SmallMassTest): Zolotarev with exact coefficients and Remez at kappa = 4e4 - 1.6e5,
+over-specified degrees, x^{+1/2}; the full default constructors at 4D m = 0.01, 0.02 and 2D
+m = 0.01 (~45 s of Remez) run only with NEOQCD_SLOW=1.
 Prints behind NEOQCD_TEST_VERBOSE.
 """
 
@@ -35,6 +38,7 @@ from neoqcd.fermions.rational import (
     rational_approximation,
     remez_approximation,
     zolotarev_inverse_sqrt,
+    zolotarev_sqrt,
 )
 from neoqcd.fermions.rhmc import (
     ExactRootedMetropolis,
@@ -63,6 +67,7 @@ HALF = Fraction(1, 2)
 QUARTER = Fraction(1, 4)
 
 VERBOSE = bool(os.environ.get("NEOQCD_TEST_VERBOSE"))
+SLOW = bool(os.environ.get("NEOQCD_SLOW"))
 
 
 def say(msg):
@@ -103,6 +108,18 @@ def force_direction(geo, mass, U1, gen, n=16, norm=1.0):
     probe.refresh(Un, gen)
     X1 = probe.force(Un).mean(0, keepdim=True)
     return norm * X1 / math.sqrt(link_sum(trace_product(X1, X1)).item())
+
+
+def check_certified(test, approx, n_grid=200001):
+    """Certified error >= the dense-grid error (compensated evaluation), and error + rounding >= the
+    dense-grid error of the plain float64 evaluation; returns (dense, plain)."""
+    grid = log_grid(approx.lower, approx.upper, n_grid)
+    dense = max_relative_error(approx, grid)
+    plain = max_relative_error(approx, grid, plain=True)
+    test.assertLessEqual(dense, approx.error, msg=repr(approx))
+    test.assertLessEqual(plain, approx.error + approx.rounding, msg=repr(approx))
+    test.assertTrue((approx.shifts >= 0).all())
+    return dense, plain
 
 
 def matrix_function(M, power):
@@ -182,21 +199,21 @@ class RationalApproximationTest(unittest.TestCase):
 
     def test_errors_below_tolerance(self):
         lines = []
-        for geo, gammas in ((G2, (HALF, QUARTER)), (G4, (HALF,))):
+        for geo, gammas in ((G2, (HALF, QUARTER)), (G4, (HALF, 1))):
             lo, hi = staggered_spectral_bounds(0.1, geo.D)
-            grid = log_grid(lo, hi, 200001)
             for gamma in gammas:
-                for name, power, tol in (("action", -gamma, 1e-10), ("heat bath", gamma / 2, 1e-10),
-                                         ("force", -gamma, 1e-6)):
+                cases = (("action", -gamma, 1e-10), ("heat bath", gamma / 2, 1e-10), ("force", -gamma, 1e-6))
+                if gamma == 1:  # x^-1 is exact: only the heat bath x^{+1/2} (Zolotarev reciprocal)
+                    cases = cases[1:2]
+                for name, power, tol in cases:
                     t0 = time.time()
                     approx = rational_approximation(power, lo, hi, tol=tol)
-                    dense = max_relative_error(approx, grid)
+                    dense, plain = check_certified(self, approx)
                     lines.append(f"  D={geo.D} [{lo:.4g}, {hi:.4g}] x^{str(power):5s} {name:9s} tol {tol:.0e}: "
                                  f"{approx.method:9s} degree {approx.degree:2d}, certified {approx.error:.3e}, "
-                                 f"dense grid {dense:.3e} ({time.time() - t0:.1f}s)")
+                                 f"dense grid {dense:.3e}, plain float64 {plain:.3e} (cancellation "
+                                 f"{approx.cancellation:.3g}, rounding {approx.rounding:.1e}) ({time.time() - t0:.1f}s)")
                     self.assertLessEqual(approx.error, tol)
-                    self.assertLessEqual(dense, approx.error * (1 + 1e-6))
-                    self.assertTrue((approx.shifts >= 0).all())
                     if power < 0:
                         self.assertTrue((approx.residues > 0).all() and approx.constant >= 0)
                     # one degree less does not reach the tolerance: the search returns the lowest
@@ -236,6 +253,144 @@ class RationalApproximationTest(unittest.TestCase):
                     self.assertLess(dev, 1e-9, msg=f"power {power}")
         say(f"r(M) phi vs dense M^power phi: max rel. dev. {worst:.1e} "
             f"(spectrum [{lam.min().item():.3f}, {lam.max().item():.3f}] in [{lo:.3f}, {hi:.3f}])")
+
+
+class SmallMassTest(unittest.TestCase):
+    """Small masses (spectral condition number kappa = 4e4 at 4D m = 0.02 and 2D m = 0.01, 1.6e5 at
+    4D m = 0.01), where float64 Zolotarev coefficients had an error floor ~1.5e-12 and the Remez
+    system at 50 digits did not converge (degree >= 17, kappa >~ 2e4). Fast cases: Zolotarev
+    coefficients against an independent formula and the achieved error at degree 22; Remez x^{1/4}
+    of degree 17 at 4D m = 0.02 (the constructor with that heat-bath degree, a refresh and the
+    action on Haar links); over-specified Remez degrees; x^{+1/2}; validation of powers;
+    immutability of the cached approximations. NEOQCD_SLOW=1: the full default constructors."""
+
+    def test_zolotarev_coefficients(self):
+        """Shifts b_k = lower c_{2k-1} against c_l = sc^2(u_l | 1 - 1/kappa) from the imaginary
+        transformation sc(u | m') = Im sn(i u | 1 - m') and K' = pi / (2 agm(1, kappa^-1/2)) in 60
+        digits; float64 coefficients had relative errors 1e-10 (kappa = 1.6e5) to 1e-8 (1.6e7)."""
+        import mpmath as mp
+
+        for lo, hi, n in ((1e-4 / 1.01, 16.0001 * 1.01, 22), (1e-6, 16.0, 30)):
+            z = zolotarev_inverse_sqrt(lo, hi, n)
+            with mp.workdps(60):
+                kappa = mp.mpf(hi) / mp.mpf(lo)
+                Kp = mp.pi / (2 * mp.agm(1, 1 / mp.sqrt(kappa)))
+                ref = sorted(float(mp.mpf(lo) * mp.im(mp.ellipfun("sn", 1j * l * Kp / (2 * n + 1), m=1 / kappa)) ** 2)
+                             for l in range(1, 2 * n + 1, 2))
+            dev = max(abs(a / b - 1) for a, b in zip(sorted(z.shifts), ref))
+            say(f"Zolotarev kappa {hi / lo:.3g} degree {n}: max rel. dev. of the shifts {dev:.1e}, error {z.error:.3e}")
+            self.assertLess(dev, 1e-13)
+
+    def test_zolotarev_small_mass(self):
+        """4D m = 0.01: degree 22 reaches 3.5e-13 (the float64 coefficients never got below 1.5e-12);
+        the search returns degree 22 for 1e-12; x^{+1/2} certified against plain and compensated
+        dense grids (cancellation ~8e3)."""
+        lo, hi = staggered_spectral_bounds(0.01, 4)
+        z = zolotarev_inverse_sqrt(lo, hi, 22)
+        dense, _ = check_certified(self, z)
+        self.assertLess(z.error, 5e-13)
+        a = rational_approximation(-HALF, lo, hi, tol=1e-12)
+        self.assertEqual(a.degree, 22)
+        r = zolotarev_sqrt(lo, hi, 22)
+        dense_r, plain_r = check_certified(self, r)
+        say(f"4D m=0.01 Zolotarev degree 22: x^-1/2 certified {z.error:.3e} (dense {dense:.3e}); x^+1/2 certified "
+            f"{r.error:.3e} (dense {dense_r:.3e}, plain float64 {plain_r:.3e}, cancellation {r.cancellation:.3g})")
+        self.assertLess(r.error, 1e-12)
+
+    def test_remez_small_mass(self):
+        """x^{1/4} degree 17 on the 4D m = 0.02 interval (raised 'the error does not alternate' at 50
+        digits); then the constructor with this heat-bath degree (action and force by tolerance), a
+        refresh and the action at the refresh links on Haar fields: S_pf = |eta|^2 up to the
+        approximation and solver errors, all multishift solves converged."""
+        lo, hi = staggered_spectral_bounds(0.02, 4)
+        t0 = time.time()
+        a = remez_approximation(QUARTER, lo, hi, 17)
+        t_build = time.time() - t0
+        dense, plain = check_certified(self, a)
+        say(f"4D m=0.02 x^1/4 Remez degree 17: certified {a.error:.3e}, dense {dense:.3e}, plain {plain:.3e} "
+            f"(cancellation {a.cancellation:.3g}), {t_build:.1f}s")
+        self.assertLess(a.error, 2e-11)
+        self.assertTrue((a.residues < 0).all() and a.constant > 0)
+        S = RootedStaggeredPseudofermion(0.02, G4, heatbath_degree=17)
+        self.assertIs(S.heatbath_approx, a)  # cached
+        self.assertLessEqual(S.action_approx.error, 1e-12)
+        self.assertEqual(S.action_approx.degree, 20)
+        U, gen = haar_links(G4, 2, 71)
+        S.refresh(U, gen)
+        s = S.action(U)
+        eta2 = sum((e.abs() ** 2).reshape(2, -1).sum(1) for e in S.eta)
+        dev = ((s - eta2).abs() / eta2).max().item()
+        say(f"4D m=0.02 refresh + action: |S - |eta|^2| / |eta|^2 = {dev:.1e}, M_ee applications per solve "
+            f"{S.stats['cg_iterations'] / S.stats['solves']:.0f}, last true residual {S.stats['last_residual'].max().item():.1e}")
+        self.assertLess(dev, 1e-9)
+
+    def test_over_specified_degree(self):
+        """Degrees whose minimax error is below the float64 resolution (kappa = 66 and 5) return a
+        float64-level approximation instead of raising."""
+        for m, D, power, n in ((0.5, 4, QUARTER, 16), (1.0, 2, -QUARTER, 14)):
+            lo, hi = staggered_spectral_bounds(m, D)
+            a = remez_approximation(power, lo, hi, n)
+            dense, plain = check_certified(self, a)
+            say(f"over-specified x^{power} degree {n} on [{lo:.3g}, {hi:.3g}]: certified {a.error:.2e}, dense "
+                f"{dense:.2e}, plain {plain:.2e}")
+            self.assertLess(a.error, 1e-13)
+
+    def test_powers(self):
+        lo, hi = staggered_spectral_bounds(0.3, 2)
+        for power in (0, 1, Fraction(3, 2), -2, Fraction(-5, 4), 0.0):
+            with self.subTest(power=power):
+                with self.assertRaises(ValueError):
+                    rational_approximation(power, lo, hi, tol=1e-8)
+        with self.assertRaises(ValueError):
+            remez_approximation(Fraction(-1), lo, hi, 4)
+        with self.assertRaises(ValueError):
+            rational_approximation(-1, lo, hi, degree=3, method="remez")
+        self.assertEqual(rational_approximation(-1, lo, hi, tol=1e-8).method, "exact")
+        with self.assertRaises(RuntimeError):  # below the float64 floor of the certified error
+            rational_approximation(-HALF, lo, hi, tol=1e-16)
+
+    def test_immutable(self):
+        lo, hi = staggered_spectral_bounds(0.3, 2)
+        a = rational_approximation(-HALF, lo, hi, degree=5)
+        shifts = a.shifts.copy()
+        with self.assertRaises(AttributeError):
+            a.error = 0.0
+        with self.assertRaises(AttributeError):
+            a.residues = a.residues * 2
+        with self.assertRaises(ValueError):
+            a.residues[0] = 1.0
+        with self.assertRaises(ValueError):
+            a.shifts[:] = 0.0
+        b = rational_approximation(-HALF, lo, hi, degree=5)
+        self.assertIs(a, b)
+        self.assertTrue((b.shifts == shifts).all())
+
+    @unittest.skipUnless(SLOW, "NEOQCD_SLOW=1: default constructors at small mass (~45 s)")
+    def test_default_constructors_small_mass(self):
+        """RootedStaggeredPseudofermion with all defaults (action and heat bath 1e-12, force 1e-7) at
+        4D m = 0.02 and 0.01 and 2D m = 0.01; certified against dense grids; refresh and action."""
+        lines = []
+        for geo, m, seed in ((G4, 0.02, 81), (G2, 0.01, 82), (G4, 0.01, 83)):
+            with self.subTest(D=geo.D, m=m):
+                t0 = time.time()
+                S = RootedStaggeredPseudofermion(m, geo)
+                t_build = time.time() - t0
+                for name, a, tol in (("action", S.action_approx, 1e-12), ("heat bath", S.heatbath_approx, 1e-12),
+                                     ("force", S.force_approx, 1e-7)):
+                    dense, plain = check_certified(self, a)
+                    self.assertLessEqual(a.error, tol)
+                    lines.append(f"  D={geo.D} m={m} {name:9s} x^{str(a.power):5s} {a.method:9s} degree {a.degree:2d} "
+                                 f"certified {a.error:.3e} dense {dense:.3e} plain {plain:.3e} "
+                                 f"(cancellation {a.cancellation:.3g})")
+                U, gen = haar_links(geo, 2, seed)
+                S.refresh(U, gen)
+                s = S.action(U)
+                eta2 = sum((e.abs() ** 2).reshape(2, -1).sum(1) for e in S.eta)
+                dev = ((s - eta2).abs() / eta2).max().item()
+                lines.append(f"  D={geo.D} m={m}: constructor {t_build:.1f}s, |S - |eta|^2| / |eta|^2 = {dev:.1e}, "
+                             f"M_ee applications per solve {S.stats['cg_iterations'] / S.stats['solves']:.0f}")
+                self.assertLess(dev, 1e-9)
+        say("default constructors at small mass:\n" + "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -280,6 +435,59 @@ class RootedActionTest(unittest.TestCase):
             f"{((s - eta2).abs() / eta2).max().item():.1e}")
         self.assertLess(abs(mean - n), 4.0 * math.sqrt(n / K))
         self.assertLess(abs(var - n), 4.0 * math.sqrt((6.0 * n + 2.0 * n * n) / K))
+
+
+class BoundsAndSolverChecksTest(unittest.TestCase):
+    """User spectral bounds must contain [m_min^2, m_max^2 + D^2] (ValueError; unsafe_bounds=True
+    accepts them, and the optional power-iteration check catches lambda_max above the interval);
+    the mass is a private copy; unconverged multishift solves raise in refresh, action and force."""
+
+    def test_spectral_bounds_validation(self):
+        with self.assertRaises(ValueError):  # free-field bounds at m = 0.3: silently wrong before
+            RootedStaggeredPseudofermion(0.3, G4, spectral_bounds=(0.5, 2.0))
+        with self.assertRaises(ValueError):  # lower bound above m^2
+            RootedStaggeredPseudofermion(MASSES, G2, spectral_bounds=(0.1, 10.0))
+        with self.assertRaises(ValueError):  # upper bound below m_max^2 + D^2 = 4.25
+            RootedStaggeredPseudofermion(MASSES, G2, spectral_bounds=(0.05, 4.2))
+        req = staggered_spectral_bounds(MASSES, G2.D, 0.0)
+        RootedStaggeredPseudofermion(MASSES, G2, spectral_bounds=req)  # the rigorous interval itself
+        RootedStaggeredPseudofermion(MASSES, G2, spectral_bounds=(0.05, 10.0))
+        # unsafe bounds: accepted; the run-time check finds lambda_max ~ m^2 + 3 > 2 on Haar links
+        S = RootedStaggeredPseudofermion(0.3, G2, spectral_bounds=(0.05, 2.0), unsafe_bounds=True,
+                                         spectrum_check_iterations=30)
+        U, gen = haar_links(G2, 2, 91)
+        with self.assertRaisesRegex(RuntimeError, "spectral bound"):
+            S.refresh(U, gen)
+        # default bounds pass the check; the estimate is below the true lambda_max
+        S = RootedStaggeredPseudofermion(MASSES, G2, spectrum_check_iterations=30)
+        S.refresh(U, gen)
+        est = S.stats["lambda_max_estimate"]
+        lam = torch.linalg.eigvalsh(assemble_staggered_even_odd(U, MASSES, G2)).max(dim=-1).values
+        say(f"power iteration lambda_max {est.tolist()}, exact {lam.tolist()}, upper bound {S.spectral_bounds[1]:.3f}")
+        self.assertTrue((est <= lam * (1 + 1e-12)).all() and (est > 0.9 * lam).all())
+
+    def test_mass_is_copied(self):
+        m = MASSES.clone()
+        S = RootedStaggeredPseudofermion(m, G2)
+        m[0] = 0.01  # in place, after construction
+        self.assertEqual(S.mass[0].item(), 0.3)
+        S.mass[0] = 0.02  # the property returns a copy
+        self.assertEqual(S.mass[0].item(), 0.3)
+        U, _ = haar_links(G2, 2, 92)
+        self.assertTrue(torch.equal(S.dirac(U).mass.reshape(-1), MASSES))
+
+    def test_unconverged_solves_raise(self):
+        U, gen = haar_links(G2, 2, 93)
+        with self.assertRaisesRegex(RuntimeError, "refresh: multishift CG not converged"):
+            RootedStaggeredPseudofermion(MASSES, G2, max_iter=3).refresh(U, gen)
+        ok = RootedStaggeredPseudofermion(MASSES, G2)
+        ok.refresh(U, gen)
+        bad = RootedStaggeredPseudofermion(MASSES, G2, max_iter=3)
+        bad.phi = ok.phi
+        with self.assertRaisesRegex(RuntimeError, "action: multishift CG not converged"):
+            bad.action(U)
+        with self.assertRaisesRegex(RuntimeError, "force: multishift CG not converged"):
+            bad.force(U)
 
 
 class StochasticEstimatorTest(unittest.TestCase):
@@ -585,11 +793,33 @@ class ExactComparisonTest(unittest.TestCase):
         self.assertLess(abs(l_h - l_m), 0.3 * gap1, msg=msg)
 
     def test_effective_action(self):
+        """rooted_effective_action against an independent computation: S_g = beta sum_x sum_{mu<nu}
+        (1 - Re tr P_{mu nu}(x) / N) from explicit link products, and log det M_ee = log det D of
+        the full (not even-odd) dense staggered matrix (det D = det M_ee for D = m + K, K
+        antihermitian with chiral pairs), for gamma = 1/2 and 1/4."""
         U, _ = haar_links(G2, 3, 7)
-        S = rooted_effective_action(U, self.BETA, self.MASS, G2, HALF)
-        ref = ExactStaggeredMetropolis(self.BETA, self.MASS, G2)
-        expected = ref.gauge_action(U) - 0.5 * log_det_staggered(U, self.MASS, G2)
-        self.assertLess((S - expected).abs().max().item(), 1e-10)
+        N, D = G2.N, G2.D
+        retr = 0.0
+        for mu in range(D):
+            for nu in range(mu + 1, D):
+                # U_nu(x + mu) is torch.roll(., 1, dim of mu) in this code base (shift(., mu, +1))
+                Umu, Unu = U[:, mu], U[:, nu]
+                P = SUN_mul(SUN_mul(Umu, torch.roll(Unu, 1, dims=1 + mu)),
+                            SUN_mul(SUN_dagger(torch.roll(Umu, 1, dims=1 + nu)), SUN_dagger(Unu)))
+                retr = retr + SUN_trace(P).real.reshape(3, -1).sum(1)
+        S_g = self.BETA * (G2.volume * D * (D - 1) / 2 - retr / N)
+        ld = []
+        for b in range(3):
+            Dm = staggered_dense_matrix(StaggeredDirac(U, self.MASS, G2), G2, batch_index=b)
+            self.assertEqual(Dm.shape[0], G2.volume * N)
+            sign, logabs = torch.linalg.slogdet(Dm)
+            self.assertLess(abs(sign.item() - 1.0), 1e-10)
+            ld.append(logabs)
+        ld = torch.stack(ld)
+        for gamma in (HALF, QUARTER):
+            S = rooted_effective_action(U, self.BETA, self.MASS, G2, gamma)
+            expected = S_g - float(gamma) * ld
+            self.assertLess((S - expected).abs().max().item(), 1e-10 * expected.abs().max().item())
 
 
 if __name__ == "__main__":

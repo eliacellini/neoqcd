@@ -40,11 +40,27 @@ Spectral interval. Default [lambda_lo, lambda_hi] = [m_min^2 / (1 + margin), (m_
 bound m^2 + D, the free-field value (max sum_mu sin^2 p_mu = D), does NOT hold on rough fields:
 on Haar-random links lambda_max(M) - m^2 is about 2D - 1 (3.0 in 2D, 7.0-7.3 in 4D). The rigorous
 bound is D^2: K = sum_mu eta_mu (V_mu - V_mu^dagger)/2 with V_mu unitary, so ||K|| <= D and
-||K_eo K_oe|| <= D^2. That is the default; `spectral_bounds` overrides it.
+||K_eo K_oe|| <= D^2. That is the default. User `spectral_bounds` must contain the rigorous
+interval [m_min^2, m_max^2 + D^2] (ValueError otherwise): a narrower interval saves poles but the
+approximation is then not controlled outside it (at m = 0.3 the free-field bounds (0.5, 2.0) give a
+silent ~4e-5 error on Haar links). `unsafe_bounds=True` accepts a narrower interval on the user's
+responsibility (e.g. smooth fields whose measured spectrum is known); `spectrum_check_iterations`
+> 0 then estimates lambda_max(M_ee) at every refresh by power iteration (a lower bound on it, so
+this detects violations of the upper bound but cannot certify it) and raises if it lies above the
+interval. The lower bound m^2 is rigorous and is not checked at run time. The mass is stored as a
+private copy, so the interval cannot be silently invalidated by an in-place change of the
+caller's mass tensor.
+
+Solver checks. Every multishift solve (refresh, action, force) checks the true relative residual
+of every shift against 10 max(tol, 1e3 eps) (the slack policy of hasenbusch.RatioWilsonTerm: the
+true residual may sit slightly above tol at roundoff) and raises RuntimeError with the residual,
+the shift and the sample otherwise: an unconverged solve would silently bias the heat bath, the
+Metropolis test or the force.
 """
 
 from fractions import Fraction
 
+import numpy as np
 import torch
 
 from neoqcd.fermions._gauge import SUN_mul
@@ -60,6 +76,7 @@ __all__ = [
     "as_exponent",
     "staggered_spectral_bounds",
     "rational_apply",
+    "check_multishift",
     "staggered_rational_force",
     "RootedStaggeredPseudofermion",
     "RootedStaggeredHamiltonian",
@@ -77,7 +94,7 @@ def as_exponent(gamma):
 
 def staggered_spectral_bounds(mass, D, margin=0.01):
     """[m_min^2 / (1 + margin), (m_max^2 + D^2)(1 + margin)]: contains the spectrum of M_ee on every
-    gauge field (module docstring)."""
+    gauge field (module docstring); margin = 0 gives the rigorous interval itself."""
     m = torch.as_tensor(mass, dtype=torch.float64).reshape(-1).abs()
     lo = float(m.min()) ** 2
     hi = float(m.max()) ** 2 + float(D) ** 2
@@ -86,13 +103,41 @@ def staggered_spectral_bounds(mass, D, margin=0.01):
     return lo / (1.0 + margin), hi * (1.0 + margin)
 
 
-def rational_apply(approx, apply, phi, tol=1e-10, max_iter=5000):
+def _real_coefficients(c, like):
+    """Real coefficients as a tensor of the real dtype and device of `like` (copies numpy arrays,
+    which may be read-only)."""
+    if torch.is_tensor(c):
+        return c.to(dtype=like.real.dtype, device=like.device)
+    return torch.tensor(np.array(c, dtype=np.float64), dtype=like.real.dtype, device=like.device)
+
+
+def check_multishift(result, shifts, tol, max_iter, where):
+    """RuntimeError unless every true relative residual of `result` (K, B) is <= 10 max(tol, 1e3 eps)
+    (module docstring, Solver checks)."""
+    r = result.residual
+    limit = 10.0 * max(float(tol), 1e3 * torch.finfo(r.dtype).eps)
+    bad = ~(r <= limit)  # also catches NaN
+    if bool(bad.any()):
+        worst = torch.where(bad, torch.nan_to_num(r, nan=float("inf")), torch.zeros_like(r))
+        k, b = divmod(int(worst.reshape(-1).argmax()), r.shape[1])
+        s = torch.as_tensor(shifts, dtype=torch.float64)
+        sk = float(s[k]) if s.dim() == 1 else float(s[b, k])
+        raise RuntimeError(f"{where}: multishift CG not converged, true relative residual {float(r[k, b]):.3e} > "
+                           f"{limit:.1e} for shift {sk:.6e} (pole {k} of {r.shape[0]}), sample {b} "
+                           f"(tol {float(tol):.1e}, max_iter {int(max_iter)}, iterations {int(result.iterations[k, b])})")
+
+
+def rational_apply(approx, apply, phi, tol=1e-10, max_iter=5000, check=None):
     """r(A) phi = a_0 phi + sum_k a_k (A + b_k)^-1 phi with one multishift CG.
 
-    Returns (r(A) phi, solutions X (K,) + phi.shape, MultishiftResult).
+    `check`: None, or a label: then `check_multishift` raises RuntimeError (with the label) if a
+    shift has not converged. Returns (r(A) phi, solutions X (K,) + phi.shape, MultishiftResult).
     """
-    res = multishift_cg(apply, phi, approx.shifts.tolist(), tol=tol, max_iter=max_iter)
-    a = torch.as_tensor(approx.residues, dtype=phi.real.dtype, device=phi.device)
+    shifts = approx.shifts.tolist()
+    res = multishift_cg(apply, phi, shifts, tol=tol, max_iter=max_iter)
+    if check is not None:
+        check_multishift(res, shifts, tol, max_iter, check)
+    a = _real_coefficients(approx.residues, phi)
     out = approx.constant * phi + (a.view((-1,) + (1,) * phi.dim()).to(phi.dtype) * res.x).sum(0)
     return out, res.x, res
 
@@ -107,7 +152,7 @@ def staggered_rational_force(op, X, coefficients):
     """
     stag = getattr(op, "staggered", op)
     eo = stag.even_odd() if not hasattr(op, "odd") else op
-    c = torch.as_tensor(coefficients, dtype=X.real.dtype, device=X.device).to(X.dtype)
+    c = _real_coefficients(coefficients, X).to(X.dtype)
     W = torch.stack([eo.odd(stag.hopping(X[k])) for k in range(X.shape[0])])
     links = fermion_boundary_links(stag.U, stag.time_sign)
     out = []
@@ -132,8 +177,12 @@ class RootedStaggeredPseudofermion(ActionTerm):
         exponent: gamma = N_f / 2^(D/2) in (0, 1], a Fraction (default 1/2).
         n_pf: number of pseudofermion fields, each with exponent gamma / n_pf.
         time_sign: fermion boundary phase in time (-1 antiperiodic).
-        spectral_bounds: (lambda_lo, lambda_hi) of M_ee; default `staggered_spectral_bounds`.
+        spectral_bounds: (lambda_lo, lambda_hi) of M_ee; default `staggered_spectral_bounds`. Must
+            contain [m_min^2, m_max^2 + D^2] (ValueError otherwise) unless `unsafe_bounds`.
         spectral_margin: relative margin of the default bounds.
+        unsafe_bounds: accept `spectral_bounds` narrower than the rigorous interval (module docstring).
+        spectrum_check_iterations: if > 0, power iterations for lambda_max(M_ee) at every refresh
+            (`check_spectrum`), RuntimeError if the estimate exceeds lambda_hi. Off (0) by default.
         action_approx_tol, force_approx_tol: certified max relative errors of r_S, r_H and of r_F;
             ignored for an approximation whose degree is given.
         action_degree, heatbath_degree, force_degree: explicit numbers of poles.
@@ -145,14 +194,17 @@ class RootedStaggeredPseudofermion(ActionTerm):
     (`RationalApproximation`). State: `phi` (list of n_pf fields), `eta` (the Gaussian draws).
     `stats` as in StaggeredPseudofermion; `solves` counts multishift solves, `cg_iterations` the
     sum over solves of the largest iteration count (= applications of M_ee).
-    The CG always starts from zero, so the force is a deterministic function of U.
+    The CG always starts from zero, so the force is a deterministic function of U. Every multishift
+    solve is checked for convergence (module docstring, Solver checks). `mass` is a private copy
+    (the property returns a copy as well).
     """
 
     def __init__(self, mass, geometry, exponent=Fraction(1, 2), n_pf=1, time_sign=-1.0,
                  spectral_bounds=None, spectral_margin=0.01, action_approx_tol=1e-12,
                  force_approx_tol=1e-7, action_degree=None, heatbath_degree=None, force_degree=None,
-                 solver_tol=1e-10, action_solver_tol=None, max_iter=5000):
-        self.mass = mass
+                 solver_tol=1e-10, action_solver_tol=None, max_iter=5000, unsafe_bounds=False,
+                 spectrum_check_iterations=0):
+        self._mass = mass.detach().clone() if torch.is_tensor(mass) else float(mass)
         self.geometry = geometry
         self.exponent = as_exponent(exponent)
         if not (0 < self.exponent <= 1):
@@ -161,10 +213,20 @@ class RootedStaggeredPseudofermion(ActionTerm):
         if self.n_pf < 1:
             raise ValueError("n_pf must be >= 1")
         self.time_sign = float(time_sign)
+        self.required_bounds = staggered_spectral_bounds(self._mass, geometry.D, 0.0)
         if spectral_bounds is None:
-            spectral_bounds = staggered_spectral_bounds(mass, geometry.D, spectral_margin)
+            spectral_bounds = staggered_spectral_bounds(self._mass, geometry.D, spectral_margin)
         self.spectral_bounds = (float(spectral_bounds[0]), float(spectral_bounds[1]))
         lo, hi = self.spectral_bounds
+        req_lo, req_hi = self.required_bounds
+        if not (0 < lo < hi):
+            raise ValueError(f"spectral_bounds must satisfy 0 < lower < upper, got {self.spectral_bounds}")
+        if not unsafe_bounds and (lo > req_lo * (1 + 1e-12) or hi < req_hi * (1 - 1e-12)):
+            raise ValueError(f"spectral_bounds {self.spectral_bounds} do not contain the rigorous spectral interval "
+                             f"[m_min^2, m_max^2 + D^2] = [{req_lo:.6g}, {req_hi:.6g}] of M_ee; widen them or pass "
+                             f"unsafe_bounds=True (module docstring)")
+        self.unsafe_bounds = bool(unsafe_bounds)
+        self.spectrum_check_iterations = int(spectrum_check_iterations)
         g = self.exponent / self.n_pf
         self.action_approx = rational_approximation(-g, lo, hi, degree=action_degree, tol=action_approx_tol)
         self.heatbath_approx = rational_approximation(g / 2, lo, hi, degree=heatbath_degree, tol=action_approx_tol)
@@ -179,10 +241,16 @@ class RootedStaggeredPseudofermion(ActionTerm):
         self._refresh_action = None
         self.reset_stats()
 
+    @property
+    def mass(self):
+        """The bare mass (a copy: the operator uses the private value fixed at construction)."""
+        return self._mass.clone() if torch.is_tensor(self._mass) else self._mass
+
     # ---- bookkeeping ---------------------------------------------------------------------
     def reset_stats(self):
         self.stats = {"refresh_calls": 0, "action_calls": 0, "force_calls": 0, "solves": 0,
-                      "cg_iterations": 0, "last_iterations": None, "last_residual": None}
+                      "cg_iterations": 0, "last_iterations": None, "last_residual": None,
+                      "lambda_max_estimate": None}
 
     def _count(self, result):
         it = result.iterations.max(dim=0).values  # (B,) applications of M_ee
@@ -203,7 +271,7 @@ class RootedStaggeredPseudofermion(ActionTerm):
 
     # ---- operators -----------------------------------------------------------------------
     def dirac(self, U):
-        return StaggeredDirac(U, self.mass, self.geometry, self.time_sign)
+        return StaggeredDirac(U, self._mass, self.geometry, self.time_sign)
 
     def operator(self, U):
         """M_ee at links U (`StaggeredEvenOdd`)."""
@@ -218,6 +286,29 @@ class RootedStaggeredPseudofermion(ActionTerm):
             return approximation
         raise ValueError(f"unknown approximation {approximation!r}")
 
+    def check_spectrum(self, U, n_iter=None):
+        """Power-iteration estimate of lambda_max(M_ee) per configuration, shape (B,) (a Rayleigh
+        quotient, so a lower bound on lambda_max). Raises RuntimeError if it exceeds the upper end of
+        `spectral_bounds`. Deterministic start vector (does not consume the caller's generator)."""
+        n_iter = self.spectrum_check_iterations if n_iter is None else int(n_iter)
+        op = self.operator(U)
+        gen = torch.Generator(device=U.device).manual_seed(12345)
+        v = op.even(torch.randn(self.geometry.staggered_shape(U.shape[0]), generator=gen, dtype=U.dtype,
+                                device=U.device))
+        B = v.shape[0]
+        est = None
+        for _ in range(max(1, n_iter)):
+            v = v / v.reshape(B, -1).norm(dim=1).view((B,) + (1,) * (v.dim() - 1))
+            w = op.apply(v)
+            est = (v.conj() * w).real.reshape(B, -1).sum(1)
+            v = w
+        self.stats["lambda_max_estimate"] = est
+        hi = self.spectral_bounds[1]
+        if bool((est > hi).any()):
+            raise RuntimeError(f"lambda_max(M_ee) >= {est.max().item():.6g} (power iteration) lies above the upper "
+                               f"spectral bound {hi:.6g}: the rational approximations are not valid on this field")
+        return est
+
     def _check_phi(self):
         if self.phi is None:
             raise RuntimeError("the pseudofermion fields are not set: call refresh(U, generator) first")
@@ -225,12 +316,15 @@ class RootedStaggeredPseudofermion(ActionTerm):
     # ---- ActionTerm interface -------------------------------------------------------------
     def refresh(self, U, generator=None):
         """phi_j = r_H(M_ee) eta_j, eta_j complex Gaussian on the even sites, j = 1 .. n_pf."""
+        if self.spectrum_check_iterations > 0:
+            self.check_spectrum(U)
         op = self.operator(U)
         self.phi, self.eta = [], []
         for _ in range(self.n_pf):
             eta = op.even(torch.randn(self.geometry.staggered_shape(U.shape[0]), generator=generator,
                                       dtype=U.dtype, device=U.device))
-            phi, _, res = rational_apply(self.heatbath_approx, op.apply, eta, self.action_solver_tol, self.max_iter)
+            phi, _, res = rational_apply(self.heatbath_approx, op.apply, eta, self.action_solver_tol, self.max_iter,
+                                         check="RootedStaggeredPseudofermion.refresh")
             self._count(res)
             self.eta.append(eta)
             self.phi.append(op.even(phi))
@@ -252,7 +346,8 @@ class RootedStaggeredPseudofermion(ActionTerm):
         op = self.operator(U)
         total = None
         for phi in self.phi:
-            rphi, _, res = rational_apply(approx, op.apply, phi, tol, self.max_iter)
+            rphi, _, res = rational_apply(approx, op.apply, phi, tol, self.max_iter,
+                                          check="RootedStaggeredPseudofermion.action")
             self._count(res)
             s = (phi.conj() * rphi).real.reshape(phi.shape[0], -1).sum(1)
             total = s if total is None else total + s
@@ -278,8 +373,10 @@ class RootedStaggeredPseudofermion(ActionTerm):
         op = self.operator(U)
         F = None
         for phi in self.phi:
-            res = multishift_cg(op.apply, phi, approx.shifts.tolist(), tol=self.solver_tol, max_iter=self.max_iter)
+            shifts = approx.shifts.tolist()
+            res = multishift_cg(op.apply, phi, shifts, tol=self.solver_tol, max_iter=self.max_iter)
             self._count(res)
+            check_multishift(res, shifts, self.solver_tol, self.max_iter, "RootedStaggeredPseudofermion.force")
             f = staggered_rational_force(op, op.even(res.x), approx.residues)
             F = f if F is None else F + f
         return F
