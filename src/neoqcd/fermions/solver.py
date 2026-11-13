@@ -24,7 +24,8 @@ except ImportError:  # pragma: no cover
 
 import torch
 
-__all__ = ["LinearOperator", "SolverResult", "cg", "bicgstab", "solve", "solve_normal"]
+__all__ = ["LinearOperator", "SolverResult", "cg", "bicgstab", "solve", "solve_normal", "MultishiftResult",
+           "multishift_cg"]
 
 
 class LinearOperator(Protocol):
@@ -242,3 +243,104 @@ def solve_normal(op, b, tol=1e-10, max_iter=1000):
         res = cg(op.normal, b, tol=tol, max_iter=max_iter)
         x, iterations = res.x, res.iterations
     return SolverResult(x, iterations, _relative_residual(full.normal, b, x))
+
+
+class MultishiftResult(NamedTuple):
+    x: torch.Tensor  # (K,) + b.shape: x[k] solves (A + sigma_k) x = b
+    iterations: torch.Tensor  # (K, B) iterations in which shift k was still updated, per sample
+    residual: torch.Tensor  # (K, B) true relative residual |b - (A + sigma_k) x_k| / |b|
+
+
+def multishift_cg(apply, b, shifts, tol=1e-10, max_iter=1000):
+    """Multishift CG: (A + sigma_k) x_k = b for all shifts sigma_k >= 0 in one Krylov sequence.
+
+    A (`apply`) must be hermitian positive definite on each sample; the shifts are a sequence of
+    K floats shared by the batch, a (K,) tensor, or a (B, K) tensor of per-sample shifts. One
+    application of A per iteration serves all shifts (Jegerlehner, hep-lat/9612014; Frommer et al.).
+
+    Algorithm. CG runs on the base system A' = A + s_b, s_b = min_k sigma_k (per sample), whose
+    solution converges last; with delta_k = sigma_k - s_b >= 0 the shifted residuals are collinear,
+    r^k_i = zeta^k_i r_i, and (alpha_i, beta_i the base CG coefficients, beta_i = |r_{i+1}|^2/|r_i|^2,
+    starting from zeta_{-1} = zeta_0 = 1, alpha_{-1} = 1, beta_{-1} = 0)
+        zeta_{i+1} = zeta_i zeta_{i-1} alpha_{i-1}
+                     / [alpha_i beta_{i-1} (zeta_{i-1} - zeta_i) + zeta_{i-1} alpha_{i-1} (1 + delta alpha_i)],
+        alpha^k_i = alpha_i zeta_{i+1} / zeta_i,        x^k += alpha^k_i p^k,
+        beta^k_i = beta_i (zeta_{i+1} / zeta_i)^2,       p^k <- zeta_{i+1} r_{i+1} + beta^k_i p^k.
+    The base shift has delta = 0 and zeta = 1 identically, so it is one of the K shifts.
+
+    Convergence is per sample and per shift: shift k of sample b stops being updated (its x, p and
+    zeta frozen) once |r^k| = zeta^k |r| <= max(tol |b|, eps |b|) (the roundoff floor of `cg`);
+    a sample stops when all its shifts have converged, or on a breakdown (p^dagger A' p <= 0 or a
+    non-finite value), which leaves its unconverged shifts at their last iterate. The initial
+    guess is zero. The returned residual is recomputed at the end (K extra applications of A).
+
+    Returns MultishiftResult(x (K,) + b.shape, iterations (K, B), residual (K, B)).
+    """
+    B = b.shape[0]
+    real = b.real.dtype if b.is_complex() else b.dtype
+    s = torch.as_tensor(shifts, dtype=real, device=b.device)
+    if s.dim() == 1:
+        s = s.unsqueeze(0)
+    if s.dim() != 2 or s.shape[0] not in (1, B) or s.shape[1] == 0:
+        raise ValueError(f"shifts must have shape (K,) or ({B}, K), got {tuple(s.shape)}")
+    s = s.expand(B, -1)
+    if bool((s < 0).any()) or not bool(torch.isfinite(s).all()):
+        raise ValueError("multishift_cg needs finite non-negative shifts")
+    K = s.shape[1]
+    base = s.min(dim=1).values  # (B,)
+    delta = s - base[:, None]  # (B, K) >= 0
+
+    def apply_base(v):
+        return apply(v) + _bview(base, v).to(v.dtype) * v
+
+    def kview(c):  # (B, K) -> (K, B, 1, ..., 1)
+        return c.transpose(0, 1).reshape((K, B) + (1,) * (b.dim() - 1))
+
+    x = torch.zeros((K,) + tuple(b.shape), dtype=b.dtype, device=b.device)
+    r = b.clone()
+    p = b.clone()
+    ps = b.unsqueeze(0).repeat((K,) + (1,) * b.dim())
+    rr = _norm2(r)
+    target = _target(b, b, tol)  # (B,)
+    ones = torch.ones((B, K), dtype=real, device=b.device)
+    zeta, zeta_prev = ones.clone(), ones.clone()
+    alpha_prev = torch.ones(B, dtype=real, device=b.device)
+    beta_prev = torch.zeros(B, dtype=real, device=b.device)
+    active_k = (zeta ** 2) * rr[:, None] > target[:, None]
+    iterations = torch.zeros((B, K), dtype=torch.long, device=b.device)
+    zero = torch.zeros(B, dtype=real, device=b.device)
+    for _ in range(int(max_iter)):
+        active = active_k.any(dim=1)
+        if not bool(active.any()):
+            break
+        Ap = apply_base(p)
+        pAp = _dot(p, Ap).real
+        active = active & (pAp > 0) & torch.isfinite(pAp)  # breakdown: A' not positive on p
+        active_k = active_k & active[:, None]
+        alpha = torch.where(active, rr / _safe(pAp, active), zero)
+        den = (alpha[:, None] * beta_prev[:, None] * (zeta_prev - zeta)
+               + zeta_prev * alpha_prev[:, None] * (1.0 + delta * alpha[:, None]))
+        ok = active_k & (den != 0) & torch.isfinite(den)
+        zeta_next = torch.where(ok, zeta * zeta_prev * alpha_prev[:, None] / _safe(den, ok), zeta)
+        ratio = torch.where(ok, zeta_next / _safe(zeta, ok), torch.zeros_like(zeta))
+        alpha_k = alpha[:, None] * ratio
+        x = x + kview(alpha_k).to(x.dtype) * ps
+        r = r - _bview(alpha, r).to(r.dtype) * Ap
+        rr_new = _norm2(r)
+        beta = torch.where(active, rr_new / _safe(rr, active), zero)
+        beta_k = beta[:, None] * ratio ** 2
+        ps_new = kview(zeta_next).to(ps.dtype) * r.unsqueeze(0) + kview(beta_k).to(ps.dtype) * ps
+        ps = torch.where(kview(ok), ps_new, ps)
+        p = r + _bview(beta, p).to(p.dtype) * p
+        iterations = iterations + ok.long()
+        zeta_prev = torch.where(ok, zeta, zeta_prev)
+        zeta = zeta_next
+        alpha_prev = torch.where(active, alpha, alpha_prev)
+        beta_prev = torch.where(active, beta, beta_prev)
+        rr = torch.where(active, rr_new, rr)
+        active_k = ok & torch.isfinite(rr)[:, None] & ((zeta ** 2) * rr[:, None] > target[:, None])
+    b2 = _norm2(b)
+    b2 = torch.where(b2 > 0, b2, torch.ones_like(b2))
+    residual = torch.stack([
+        torch.sqrt(_norm2(b - apply(x[k]) - _bview(s[:, k], b).to(b.dtype) * x[k]) / b2) for k in range(K)])
+    return MultishiftResult(x, iterations.transpose(0, 1).contiguous(), residual)
