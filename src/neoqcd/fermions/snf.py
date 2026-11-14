@@ -36,6 +36,11 @@ mass in place of kappa (protocol parameter "mass", one solve per jump as for kap
 Z(lambda) ~ int dU det M_ee(m) exp(-S_g(U; beta, bc)); FieldState.phi is then the even-site
 staggered field. Nothing in this module depends on the fermion discretisation beyond that.
 
+Fast path: with `QCDAction(..., fast=True)` (Wilson) nothing changes here: the fast fermion term
+reads and writes phi as a full-lattice tensor (odd sites zero, as the reference even-odd term),
+so `FieldState.phi` has the same layout on both paths and round-trips exactly through
+`QCDAction.phi`; a kappa jump still costs one solve.
+
 Accumulators: `FieldState` carries `work`, `heat` and `logJ` per configuration, so a run can be
 continued from its final state; `FermionNEMCMC.forward` also returns W and Q of the run alone.
 """

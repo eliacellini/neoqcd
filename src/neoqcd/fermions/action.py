@@ -32,6 +32,12 @@ Wilson). A mass jump at fixed fields is S_pf(m_new) - S_pf(m_old), two CG solves
 NE-MCMC driver spends one, as for kappa); beta and bc are unchanged (gauge only, no solve). Z(m) is
 proportional to int dU det M_ee(m) exp(-S_g).
 
+Fast path (`QCDAction(..., fast=True)`, Wilson only): the fermion term is
+`ParametricFastTwoFlavourWilson`, the same set_kappa / set_phi / cache rules on top of
+`fast.FastTwoFlavourWilson`. Its operator (half-lattice links) is cached per links tensor and per
+VALUE of kappa, so a kappa change rebuilds it and a kappa jump still costs one solve; phi and X are
+stored on the even sites only but read and written as full-lattice tensors.
+
 kappa updates: `ParametricTwoFlavourWilson` is a `TwoFlavourWilson` with `set_kappa`. Nothing is
 cached per kappa in TwoFlavourWilson (the Dirac operator is rebuilt from `self.kappa` at every
 call), so changing kappa costs nothing; the only kappa-dependent cache is eta^dagger eta = S_pf at
@@ -43,17 +49,20 @@ kappa and only affects the iteration count).
 import torch
 
 from neoqcd.fermions._gauge import plaquette_fields
+from neoqcd.fermions.fast import FastTwoFlavourWilson, to_half
 from neoqcd.fermions.hmc import Hamiltonian, WilsonGaugeAction
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson
 from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion
 
-__all__ = ["PARAMETER_NAMES", "STAGGERED_PARAMETER_NAMES", "FERMION_TYPES", "bc_link_couplings",
-           "bc_plaquette_weights", "ParametricTwoFlavourWilson", "ParametricStaggeredPseudofermion",
-           "JointHamiltonian", "QCDAction"]
+__all__ = ["PARAMETER_NAMES", "STAGGERED_PARAMETER_NAMES", "FERMION_TYPES", "FAST_OPTIONS", "bc_link_couplings",
+           "bc_plaquette_weights", "ParametricTwoFlavourWilson", "ParametricFastTwoFlavourWilson",
+           "ParametricStaggeredPseudofermion", "JointHamiltonian", "QCDAction"]
 
 PARAMETER_NAMES = ("beta", "kappa", "bc")  # Wilson fermions (the default)
 STAGGERED_PARAMETER_NAMES = ("beta", "mass", "bc")
 FERMION_TYPES = ("wilson", "staggered")
+# keyword arguments of FastTwoFlavourWilson that the reference term does not take
+FAST_OPTIONS = ("precision", "check_every", "inner_tol", "max_outer", "colour_product")
 
 
 def _as_parameter(value):
@@ -109,11 +118,13 @@ def bc_plaquette_weights(defect_mask, bc, D):
     return weights
 
 
-class ParametricTwoFlavourWilson(TwoFlavourWilson):
-    """`TwoFlavourWilson` whose kappa can change between calls at fixed phi (module doc)."""
+class _ParametricKappa:
+    """set_kappa / set_phi and the kappa-tagged refresh cache, shared by the reference and the fast
+    parametric Wilson terms (mixed in before `TwoFlavourWilson` or `FastTwoFlavourWilson`)."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kappa = _as_parameter(self.kappa)  # private copy (cache tags compare by value)
         self._refresh_kappa = None
 
     def set_kappa(self, kappa):
@@ -135,6 +146,31 @@ class ParametricTwoFlavourWilson(TwoFlavourWilson):
         if _same_parameter(self.kappa, self._refresh_kappa):
             return super().action_difference(U_old, U_new)
         return self.action(U_new) - self.action(U_old)
+
+
+class ParametricTwoFlavourWilson(_ParametricKappa, TwoFlavourWilson):
+    """`TwoFlavourWilson` whose kappa can change between calls at fixed phi (module doc)."""
+
+
+class ParametricFastTwoFlavourWilson(_ParametricKappa, FastTwoFlavourWilson):
+    """`ParametricTwoFlavourWilson` on the fast path (`fast.FastTwoFlavourWilson`: half-lattice
+    operator, lean / mixed-precision CG), for `QCDAction(..., fast=True)`.
+
+    Same interface and cache rules: kappa is a private copy (`set_kappa`), the operator cache of
+    the fast term is keyed by the value of kappa (so a kappa change rebuilds the operator, a kappa
+    jump costs the one solve of the action), and eta^dagger eta of the refresh is reused only while
+    kappa equals the kappa of the refresh. `phi` / `X` read and write full-lattice tensors (odd
+    sites zero, the layout of the reference even-odd term), so `FieldState.phi` and checkpoints are
+    interchangeable with the reference path; `set_phi` refuses a field with nonzero odd sites
+    (it would be silently dropped by the half-lattice storage).
+    """
+
+    def set_phi(self, phi):
+        if phi is not None:
+            odd = to_half(phi, self.geometry, 1)
+            if bool((odd != 0).any()):
+                raise ValueError("the even-odd pseudofermion field must vanish on the odd sites")
+        super().set_phi(phi)
 
 
 class ParametricStaggeredPseudofermion(StaggeredPseudofermion):
@@ -209,8 +245,15 @@ class QCDAction:
             the layout of `utils.Defect`/`DefectMCMCAdapter`) unless bc stays 1 and the protocol
             is not "bc".
         n_gauge_substeps: inner gauge steps per outer fermion step of the Hamiltonians.
-        Extra keyword arguments go to `TwoFlavourWilson` (time_sign, even_odd, solver_tol, ...)
-        or `StaggeredPseudofermion` (time_sign, solver_tol, action_tol, max_iter, reuse_guess).
+        fast: Wilson only: the fermion term is `ParametricFastTwoFlavourWilson` (half-lattice
+            operator and lean CG of `fast.py`; same physics, action and force to the solver
+            tolerance, the same heat-bath draws); it then also takes `FAST_OPTIONS` (precision,
+            check_every, inner_tol, max_outer, colour_product), which are refused without it.
+            `hamiltonian(p)` is then the fast two-level Hamiltonian (fast fermion term outside,
+            gauge inside, as `fast.FastTwoFlavourHamiltonian`). ValueError for staggered fermions.
+        Extra keyword arguments go to `TwoFlavourWilson` (time_sign, even_odd, solver_tol, ...,
+        on_unconverged), `FastTwoFlavourWilson` (the same plus FAST_OPTIONS) or
+        `StaggeredPseudofermion` (time_sign, solver_tol, action_tol, max_iter, reuse_guess).
 
     Interface (that of a target for distributedPT/Flow):
         set_parameter(value), parameter;
@@ -226,9 +269,18 @@ class QCDAction:
     """
 
     def __init__(self, geometry, parameter_name, beta, kappa=None, bc=1.0, defect_mask=None,
-                 n_gauge_substeps=1, fermions="wilson", mass=None, **fermion_kwargs):
+                 n_gauge_substeps=1, fermions="wilson", mass=None, fast=False, **fermion_kwargs):
         if fermions not in FERMION_TYPES:
             raise ValueError(f"fermions must be one of {FERMION_TYPES}, got {fermions!r}")
+        fast = bool(fast)
+        if fast and fermions != "wilson":
+            raise ValueError("fast=True is for Wilson fermions only (no fast staggered term)")
+        extra = sorted(k for k in FAST_OPTIONS if k in fermion_kwargs)
+        if extra and not fast:
+            raise ValueError(f"{extra} are options of the fast path: pass fast=True")
+        if fast and not fermion_kwargs.get("even_odd", True):
+            raise ValueError("fast=True is even-odd only")
+        self.fast = fast
         names = PARAMETER_NAMES if fermions == "wilson" else STAGGERED_PARAMETER_NAMES
         if parameter_name not in names:
             raise ValueError(f"parameter_name must be one of {names} for {fermions} fermions, got {parameter_name!r}")
@@ -260,7 +312,8 @@ class QCDAction:
         self.defect_mask = defect_mask
         self.n_gauge_substeps = int(n_gauge_substeps)
         if fermions == "wilson":
-            self.fermion = ParametricTwoFlavourWilson(self.kappa, geometry, **fermion_kwargs)
+            cls = ParametricFastTwoFlavourWilson if fast else ParametricTwoFlavourWilson
+            self.fermion = cls(self.kappa, geometry, **fermion_kwargs)
         else:
             self.fermion = ParametricStaggeredPseudofermion(self.mass, geometry, **fermion_kwargs)
 

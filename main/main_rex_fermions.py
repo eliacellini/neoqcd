@@ -53,6 +53,10 @@ Output directory (--out, default output/rex_fermions/<auto name>):
     checkpoint.pt/.json links + run generator (`neoqcd.fermions.io.save_state`);
     rex_state.pt        labels, step count, swap counters, swap-generator state (atomic write).
 
+--fast (Wilson) and its options (--precision, --colour-product, --check-every, --inner-tol,
+--max-outer) and --on-unconverged are those of main_snf_fermions.py: the replicas use
+`QCDAction(fast=True)`; the fast settings are in run_meta.json and in the resume key.
+
 Two generators: the run generator (on the device: pseudofermions, momenta, Metropolis, translation)
 and a CPU generator for the swap uniforms, passed to `FermionREX(swap_generator=...)` (which keeps
 labels, swaps and history on the CPU, so the driver also runs on CUDA). Seeds
@@ -402,7 +406,7 @@ def main(argv=None):
 
     total = args.therm + args.steps
     params_json = {k: v for k, v in vars(args).items()}
-    info = run_info("main/main_rex_fermions.py", argv, device)
+    info = run_info("main/main_rex_fermions.py", argv, device, args)
     info.update(lattice=list(geometry.lattice), volume=geometry.volume, start_source=source, B=B,
                 fermions=args.fermions, mass=args.mass,
                 n_rungs=n_rungs, defect_links=int(defect_mask[1].sum().item()), obs_fields=list(OBS_FIELDS))

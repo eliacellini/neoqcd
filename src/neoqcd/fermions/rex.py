@@ -62,6 +62,10 @@ store it as the `defect_action` array of replica_history.npz.
 Swap uniforms of the distributed step: `ParallelTempering` draws them on rank 0 from the global
 generator of pt.device; `GlobalRNGStream` turns that into a private, checkpointable stream.
 
+Fast path: `FermionREXTarget` and `distributed_rex_step` take a `QCDAction(..., fast=True)` as it
+is (they only use its Hamiltonian and the gauge-only bc jump); `FermionREX` forwards `fast=True`
+and the fast options to its `QCDAction`. Swaps and tables do not involve the fermions at all.
+
 Seeds: `derived_seed(seed, *keys)` maps (run seed, rank, stream tag) to an independent 63-bit seed
 through `numpy.random.SeedSequence`, so runs with seeds s and s + 1 share no stream on any rank
 (the pure-gauge rule seed + rank makes seed s, rank 1 equal to seed s + 1, rank 0).
@@ -360,7 +364,9 @@ class FermionREX:
             with `swap_seed`, or, if that is None too, at the first `step` with one int64 drawn
             from the step's generator (from the global RNG if that is None). A resumable run
             passes its own generator and saves its state.
-        Extra keyword arguments go to `TwoFlavourWilson` (via QCDAction).
+        Extra keyword arguments go to `QCDAction` and its fermion term (`TwoFlavourWilson`), e.g.
+            `fast=True, precision="mixed", colour_product=..., check_every=...` for the fast
+            path (`ParametricFastTwoFlavourWilson`), or `fermions="staggered", mass=...`.
 
     Device: U and the HMC may live on CUDA; labels, swap table, swap uniforms and history are kept
     on the CPU (per-rung reductions run on the device, values are moved to the CPU when stored).

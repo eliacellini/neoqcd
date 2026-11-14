@@ -19,6 +19,10 @@ test shape. Ladder: world_size rungs, --ladder (aliases --ladder-file, --paramet
 the JSON file of main/optimal_ladder.py) or evenly spaced in [--bc-min, --bc-max] (the same
 `distributedPT.ladder_values` as main_pt_obc.py).
 
+--fast (Wilson) and its options (--precision, --colour-product, --check-every, --inner-tol,
+--max-outer) and --on-unconverged are those of main_snf_fermions.py: every rank's `QCDAction` is
+built with fast=True; the fast settings are in run_meta.json and in the resume key.
+
 Devices: --device cpu (Gloo), or cuda / auto: rank with LOCAL_RANK = l uses cuda:l (NCCL) with an
 explicit index (torch 2.0 cannot set_device("cuda") without one). A LOCAL_RANK beyond the visible
 GPUs is an error, and so is --device cuda:K with more than one local rank (every rank on GPU K),
@@ -587,7 +591,7 @@ def run(args, argv, device, backend):
     writer = comm.rank0(open_writer, f"opening {csv_path}")
 
     total = args.therm + args.steps
-    info = run_info("main/main_rex_fermions_distributed.py", argv, device)
+    info = run_info("main/main_rex_fermions_distributed.py", argv, device, args)
     info.update(lattice=list(geometry.lattice), volume=geometry.volume, start_source=source, backend=backend,
                 world_size=world, n_chains=C, fermions=args.fermions, mass=args.mass,
                 defect_links=int(defect_mask[1].sum().item()), obs_fields=list(OBS_FIELDS))

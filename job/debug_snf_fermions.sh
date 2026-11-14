@@ -21,6 +21,9 @@
 #   nemcmc  NE-MCMC, pool thermalised from cold (100 trajectories at kappa = 0.153), 256 samples;
 #   snf     stout (smearing) layers, starting from the pool checkpoint of `nemcmc` (no new
 #           thermalisation), 20 Adam steps on mean(W), then 128 samples.
+# Both points use the fast even-odd operator (--fast, fp64, default colour product); the output
+# directories end in _fast so no old non-fast checkpoint is resumed (the resume key refuses a
+# fast/non-fast mix anyway).
 # Outputs in output/snf_fermions/<name>/ (samples.csv, blocks.csv, training.csv, run_meta.json,
 # pool.*, flow.*). A point whose checkpoint exists is resumed (--resume); remove its directory to
 # restart. `snf` needs the pool of `nemcmc` (run both in one job, or nemcmc first).
@@ -42,13 +45,13 @@ export OMP_NUM_THREADS=1
 POINTS="${POINTS:-nemcmc snf}"
 SEED="${SEED:-1234}"
 BASE="output/snf_fermions"
-NEMCMC_OUT="${BASE}/nemcmc_kappa0.153to0.1545_n8_b5.6_4x4p3"
-SNF_OUT="${BASE}/snf_smearing_kappa0.153to0.1545_n8_b5.6_4x4p3"
+NEMCMC_OUT="${BASE}/nemcmc_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
+SNF_OUT="${BASE}/snf_smearing_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
 
 COMMON=(--D 4 --T 4 --L 4 --N 3 --beta 5.6 --kappa 0.153
         --protocol kappa --initial 0.153 --final 0.1545 --n-step 8
         --tau 1.0 --n-steps 8 --n-gauge-substeps 4 --integrator omelyan --n-traj 1
-        --batch 16 --n-between 1 --checkpoint-every 4)
+        --batch 16 --n-between 1 --checkpoint-every 4 --fast)
 
 run_point() {
   local out="$1"; shift

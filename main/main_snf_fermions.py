@@ -6,7 +6,15 @@ S(U, phi; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa) (`neoqcd.fermions.act
     --protocol ... --initial lambda_0 --protocol-file f                       (lambda_1 .. lambda_n).
 --mode nemcmc: `snf.FermionNEMCMC` (HMC blocks only, --layers none);
 --mode snf:    `snf_layers.FermionSNF` (a pure-gauge layer before every HMC block, --layers
-               smearing|residual, trained on mean(W) with Adam for --train-steps steps).
+               smearing|smearing_signed|residual, trained on mean(W) with Adam for --train-steps
+               steps; smearing_signed --rho-init 0 starts at the identity and trains, --lr-warmup
+               ramps the learning rate). Adam's first steps move every parameter by about --lr,
+               so --lr should be well below --rho-init.
+--fast (Wilson): `QCDAction(fast=True)`, the half-lattice operator and lean CG of
+`neoqcd.fermions.fast` (--precision, --colour-product, --check-every, --inner-tol, --max-outer as
+in main_hmc.py); same physics to the solver tolerance. The fast settings are in run_meta.json and
+in the resume key (a run is resumed only on the path it started on); pool/flow files have the same
+format on both paths.
 Each HMC block runs --n-traj fermionic HMC trajectories (fresh phi at every trajectory) at lambda_i.
 
 Starting configurations. A pool of --batch chains in equilibrium at lambda_0: from --start-config
@@ -24,7 +32,8 @@ spatial coordinates = --defect-space-slice), e.g. the 2-link defect of the tests
 Output directory (--out, default output/snf_fermions/<auto name>):
     samples.csv     one row per evaluated sample (SAMPLE_FIELDS);
     blocks.csv      one row per (evaluation batch, protocol step) (BLOCK_FIELDS);
-    training.csv    one row per training step (TRAIN_FIELDS), --mode snf only;
+    training.csv    one row per training step (TRAIN_FIELDS), --mode snf only; param_abs_mean is
+                    the mean |parameter| the step's flow ran with (before its optimizer step);
     run_meta.json   parameters + summary: Jarzynski dF = -log <exp(-W)> = -log Z_n/Z_0 with its
                     jackknife error, ESS = <e^-W>^2/<e^-2W>, mean work/heat/logJ, acceptance per
                     block, solves and CG iterations per sample, seconds per sample;
@@ -63,6 +72,7 @@ from main_hmc import _sync, choose_device  # noqa: E402
 
 from neoqcd.fermions._gauge import Defect, FlowPars, SUN_identity, create_mask  # noqa: E402
 from neoqcd.fermions.action import QCDAction  # noqa: E402
+from neoqcd.fermions.fast import resolve_colour_product  # noqa: E402
 from neoqcd.fermions.hmc import HMC, INTEGRATORS  # noqa: E402
 from neoqcd.fermions.io import (  # noqa: E402
     ObservableWriter,
@@ -79,7 +89,7 @@ from neoqcd.fermions.snf import (  # noqa: E402
     effective_sample_size,
     jarzynski_free_energy,
 )
-from neoqcd.fermions.snf_layers import FermionSNF, make_gauge_layers  # noqa: E402
+from neoqcd.fermions.snf_layers import LAYER_KINDS, FermionSNF, make_gauge_layers  # noqa: E402
 
 SAMPLE_FIELDS = (
     "batch",         # evaluation batch index
@@ -112,7 +122,9 @@ BLOCK_FIELDS = (
 
 TRAIN_FIELDS = (
     "step", "loss", "work_mean", "work_std", "ess", "heat_mean", "logJ_mean", "acceptance",
-    "grad_norm", "solves", "cg_iter", "wall_s", "lr", "param_abs_mean",
+    "grad_norm", "solves", "cg_iter", "wall_s",
+    "lr",              # learning rate of this step (after the --lr-warmup factor)
+    "param_abs_mean",  # mean |parameter| the flow of this step ran with (BEFORE its optimizer step)
 )
 
 POOL_NAME = "pool"
@@ -136,6 +148,22 @@ def add_physics_args(p):
     p.add_argument("--action-tol", type=float, default=None, help="CG relative residual (action solves).")
     p.add_argument("--max-iter", type=int, default=5000)
     p.add_argument("--no-reuse-guess", dest="reuse_guess", action="store_false")
+    p.add_argument("--fast", action="store_true",
+                   help="Wilson only: half-lattice operator and lean CG (neoqcd.fermions.fast, "
+                        "QCDAction(fast=True)); same physics. Part of the resume key.")
+    p.add_argument("--precision", choices=("double", "mixed"), default="double",
+                   help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
+    p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default=None,
+                   help="With --fast: SU(N) x spinor product; auto (default) = broadcast_sum on CUDA, matmul on CPU.")
+    p.add_argument("--check-every", type=int, default=None,
+                   help="With --fast: host convergence check of the CG every k iterations (default 10).")
+    p.add_argument("--inner-tol", type=float, default=None,
+                   help="With --precision mixed: relative tolerance of the complex64 inner solves (default 1e-6).")
+    p.add_argument("--max-outer", type=int, default=None,
+                   help="With --precision mixed: maximum outer (defect-correction) steps per solve (default 30).")
+    p.add_argument("--on-unconverged", choices=("raise", "warn", "ignore"), default=None,
+                   help="Wilson only: an unconverged CG solve raises (default), warns once per kind, or is "
+                        "only counted (neoqcd.fermions.pseudofermion, convergence policy).")
     p.add_argument("--tau", type=float, default=1.0, help="HMC trajectory length.")
     p.add_argument("--n-steps", type=int, default=6, help="Outer integrator steps per trajectory.")
     p.add_argument("--n-gauge-substeps", type=int, default=3)
@@ -165,16 +193,23 @@ def parse_args(argv=None):
     p.add_argument("--n-step", type=int, default=None, help="Protocol steps n of the linear protocol.")
     p.add_argument("--protocol-file", type=str, default=None, help="Text file with lambda_1 .. lambda_n.")
     p.add_argument("--mode", choices=("nemcmc", "snf"), default="nemcmc")
-    p.add_argument("--layers", choices=("none", "smearing", "residual"), default=None,
-                   help="Default: none for nemcmc, smearing for snf.")
+    p.add_argument("--layers", choices=("none",) + LAYER_KINDS, default=None,
+                   help="Default: none for nemcmc, smearing for snf. smearing_signed: stout with a signed "
+                        "rho (snf_layers.SignedCouplingLayer), trainable from --rho-init 0 (the identity).")
     p.add_argument("--rho-init", type=float, default=1e-3,
-                   help="Initial stout rho of the smearing layers (default 1e-3). Must be nonzero for "
-                        "training: the stout layer uses |rho|, so at rho = 0 exactly its parameter gradient "
-                        "is identically zero and the layers never move. Unused with --layers none or "
-                        "--mode nemcmc.")
+                   help="Initial stout rho of every slot of every smearing layer (default 1e-3), the value "
+                        "used by the first training step (param_abs_mean of training step 0). With --layers "
+                        "smearing it must be nonzero for training: that layer uses |rho|, whose gradient at "
+                        "rho = 0 is zero, so the layers would never move; use --layers smearing_signed "
+                        "--rho-init 0 for a trainable identity start. Unused with --layers none or residual.")
     p.add_argument("--load-flow", type=str, default=None, help="flow.pt of a previous snf run (layer weights).")
     p.add_argument("--train-steps", type=int, default=0)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="Adam learning rate. Adam's first steps move every parameter by about lr whatever "
+                        "the gradient size, so lr should be well below --rho-init (or use --lr-warmup).")
+    p.add_argument("--lr-warmup", type=int, default=0,
+                   help="Linear learning-rate warm-up: lr * min(1, (step + 1) / k) at training step `step` "
+                        "(0: off). Stateless in the step index, so a resume continues it exactly.")
     p.add_argument("--grad-clip", type=float, default=0.0, help="Clip the gradient norm (0: off).")
     p.add_argument("--batch", type=int, default=8, help="Configurations per flow run (training and evaluation).")
     p.add_argument("--eval-samples", type=int, default=64, help="Evaluated samples (rounded up to whole batches).")
@@ -185,6 +220,13 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     validate_args(args)
     return args
+
+
+def learning_rate(args, step):
+    """lr at training step `step` (0-based): linear warm-up over --lr-warmup steps, then --lr."""
+    if args.lr_warmup <= 0:
+        return float(args.lr)
+    return float(args.lr) * min(1.0, (step + 1) / float(args.lr_warmup))
 
 
 def parse_integrator(spec):
@@ -219,6 +261,34 @@ def validate_common(args):
             raise SystemExit("--kappa is for --fermions wilson (staggered fermions take --mass)")
         if args.mass is None or args.mass <= 0:
             raise SystemExit("--fermions staggered needs --mass > 0")
+    validate_fast(args)
+
+
+def validate_fast(args):
+    """The fast-path options, as main/main_hmc.py: --fast is Wilson only, its options need it,
+    --inner-tol / --max-outer need --precision mixed; defaults filled in afterwards."""
+    if args.fast and args.fermions != "wilson":
+        raise SystemExit("--fast is for --fermions wilson")
+    if args.precision != "double" and not args.fast:
+        raise SystemExit("--precision mixed needs --fast")
+    for name in ("colour_product", "check_every"):
+        if getattr(args, name) is not None and not args.fast:
+            raise SystemExit(f"--{name.replace('_', '-')} needs --fast")
+    for name in ("inner_tol", "max_outer"):
+        if getattr(args, name) is not None and args.precision != "mixed":
+            raise SystemExit(f"--{name.replace('_', '-')} needs --fast --precision mixed")
+    if args.on_unconverged is not None and args.fermions != "wilson":
+        raise SystemExit("--on-unconverged is for --fermions wilson")
+    args.colour_product = "auto" if args.colour_product is None else args.colour_product
+    args.check_every = 10 if args.check_every is None else args.check_every
+    args.inner_tol = 1e-6 if args.inner_tol is None else args.inner_tol
+    args.max_outer = 30 if args.max_outer is None else args.max_outer
+    if args.fermions == "wilson":  # the staggered term keeps its own behaviour (recorded as None)
+        args.on_unconverged = "raise" if args.on_unconverged is None else args.on_unconverged
+    if args.check_every < 1:
+        raise SystemExit("--check-every must be >= 1")
+    if args.max_outer < 1 or not args.inner_tol > 0:
+        raise SystemExit("--max-outer must be >= 1 and --inner-tol > 0")
 
 
 def fermion_parameter(args):
@@ -259,6 +329,11 @@ def validate_args(args):
         raise SystemExit("--mode snf needs --layers smearing or residual")
     if args.mode == "nemcmc" and (args.train_steps or args.load_flow):
         raise SystemExit("--train-steps / --load-flow need --mode snf")
+    if args.layers == "smearing" and args.rho_init == 0.0 and args.train_steps:
+        raise SystemExit("--layers smearing with --rho-init 0 cannot train (the gradient of |rho| vanishes at 0): "
+                         "use --layers smearing_signed for an identity start")
+    if args.lr_warmup < 0:
+        raise SystemExit("--lr-warmup must be >= 0")
     for name in ("batch", "n_traj"):
         if getattr(args, name) < 1:
             raise SystemExit(f"--{name.replace('_', '-')} must be >= 1")
@@ -322,8 +397,34 @@ def build_defect_mask(args, geometry):
 
 
 def staggered_key(args):
-    """Extra physics-key entries for staggered runs (none for Wilson: keys of Wilson runs unchanged)."""
-    return {"fermions": "staggered", "mass": float(args.mass)} if args.fermions == "staggered" else {}
+    """Extra physics-key entries for staggered runs (none for Wilson: keys of Wilson runs unchanged)
+    and for --fast runs (`fast_key`)."""
+    key = {"fermions": "staggered", "mass": float(args.mass)} if args.fermions == "staggered" else {}
+    key.update(fast_key(args))
+    return key
+
+
+def fast_key(args):
+    """Resume-key entries of the fast path: none without --fast (keys of reference runs unchanged,
+    so their checkpoints still resume), else fast, precision, colour product, check interval (and
+    the mixed-precision settings), so neither path resumes a checkpoint of the other: they agree
+    only to the solver tolerance, not bitwise."""
+    if not getattr(args, "fast", False):
+        return {}
+    key = {"fast": True, "precision": args.precision, "colour_product": args.colour_product,
+           "check_every": int(args.check_every)}
+    if args.precision == "mixed":
+        key.update(inner_tol=float(args.inner_tol), max_outer=int(args.max_outer))
+    return key
+
+
+def fast_info(args, device):
+    """run_meta.json "run" entries of the fermion operator (resolved colour product)."""
+    if not getattr(args, "fast", False):
+        return {"fermion_operator": "reference", "on_unconverged": getattr(args, "on_unconverged", None)}
+    return {"fermion_operator": "half_lattice_fast", "precision": args.precision,
+            "colour_product": resolve_colour_product(args.colour_product, device),
+            "check_every": args.check_every, "on_unconverged": args.on_unconverged}
 
 
 def action_kwargs(args):
@@ -341,8 +442,15 @@ def state_couplings(args, fpar0):
 
 
 def fermion_kwargs(args):
-    return dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
-                max_iter=args.max_iter, reuse_guess=args.reuse_guess)
+    """Keywords of the fermion term for QCDAction / FermionREX (the fast-path options with --fast)."""
+    kw = dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
+              max_iter=args.max_iter, reuse_guess=args.reuse_guess)
+    if args.fermions == "wilson":
+        kw["on_unconverged"] = args.on_unconverged
+    if getattr(args, "fast", False):
+        kw.update(fast=True, precision=args.precision, colour_product=args.colour_product,
+                  check_every=args.check_every, inner_tol=args.inner_tol, max_outer=args.max_outer)
+    return kw
 
 
 def start_links(args, geometry, device, batch, beta0, kappa0, bc0):
@@ -379,8 +487,9 @@ def clean_json(x):
     return x
 
 
-def run_info(script, argv, device):
-    return {
+def run_info(script, argv, device, args=None):
+    """The "run" block of run_meta.json (with the fermion-operator entries of `fast_info` if args)."""
+    info = {
         "script": script, "argv": list(sys.argv[1:] if argv is None else argv),
         "started": datetime.now().isoformat(timespec="seconds"), "device": str(device),
         "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else platform.processor(),
@@ -388,6 +497,9 @@ def run_info(script, argv, device):
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "torch_threads": torch.get_num_threads(),
         "dtype": "complex128",
     }
+    if args is not None:
+        info.update(fast_info(args, device))
+    return info
 
 
 def _log(args, *msg):
@@ -584,7 +696,7 @@ def main(argv=None):
 
     n_batches = -(-args.eval_samples // args.batch) if args.eval_samples else 0
     params_json = {k: v for k, v in vars(args).items()}
-    info = run_info("main/main_snf_fermions.py", argv, device)
+    info = run_info("main/main_snf_fermions.py", argv, device, args)
     info.update(lattice=list(geometry.lattice), volume=geometry.volume, start_source=source,
                 fermions=args.fermions, mass=args.mass,
                 initial_couplings={"beta": beta0, fermion_parameter(args)[0]: kappa0, "bc": bc0},
@@ -635,6 +747,11 @@ def main(argv=None):
             _sync(device)
             t0 = time.perf_counter()
             optimizer.zero_grad()
+            lr = learning_rate(args, step)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            # the parameters this step's flow runs with (before the optimizer step)
+            param_abs_mean = float(torch.cat([p.detach().abs().reshape(-1) for p in params]).mean())
             _, W, Q, logJ, _ = flow(FieldState(pool.U.clone()), generator)
             loss = flow.loss(W)
             loss.backward()
@@ -653,8 +770,7 @@ def main(argv=None):
                    "ess": effective_sample_size(Wd) if Wd.numel() > 1 else 1.0,
                    "heat_mean": float(Q.mean()), "logJ_mean": float(logJ.mean()), "acceptance": acc,
                    "grad_norm": grad_norm, "solves": solves, "cg_iter": cg_iter, "wall_s": wall,
-                   "lr": optimizer.param_groups[0]["lr"],
-                   "param_abs_mean": float(torch.cat([p.detach().abs().reshape(-1) for p in params]).mean())}
+                   "lr": lr, "param_abs_mean": param_abs_mean}
             writers["training"].write_rows([row])
             _log(args, f"train {step:5d} loss {row['loss']:+.5f} ess {row['ess']:.3f} acc {acc:.2f} "
                        f"|g| {grad_norm:.2e} solves {solves} {wall:.2f} s")

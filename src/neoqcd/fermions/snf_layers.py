@@ -74,35 +74,51 @@ kappa replaced by the mass (`QCDAction.fermion_parameter_name`), and the force f
 F = 2 staggered_hopping_derivative(op, X, K_oe X) with X = M_ee^-1 phi (its algebra gradient
 convention is that of `TwoFlavourWilson.force`, so the backward G = i F U is unchanged). A mass
 jump costs one solve, as a kappa jump. The fermion term type is dispatched by isinstance.
+
+Fast Wilson (`QCDAction(..., fast=True)`, `fast.FastTwoFlavourWilson`): `PseudofermionAction`
+solves on the half lattice (phi_e, X_e), S = Re phi_e^dagger X_e, and the force from the same X_e
+(`FastTwoFlavourWilson.force_from_solution`, built on `HalfLatticeWilson.hopping_derivative`); the
+backward i F U is unchanged. Equal to the reference path to the solver tolerance (unit tests).
+
+Identity start (`make_gauge_layers(..., kind="smearing_signed", rho=0)`, `SignedCouplingLayer`):
+the pure-gauge stout layer uses |rho|, whose gradient vanishes at rho = 0, so a layer starting at
+the identity never trains; the signed variant passes rho itself to the stout map (linear in rho
+through the staples, exact log-Jacobian unchanged), so rho = 0 is the identity and a regular point.
 """
 
 import warnings
 
 import torch
 
-from neoqcd.fermions._gauge import (CouplingLayer, ResidualCouplingLayer, mean_plaquette,
+from neoqcd.fermions._gauge import (CouplingLayer, ResidualCouplingLayer, Smearing, mean_plaquette,
                                     plaquette_fields)
 from neoqcd.fermions.action import _as_parameter, _same_parameter
+from neoqcd.fermions.fast import FastTwoFlavourWilson
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson, hopping_derivative
 from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion, staggered_hopping_derivative
 from neoqcd.fermions.snf import OBSERVABLES, FieldState, HMCBlock
 
 __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "FermionLayerBlock",
-           "FermionSNF", "make_gauge_layers"]
+           "FermionSNF", "make_gauge_layers", "SignedSmearing", "SignedCouplingLayer", "LAYER_KINDS"]
 
 
 def _fermion_kind(fermion):
-    """"wilson" or "staggered" from the type of the fermion term (dispatch of this module)."""
+    """"wilson" (reference `TwoFlavourWilson`), "wilson_fast" (`fast.FastTwoFlavourWilson`, half-
+    lattice phi and X) or "staggered" from the type of the fermion term (dispatch of this module).
+    Hasenbusch terms and unknown types raise TypeError."""
     from neoqcd.fermions.hasenbusch import RatioWilsonTerm  # lazy: avoids an import cycle
     if isinstance(fermion, RatioWilsonTerm):
         raise TypeError(f"{type(fermion).__name__}: Hasenbusch terms are not supported in the SNF layers "
                         "yet (PseudofermionAction would return the plain TwoFlavourWilson S_pf, which is wrong)")
     if isinstance(fermion, StaggeredPseudofermion):
         return "staggered"
+    if isinstance(fermion, FastTwoFlavourWilson):  # before TwoFlavourWilson: it is a subclass
+        return "wilson_fast"
     if isinstance(fermion, TwoFlavourWilson):
         return "wilson"
     raise TypeError(f"unsupported fermion term {type(fermion).__name__}: PseudofermionAction handles "
-                    "TwoFlavourWilson and StaggeredPseudofermion (and their parametric subclasses)")
+                    "TwoFlavourWilson, FastTwoFlavourWilson and StaggeredPseudofermion (and their "
+                    "parametric subclasses)")
 
 
 def _staggered_force_from_solution(op, X):
@@ -114,9 +130,13 @@ def _staggered_force_from_solution(op, X):
 
 def _force_from_solution(fermion, op, X):
     """The force of `TwoFlavourWilson.force` (or `StaggeredPseudofermion.force`) from a given
-    solution X = M^-1 phi (no new solve)."""
-    if _fermion_kind(fermion) == "staggered":
+    solution X = M^-1 phi (no new solve). For the fast term X is the half-lattice solution and op
+    its `HalfLatticeWilson` (`FastTwoFlavourWilson.force_from_solution`)."""
+    kind = _fermion_kind(fermion)
+    if kind == "staggered":
         return _staggered_force_from_solution(op, X)
+    if kind == "wilson_fast":
+        return fermion.force_from_solution(op, X)
     if fermion.even_odd:
         w = op.wilson
         Y = op.apply(X)
@@ -139,7 +159,10 @@ class PseudofermionAction(torch.autograd.Function):
     used. Staggered: `fermion` a `StaggeredPseudofermion` (or `ParametricStaggeredPseudofermion`),
     S = phi^dagger M_ee(m)^-1 phi at its current mass, force F = 2 staggered_hopping_derivative(
     op, X, K_oe X) from the same solve X = M_ee^-1 phi (`staggered_pseudofermion` module doc); any
-    other fermion type raises TypeError. Forward: one CG solve at `fermion.action_tol`, S = Re phi^dagger X, (B,) float64; if U
+    other fermion type raises TypeError. Fast Wilson (`fast.FastTwoFlavourWilson`, e.g. the term
+    of `QCDAction(..., fast=True)`): the same S and F from one half-lattice solve (phi and X on the
+    even sites, force by `HalfLatticeWilson.hopping_derivative`); the backward is unchanged.
+    Forward: one CG solve at `fermion.action_tol`, S = Re phi^dagger X, (B,) float64; if U
     requires grad, the force F at U is computed from the same X and saved (so later changes of
     fermion.phi or kappa do not affect the backward). Backward: dS/dU = grad_out * i F U
     (module doc), no backpropagation through CG.
@@ -147,11 +170,14 @@ class PseudofermionAction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, U, fermion):
-        _fermion_kind(fermion)  # TypeError for unknown fermion terms
-        op = fermion.operator(U)
+        kind = _fermion_kind(fermion)  # TypeError for unknown fermion terms
+        # the fast term caches its operator per links tensor: give it a detached view, so the cache
+        # never holds the autograd graph of a layer output
+        op = fermion.operator(U.detach() if kind == "wilson_fast" else U)
         fermion.stats["action_calls"] += 1
         X = fermion._solve(op, fermion.action_tol)
-        S = (fermion.phi.conj() * X).real.reshape(X.shape[0], -1).sum(1)
+        phi = fermion._phi_h if kind == "wilson_fast" else fermion.phi  # the layout of X
+        S = (phi.conj() * X).real.reshape(X.shape[0], -1).sum(1)
         if ctx.needs_input_grad[0]:
             fermion.stats["force_calls"] += 1
             F = _force_from_solution(fermion, op, X)
@@ -261,14 +287,49 @@ class FermionLayerBlock(torch.nn.Module):
         return new_state, dW, S_new, dlogJ
 
 
+class SignedSmearing(Smearing):
+    """`Smearing` with a signed rho: the stout coefficient of every mask block is rho itself, not
+    |rho| (`Smearing._mask_rho`). The stout map and its exact log-Jacobian are linear in rho
+    through the staples C = sum rho_p staple_p, so nothing else depends on the sign; for the small
+    |rho| of an identity start the map is invertible for either sign. Plain trainable rho only
+    (no hyper-smearing, no rho functional, no fit_train)."""
+
+    def _mask_rho(self, rho_runtime, batched_rho, sm, m):
+        if self.use_hyper_smearing:
+            return super()._mask_rho(rho_runtime, batched_rho, sm, m)
+        return rho_runtime[sm, m, :]
+
+
+class SignedCouplingLayer(CouplingLayer):
+    """`CouplingLayer` with a signed stout parameter (`SignedSmearing`): rho = 0 is the identity
+    map AND a regular point of the parametrisation (d U'/d rho != 0 there), so a layer can start
+    exactly at the identity and still be trained. With the pure-gauge |rho| the gradient at
+    rho = 0 vanishes identically (torch's d|x|/dx = sign(x) = 0 at 0) and a zero-initialised layer
+    never moves. For rho > 0 it is the same map as `CouplingLayer`. The state_dict has the same
+    keys ("rho_layer"); a signed checkpoint loaded into a `CouplingLayer` would act as |rho|."""
+
+    def __init__(self, flow_pars, rho_layer, time):
+        if (int(getattr(flow_pars, "fit_train", 0)) != 0 or getattr(flow_pars, "use_hyper_smearing", False)
+                or getattr(flow_pars, "use_rho_functional", False) or getattr(flow_pars, "use_nn", False)):
+            raise ValueError("SignedCouplingLayer needs a plain trainable rho (no fit_train, hyper-smearing, "
+                             "rho functional or NN staples)")
+        super().__init__(flow_pars, rho_layer, time)
+        self.smearing = SignedSmearing(flow_pars, time)
+
+
+LAYER_KINDS = ("smearing", "smearing_signed", "residual")
+
+
 def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3):
     """One pure-gauge layer per protocol step, as `Flow.__init__` builds them for flow_type='snf'
     (time (i+1)/n): kind "smearing" -> `CouplingLayer` with rho_layer = rho * ones(rho_shape)
-    (a float or a tensor of shape rho_shape), "residual" -> `ResidualCouplingLayer`.
+    (a float or a tensor of shape rho_shape), "smearing_signed" -> `SignedCouplingLayer` (same,
+    with a signed rho: trainable from rho = 0, the identity), "residual" -> `ResidualCouplingLayer`.
 
-    The default rho is small but nonzero: the stout layer uses |rho| (`Smearing._mask_rho`), whose
-    gradient at rho = 0 exactly is zero, so layers built with rho = 0 are silently untrainable.
-    Pass rho = 0.0 explicitly for the identity layers (the NE-MCMC limit)."""
+    The default rho is small but nonzero: the stout layer of kind "smearing" uses |rho|
+    (`Smearing._mask_rho`), whose gradient at rho = 0 exactly is zero, so "smearing" layers built
+    with rho = 0 are silently untrainable (pass rho = 0.0 explicitly for fixed identity layers,
+    the NE-MCMC limit). For an identity start that trains, use kind "smearing_signed" with rho = 0."""
     n = int(flow_pars.nstep)
     layers = []
     for i in range(n):
@@ -276,6 +337,8 @@ def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3):
         r = r.to(flow_pars.device)
         if kind == "smearing":
             layers.append(CouplingLayer(flow_pars, r, (i + 1) / n))
+        elif kind == "smearing_signed":
+            layers.append(SignedCouplingLayer(flow_pars, r, (i + 1) / n))
         elif kind == "residual":
             layers.append(ResidualCouplingLayer(flow_pars, r, (i + 1) / n))
         else:

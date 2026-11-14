@@ -21,6 +21,9 @@
 # DEO swaps, periodic translation of the bc = 1 replica, 50 thermalisation + 200 measured steps.
 # Start: cold, or the NE-MCMC pool of job/debug_snf_fermions.sh at kappa = 0.153 if it exists
 # (equilibrium at bc = 1; the open rungs thermalise during --therm).
+# Fast even-odd operator (--fast, fp64); the output directory ends in _fast so no old non-fast
+# checkpoint is resumed. The start pool is that of the fast NE-MCMC pilot (links only: the format
+# is the same for both paths).
 # Outputs in output/rex_fermions/<name>/ (observables.csv, replica_history.npz, run_meta.json,
 # checkpoint.*, rex_state.pt). An existing checkpoint is resumed (--resume); a job killed before
 # its first checkpoint restarts from scratch (the driver deletes its own partial files).
@@ -39,8 +42,8 @@ echo "=== worktree $PWD commit $(git rev-parse HEAD)"
 export OMP_NUM_THREADS=1
 
 SEED="${SEED:-1234}"
-OUT="output/rex_fermions/rex_r3_c4_line2_b5.6_k0.153_4x4p3"
-POOL="output/snf_fermions/nemcmc_kappa0.153to0.1545_n8_b5.6_4x4p3/pool"
+OUT="output/rex_fermions/rex_r3_c4_line2_b5.6_k0.153_4x4p3_fast"
+POOL="output/snf_fermions/nemcmc_kappa0.153to0.1545_n8_b5.6_4x4p3_fast/pool"
 
 extra=()
 if [[ -f "${OUT}/checkpoint.json" ]]; then
@@ -54,4 +57,4 @@ srun python main/main_rex_fermions.py --device cuda --seed "$SEED" --out "$OUT" 
   --D 4 --T 4 --L 4 --N 3 --beta 5.6 --kappa 0.153 \
   --ladder 0,0.5,1 --defect-shape line --defect-size 2 --n-chains 4 \
   --tau 1.0 --n-steps 8 --n-gauge-substeps 4 --integrator omelyan \
-  --therm 50 --steps 200 --swap-parity alternating --periodic-translation --checkpoint-every 25 "$@"
+  --therm 50 --steps 200 --swap-parity alternating --periodic-translation --checkpoint-every 25 --fast "$@"

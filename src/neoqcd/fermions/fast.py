@@ -692,8 +692,11 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
 
     Internally `phi` and `X` are half-lattice fields (`_phi_h`, `_X_h`); the attributes `phi`
     and `X` read/write full-lattice tensors (odd sites zero) for compatibility. `_solve(op, tol)`
-    takes a `HalfLatticeWilson` and returns the half-lattice X, so code that mixes `_solve` with
-    full-lattice phi (snf_layers.PseudofermionAction) must keep using the reference class.
+    takes a `HalfLatticeWilson` and returns the half-lattice X, so code that calls `_solve`
+    directly must pair it with the half-lattice `_phi_h` (as `snf_layers.PseudofermionAction` does
+    for this class, with `force_from_solution` for the force of the same solve).
+    The parametric variant (set_kappa / set_phi, for `QCDAction(..., fast=True)`) is
+    `action.ParametricFastTwoFlavourWilson`.
     The operator (and its complex64 copy) is cached per links tensor (identity and `_version`)
     and per value of every parameter that defines it (kappa, time_sign, colour_product, geometry),
     so changing `term.kappa` or `term.time_sign` between calls takes effect. Writes through
@@ -824,6 +827,13 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
         self.stats["force_calls"] += 1
         op = self.operator(U)
         X = self._solve_as("force", op, self.solver_tol)
+        return self.force_from_solution(op, X)
+
+    @staticmethod
+    def force_from_solution(op, X):
+        """The force of `force` from a given half-lattice solution X = (D_hat^dagger D_hat)^-1 phi
+        and its operator `op` (no solve): used by `force` and by `snf_layers.PseudofermionAction`,
+        which takes the action and the force from the same solve."""
         W = op.hop(X, 1)
         Y = op.hop(W, 0).mul_(-op._k2).add_(X)
         Z = op.hop(Y, 1, dagger=True)

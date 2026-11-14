@@ -22,6 +22,8 @@
 # [0, 1] (or LADDER=<json of main/optimal_ladder.py>), 4 independent ladders per rank, alternating
 # swaps, periodic translation of the bc = 1 replica; 20 thermalisation trajectories without swaps,
 # then 100 REX steps. Cold start.
+# Fast even-odd operator (--fast, fp64); the default output directory ends in _fast so no old
+# non-fast checkpoint is resumed (the resume key refuses a fast/non-fast mix anyway).
 # Outputs in output/rex_fermions_distributed/<name>/ (observables.csv, replica_history.npz,
 # run_meta.json, checkpoint_step.json, rankNNN/checkpoint_{0,1}.*, rankNNN/rex_state_{0,1}.pt).
 # A committed checkpoint (checkpoint_step.json) is resumed (--resume), so resubmitting extends a run
@@ -50,7 +52,7 @@ MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
 SEED="${SEED:-1234}"
-OUT="${OUT:-output/rex_fermions_distributed/rexd_r${NPROC}_c4_cube2_b5.6_k0.153_4x4p3}"
+OUT="${OUT:-output/rex_fermions_distributed/rexd_r${NPROC}_c4_cube2_b5.6_k0.153_4x4p3_fast}"
 
 extra=()
 if [[ -f "${OUT}/checkpoint_step.json" ]]; then
@@ -73,4 +75,4 @@ srun python -m torch.distributed.run \
   --defect-shape cube --defect-size 2 --time-slice 0 --space-slice 1 --n-chains 4 \
   --tau 1.0 --n-steps 8 --n-gauge-substeps 4 --integrator omelyan \
   --therm 20 --steps 100 --swap-parity alternating --periodic-translation \
-  --checkpoint-every 25 --log-every 10 --max-run-minutes 25 "$@"
+  --checkpoint-every 25 --log-every 10 --max-run-minutes 25 --fast "$@"

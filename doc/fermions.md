@@ -23,8 +23,9 @@ This page describes the code as it is. The plan holds the motivation and the lit
   small determinant det A_oo, clover Hamiltonian, exact-determinant Metropolis.
 - RHMC for rooted staggered fermions (`rhmc.py`, `rational.py`): multishift CG, Zolotarev and
   Remez rational approximations, N_f = 2 in 4D, also at light masses.
-- An opt-in fast path for N_f = 2 Wilson (`fast.py`, `main_hmc.py --fast`): half-lattice
-  even-odd operator, lean and mixed-precision CG (§5b).
+- An opt-in fast path for N_f = 2 Wilson (`fast.py`, `--fast` in `main_hmc.py`, the SNF and both
+  REX drivers; `QCDAction(..., fast=True)`): half-lattice even-odd operator, lean and
+  mixed-precision CG (§5b).
   (Hasenbusch, clover and RHMC are implemented and reviewed; status in `fermions_plan.md`,
   "Aggiornamento del 13/14 novembre".)
 - `QCDAction`: one parametric joint action S(U, φ; λ) with λ ∈ {β, κ, bc} (Wilson) or
@@ -53,8 +54,9 @@ at 4^4, β = 1.0, κ = 0.1 and at 8^4, β = 5.6, κ = 0.153 (§5b).
 - O-REX and NEO-REX with fermions (out of this plan).
 - The 8^4, β = 5.6, κ = 0.1545 point (openQCD reference 0.5687(3) available) and the
   comparison with Grid. The 4^4 and 8^4 κ = 0.153 openQCD comparisons are done (§5b).
-- CUDA: `main_hmc.py` (reference and `--fast`) has run on an A100; the SNF/REX drivers and the
-  fast path outside `main_hmc.py` have not.
+- CUDA: `main_hmc.py` (reference and `--fast`) and the SNF/REX drivers (reference) have run on an
+  A100; the fast path outside `main_hmc.py` (QCDAction/NE-MCMC/SNF/REX, `--fast` in the SNF and REX
+  drivers) is tested on the CPU only.
 - A line-of-constant-physics protocol. The β protocols at fixed κ are algorithmic only, since
   the quark mass changes. The β interval (5.45 → 5.6) is open until t0 is measured.
 
@@ -299,9 +301,14 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 
 - Protocol: `--protocol beta|kappa|bc` with `--initial --final --n-step` (linear) or
   `--protocol-file`.
-- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|residual --rho-init` (default 1e-3;
-  ρ = 0 cannot train) `--train-steps --lr
-  --grad-clip --load-flow`.
+- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|smearing_signed|residual --rho-init`
+  (default 1e-3; with `smearing` ρ = 0 cannot train and is refused for training,
+  `smearing_signed --rho-init 0` is a trainable identity start) `--train-steps --lr --lr-warmup
+  --grad-clip --load-flow`. `param_abs_mean` in training.csv is the mean |ρ| the step ran with
+  (before its optimizer step).
+- Solver and fast path: `--solver-tol --action-tol --max-iter --no-reuse-guess --on-unconverged`
+  and `--fast --precision --colour-product --check-every --inner-tol --max-outer` (§5b; part of the
+  resume key; also in the two REX drivers).
 - Sampling: `--batch --eval-samples`, `--n-traj` (HMC trajectories per block), `--n-between`
   (pool trajectories at λ_0 between flow runs).
 - Starting pool: `--start-config` (a `main_hmc`/pool checkpoint) and `--therm`.
@@ -338,11 +345,12 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 - `job/debug_snf_fermions.sh` (`POINTS="nemcmc snf"`), 4^4, β = 5.6, κ 0.153 → 0.1545 in 8 steps:
   - nemcmc: 100 thermalisation trajectories and 256 samples.
   - snf: starts from the nemcmc pool, 20 Adam steps with stout layers (ρ_init = 1e-3), then 128 samples.
+  - Both with `--fast`; output directories end in `_fast` (no old non-fast checkpoint is resumed).
 - `job/debug_rex_fermions.sh`: 4^4, β = 5.6, κ = 0.153, a 2-link line defect, ladder bc = 0, 0.5, 1,
   4 ladders, DEO swaps with translation, 50 + 200 steps. It starts from the SNF nemcmc pool if
-  present.
+  present. `--fast`, directory ending in `_fast` (as `job/debug_rex_fermions_distributed.sh`).
 
-## 5b. Fast path (`fast.py`, `main_hmc.py --fast`)
+## 5b. Fast path (`fast.py`; `--fast` in all Wilson drivers; `QCDAction(..., fast=True)`)
 
 **What it is.** `FastTwoFlavourWilson` is `TwoFlavourWilson` (even-odd) with the same heat-bath
 draws, action and force to the solver tolerance, computed differently:
@@ -383,10 +391,43 @@ plaquette = 3 × ours, converted):
 | 4^4, β = 1.0, κ = 0.1 | 0.060765(28) | 0.06084(19) fast (0.06091(19) reference) |
 | 8^4, β = 5.6, κ = 0.153 | 0.5661(5) | 0.56609(29) fast (16 replicas, trajectories 121-342) |
 
+**Where it is used.** The reference classes stay the default and the ground truth; the fast path
+is opt-in everywhere and tested for equality against them (`test_fermions_fast`,
+`test_fermions_fast_action`).
+
+- `main_hmc.py --fast`: `FastTwoFlavourHamiltonian`.
+- `QCDAction(..., fast=True, precision=..., colour_product=..., check_every=..., inner_tol=...,
+  max_outer=...)` (Wilson only; ValueError for staggered, and for fast-only options without
+  `fast=True`): the fermion term is `ParametricFastTwoFlavourWilson` (`action.py`), the fast term
+  with the `set_kappa` / `set_phi` / κ-tagged η†η cache of `ParametricTwoFlavourWilson` (one mixin
+  for both). `hamiltonian(p)` is the fast two-level Hamiltonian. All three protocols work; a κ
+  jump costs one solve (the operator cache is keyed by the value of κ, so it is rebuilt, not
+  reused stale). `phi` / `X` are read and written as full-lattice tensors (odd sites zero), so
+  `FieldState.phi` round-trips exactly and checkpoints are interchangeable; `set_phi` refuses a
+  field with nonzero odd sites.
+- NE-MCMC, SNF, REX: `FermionNEMCMC` and `FermionSNF` take the fast `QCDAction` as it is;
+  `FermionREX(..., fast=True, precision=...)` passes the options to its `QCDAction`;
+  `FermionREXTarget` / `distributed_rex_step` take a fast `QCDAction`.
+- SNF layers: `PseudofermionAction` dispatches on the fermion type (`_fermion_kind`: "wilson",
+  "wilson_fast", "staggered"; Hasenbusch terms still rejected). For the fast term the action
+  Re φ_e†X_e and the force come from the same half-lattice solve
+  (`FastTwoFlavourWilson.force_from_solution`, i.e. `HalfLatticeWilson.hopping_derivative`);
+  the backward is unchanged (i F U, no CG backpropagation).
+- Drivers: `main_snf_fermions.py`, `main_rex_fermions.py`, `main_rex_fermions_distributed.py`
+  take `--fast --precision --colour-product --check-every --inner-tol --max-outer` (rules of
+  `main_hmc.py`) and `--on-unconverged` (Wilson, reference or fast). The fast settings are in
+  run_meta.json (`parameters`; `run.fermion_operator`, resolved `run.colour_product`) and in the
+  resume key: a run started without `--fast` is not resumed with it, nor vice versa (the two
+  agree to the solver tolerance, not bitwise). Reference runs have unchanged keys, so their old
+  checkpoints still resume. Pool / link checkpoints have the same format on both paths.
+- Measured on the CPU (2D 4×4 SU(3), tight tolerances): fast and reference runs give the same
+  accept/swap decisions and works, actions, swap tables and observables within 1e-8.
+
 **Limits.**
 
-- Only `main_hmc.py` uses it; action/SNF/REX use the reference classes
-  (`snf_layers.PseudofermionAction` mixes `_solve` with full-lattice φ).
+- Cost columns of the SNF/REX drivers (`solves`, `cg_iter`) are the same counters on both paths;
+  with `--precision mixed` `cg_iter` counts complex64 inner iterations, not the outer complex128
+  applications (only `main_hmc.py` reports the real mixed cost).
 - Without per-sample masking every sample of the batch iterates until the slowest has
   converged, so a sample's solution depends on the batch composition at the level of the solver
   tolerance: chains are not bit-reproducible across batch sizes. Resume is bitwise at a fixed
@@ -432,7 +473,8 @@ largest residual per trajectory.
   only on Gloo/CPU.
 - **Hasenbusch.** On 2D 4×4 the two-term HMC gives no cost saving at equal acceptance; the
   choice of κ' and of the layout is to be measured on 4^4/8^4. Not yet wired into the drivers.
-- **CUDA in general.** Only `main_hmc.py` (reference and `--fast`) has run on a GPU (A100).
+- **CUDA in general.** `main_hmc.py` (reference and `--fast`) and the SNF/REX drivers (reference)
+  have run on a GPU (A100); the fast path in the SNF/REX drivers has not yet.
   Generators must be on the device (`torch.Generator(device=U.device)`). `stats["acceptance"]` syncs once per trajectory.
 - **Exact tools.** `ExactMetropolis` recomputes a dense determinant per proposal, which is
   practical only up to about 2^3×4 in a unit test. Exact log det on 4^4 even-odd is 1536² and
@@ -447,6 +489,15 @@ largest residual per trajectory.
     exact Haar log-Jacobian (relative error ~1e-3 at ρ = 0.01-0.1), so SU(2) stout SNF is only
     approximately Jarzynski-exact. SU(3) is exact to ~1e-14 (unit test).
   - The stout layer uses |ρ|, whose gradient vanishes at ρ = 0, hence the default ρ = 1e-3.
+    `--layers smearing_signed` (`snf_layers.SignedCouplingLayer`, a `Smearing` subclass with a
+    signed ρ; the map and its exact log-Jacobian are linear in ρ through the staples, checked
+    against the dense Haar Jacobian at negative ρ) starts at the identity with `--rho-init 0`
+    and trains; `--lr-warmup k` ramps the learning rate linearly over k steps.
+  - Adam's first steps move every parameter by about lr whatever the gradient: with lr = ρ_init
+    (the 14 November GPU pilot, lr = ρ_init = 1e-3) step 0 sends each ρ to ≈ 0 or ≈ 2ρ_init.
+    `param_abs_mean` in training.csv is the value the step's flow ran with (before its optimizer
+    step; before 14 November it was logged after it, which is why the pilot showed 1.5625e-4 =
+    5 × 2e-3 / 64 at step 0).
   - The protocol is a list of floats; per-configuration (B,) protocols are accepted by the
     NE-MCMC only.
 - **Pool correlation.** The SNF driver's consecutive batches are correlated through the pool's
