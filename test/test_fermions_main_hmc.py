@@ -145,6 +145,53 @@ class MainHMCTest(unittest.TestCase):
             MAIN.main(["--D", "4", "--T", "8", "--L", "8", "--kappa", "0.153", "--exact-logdet",
                        "--device", "cpu", "--quiet", "--out", str(self.tmp / "big")])
 
+    @staticmethod
+    def _ar1(seed=33, phi=0.5, n=50, B=16):
+        """AR(1) series (tau_int ~ 1.5-3) that makes Obs.gamma_method raise in _compute_drho
+        (odd w_max = 25: the mirrored rho slice is one element short)."""
+        rng = np.random.default_rng(seed)
+        x = np.zeros((n, B))
+        for t in range(1, n):
+            x[t] = phi * x[t - 1] + rng.normal(size=B)
+        return x
+
+    def test_gamma_summary_falls_back_when_gamma_method_raises(self):
+        x = self._ar1()
+        s = MAIN.gamma_summary(x, S=2.0)
+        self.assertTrue(s["status"].startswith("gamma_failed: "), s["status"])
+        self.assertAlmostEqual(s["value"], float(x.mean()))
+        self.assertEqual(s["error_method"], "replica_means")
+        self.assertAlmostEqual(s["error"], float(x.mean(axis=0).std(ddof=1) / 4.0))
+        self.assertEqual(sorted(s["binned_errors"], key=int), ["1", "2", "4", "8", "16"])
+        # forced failure through a monkeypatched Obs method (independent of the obs.py bug)
+        from neoqcd import obs as obs_mod
+        orig = obs_mod.Obs.gamma_method
+        try:
+            obs_mod.Obs.gamma_method = lambda self, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+            s = MAIN.gamma_summary(self._ar1(seed=0), S=2.0)
+        finally:
+            obs_mod.Obs.gamma_method = orig
+        self.assertEqual(s["status"], "gamma_failed: RuntimeError: boom")
+        self.assertIsNotNone(s["error"])
+
+    def test_summary_failure_does_not_kill_checkpoint_and_stale_meta_resumes(self):
+        out = self.tmp / "run"
+        orig = MAIN.summarize
+        try:
+            MAIN.summarize = lambda *a, **k: (_ for _ in ()).throw(ValueError("broken stats"))
+            MAIN.main(WILSON + ["--n-traj", "4", "--checkpoint-every", "2", "--out", str(out)])
+        finally:
+            MAIN.summarize = orig
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertTrue(meta["summary"]["status"].startswith("summary_failed: ValueError"))
+        self.assertEqual(load_state(out / "checkpoint")[1]["trajectory"], 4)
+        # stale run_meta.json (older than the checkpoint): resume reads only checkpoint.* + CSV
+        meta["trajectories_done"] = 0
+        (out / "run_meta.json").write_text(json.dumps(meta))
+        MAIN.main(WILSON + ["--n-traj", "6", "--checkpoint-every", "2", "--out", str(out), "--resume"])
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertEqual(meta["trajectories_done"], 6)
+
 
 if __name__ == "__main__":
     unittest.main()

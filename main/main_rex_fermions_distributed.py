@@ -436,7 +436,11 @@ def run(args, argv, device, backend):
     stopped = False
 
     def write_meta(final):
-        summary, hist = summarize(history, csv_path, ladder, hist_path)
+        try:
+            summary, hist = summarize(history, csv_path, ladder, hist_path)
+        except Exception as exc:  # checkpoint files are already written; never die on statistics
+            print(f"WARNING: summary failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
+            summary, hist = {"status": f"summary_failed: {exc.__class__.__name__}: {exc}"}, None
         swap = dict(swap_meta(ladder, link_accepted, link_proposed), swap_attempts=swap_attempts)
         meta = {"algorithm": "rex_fermions_distributed", "backend": backend, "world_size": world,
                 "device": str(device), "parameter_min": ladder[0], "parameter_max": ladder[-1],
@@ -465,7 +469,10 @@ def run(args, argv, device, backend):
         meta = None
         if rank == 0:
             history.save(hist_path, ladder, args.therm)
-            meta = write_meta(final)
+            try:
+                meta = write_meta(final)
+            except Exception as exc:  # never skip the barrier below on rank 0 alone
+                print(f"WARNING: run_meta failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
         dist.barrier()
         return meta
 
@@ -558,7 +565,7 @@ def run(args, argv, device, backend):
     if rank == 0:
         result["parameter_matrix"] = pt.parameter_matrix.cpu().tolist()
         result["meta"] = meta
-        if not args.quiet:
+        if not args.quiet and meta is not None:
             h = meta.get("replica_history", {})
             print(f"done: {meta['steps_completed']} measured steps, round trips {h.get('round_trips')}, "
                   f"round-trip steps {h.get('round_trip_steps')}, link acceptance {meta['swap']['link_acceptance']}, "

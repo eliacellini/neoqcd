@@ -360,7 +360,11 @@ def main(argv=None):
                    trajectory=rex.n_steps_done, time_sign=args.time_sign, generator=generator,
                    **state_couplings(args, fpar),
                    extra={"physics": key, "source": source, "seed": args.seed, "final": bool(final)})
-        summary = summarize(rex, csv_path, args.therm)
+        try:
+            summary = summarize(rex, csv_path, args.therm)
+        except Exception as exc:  # checkpoint files are already written; never die on statistics
+            print(f"WARNING: summary failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
+            summary = {"status": f"summary_failed: {exc.__class__.__name__}: {exc}"}
         meta = {"algorithm": "rex_fermions", "parameters": params_json, "run": info, "steps_done": rex.n_steps_done,
                 "finished": bool(final and rex.n_steps_done >= total), "summary": summary}
         if "swap" in summary:  # main_pt_obc.py layout, read by main/optimal_ladder.py --metric acceptance
@@ -399,7 +403,7 @@ def main(argv=None):
 
     summary = checkpoint(final=True)
     h = summary.get("history", {})
-    _log(args, f"done: {summary['steps_measured']} measured steps, round trips {h.get('round_trips')}, "
+    _log(args, f"done: {summary.get('steps_measured')} measured steps, round trips {h.get('round_trips')}, "
                f"round-trip steps {h.get('round_trip_steps')}, swap acceptance {summary.get('swap_acceptance')}, "
                f"{summary.get('seconds_per_step')} s/step, {summary.get('solves_per_step')} solves/step")
     return {"out": str(out), "summary": summary}

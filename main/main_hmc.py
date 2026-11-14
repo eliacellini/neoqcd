@@ -303,14 +303,39 @@ def gamma_summary(values, S=2.0):
     if np.all(flat == flat[0]):  # constant data (e.g. accepted = 1 everywhere): no fluctuation
         out.update(error=0.0, status="constant")
         return out
-    obs = Obs([values[:, b].copy() for b in range(values.shape[1])],
-              [f"hmc|r{b}" for b in range(values.shape[1])])
-    obs.gamma_method(S=float(S))
-    ens = next(iter(obs.e_tauint))
-    out.update(value=float(obs.value), error=float(obs.dvalue), error_of_error=float(obs.ddvalue),
-               tau_int=float(obs.e_tauint[ens]), tau_int_error=float(obs.e_dtauint[ens]),
-               window=float(obs.e_windowsize[ens]), status="gamma")
+    try:
+        obs = Obs([values[:, b].copy() for b in range(values.shape[1])],
+                  [f"hmc|r{b}" for b in range(values.shape[1])])
+        obs.gamma_method(S=float(S))
+        ens = next(iter(obs.e_tauint))
+        out.update(value=float(obs.value), error=float(obs.dvalue), error_of_error=float(obs.ddvalue),
+                   tau_int=float(obs.e_tauint[ens]), tau_int_error=float(obs.e_dtauint[ens]),
+                   window=float(obs.e_windowsize[ens]), status="gamma")
+    except Exception as exc:  # a statistics bug must never kill a run or a checkpoint
+        out.update(robust_summary(values))
+        out["status"] = f"gamma_failed: {exc.__class__.__name__}: {exc}"
     return out
+
+
+def robust_summary(values):
+    """Fallback estimate of an (n, B) array: error from the spread of the B replica means (B >= 2),
+    else the naive error, plus binned errors (bins along the trajectory axis, all replicas)."""
+    values = np.asarray(values, dtype=np.float64)
+    n, B = values.shape
+    flat = values.reshape(-1)
+    res = {"value": float(flat.mean()), "error": None, "error_method": "naive", "binned_errors": {}}
+    if B >= 2:
+        means = values.mean(axis=0)
+        res.update(error=float(means.std(ddof=1) / math.sqrt(B)), error_method="replica_means")
+    elif flat.size > 1:
+        res["error"] = float(flat.std(ddof=1) / math.sqrt(flat.size))
+    for bs in (1, 2, 4, 8, 16):
+        nb = n // bs
+        if nb < 2 or nb * B < 2:
+            break
+        bins = values[:nb * bs].reshape(nb, bs, B).mean(axis=1).reshape(-1)
+        res["binned_errors"][str(bs)] = float(bins.std(ddof=1) / math.sqrt(bins.size))
+    return res
 
 
 def summarize(csv_path, batch, S=2.0):
@@ -425,7 +450,11 @@ def main(argv=None):
         save_state(state_prefix, U, geometry=geometry, beta=args.beta, fermions=args.fermions,
                    trajectory=traj_done, time_sign=args.time_sign, kappa=args.kappa, mass=args.mass,
                    generator=generator, extra={"seed": args.seed, "final": bool(final)})
-        summary, _ = summarize(csv_path, args.batch, args.gamma_S)
+        try:
+            summary, _ = summarize(csv_path, args.batch, args.gamma_S)
+        except Exception as exc:  # checkpoint files are already written; never die on statistics
+            print(f"WARNING: summary failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
+            summary = {"status": f"summary_failed: {exc.__class__.__name__}: {exc}"}
         if final:
             write_npz(out / "observables.npz", read_observables(csv_path))  # all rows, therm included
         atomic_json_save({"parameters": params, "run": run_info, "trajectories_done": traj_done,
@@ -486,11 +515,14 @@ def main(argv=None):
             checkpoint()
 
     summary = checkpoint(final=True)
-    p = summary["plaquette"]
-    _log(args, f"done: {summary['n_traj_measured']} trajectories, plaquette {p['value']} +- {p['error']} "
-               f"(tau_int {p['tau_int']}), acceptance {summary['acceptance']['value']}, "
-               f"<exp(-dH)> {summary['exp_minus_dH']['value']}, {summary['seconds_per_traj']} s/traj, "
-               f"{summary['seconds_per_solve']} s/solve, {summary['cg_iter_per_solve']} CG it/solve")
+    if "plaquette" in summary:
+        p = summary["plaquette"]
+        _log(args, f"done: {summary['n_traj_measured']} trajectories, plaquette {p['value']} +- {p['error']} "
+                   f"(tau_int {p['tau_int']}), acceptance {summary['acceptance']['value']}, "
+                   f"<exp(-dH)> {summary['exp_minus_dH']['value']}, {summary['seconds_per_traj']} s/traj, "
+                   f"{summary['seconds_per_solve']} s/solve, {summary['cg_iter_per_solve']} CG it/solve")
+    else:
+        _log(args, f"done: {traj_done} trajectories, summary {summary.get('status')}")
     return {"out": str(out), "summary": summary}
 
 
