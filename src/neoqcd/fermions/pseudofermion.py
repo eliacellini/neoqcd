@@ -27,7 +27,20 @@ so, with W = H_oe X (odd) and Z = (H^dagger)_oe Y = gamma_5 H gamma_5 Y (odd),
 variant dS = 2 kappa Re[Y^dagger dH X] with X = (D^dagger D)^-1 phi, Y = D X.
 The bilinear Re[a^dagger dH b] is `hopping_derivative(wilson, a, b)`; see its docstring for the
 projectors and shifts.
+
+Convergence policy (`on_unconverged`, default "raise"). An unconverged solve biases the
+Metropolis step (action solves) or the molecular dynamics (force solves) without any visible
+sign, so after every solve the TRUE relative residual |b - A x| / |b| returned by the solver is
+compared with `convergence_limit(tol, dtype)` = 10 max(tol, 1e3 eps) (the slack of the
+Hasenbusch heavy refresh: the true residual can sit slightly above a tolerance near roundoff).
+Above it, "raise" raises a RuntimeError naming the solve kind (action / force / refresh, or
+"solve" when a subclass calls `_count(result)` without the tolerance: then the limit uses the
+looser of solver_tol and action_tol), the residual, the limit, the iterations and the sample
+indices; "warn" issues an `UnconvergedSolveWarning` once per kind and term instance; "ignore"
+only counts. `stats["unconverged_solves"]` counts the offending solves in every mode.
 """
+
+import warnings
 
 import torch
 
@@ -37,7 +50,25 @@ from neoqcd.fermions.hmc import ActionTerm, Hamiltonian, WilsonGaugeAction
 from neoqcd.fermions.lattice import fermion_boundary_links, shift
 from neoqcd.fermions.solver import cg
 
-__all__ = ["hopping_derivative", "TwoFlavourWilson", "TwoFlavourHamiltonian"]
+__all__ = ["hopping_derivative", "TwoFlavourWilson", "TwoFlavourHamiltonian", "convergence_limit",
+           "ON_UNCONVERGED", "UnconvergedSolveWarning"]
+
+ON_UNCONVERGED = ("raise", "warn", "ignore")
+
+
+class UnconvergedSolveWarning(RuntimeWarning):
+    """A pseudofermion solve ended above its tolerance (on_unconverged="warn")."""
+
+
+def convergence_limit(tol, real_dtype):
+    """Largest accepted true relative residual of a solve at `tol`: 10 max(tol, 1e3 eps).
+
+    `tol` a float (returns a float) or a tensor (returns a tensor); eps of `real_dtype`.
+    """
+    eps = torch.finfo(real_dtype).eps
+    if torch.is_tensor(tol):
+        return 10.0 * torch.clamp(tol, min=1e3 * eps)
+    return 10.0 * max(float(tol), 1e3 * eps)
 
 
 def _outer(b, c):
@@ -97,6 +128,8 @@ class TwoFlavourWilson(ActionTerm):
             loses orthogonality, its finite-precision iterates are not a smooth function of U.
             (Reversibility to rounding at a loose tolerance, as for Wilson at kappa = 0.12, relies
             on CG converging in ~20 iterations, well before that regime.)
+        on_unconverged: "raise" (default), "warn" or "ignore": what to do when a solve ends with
+            a true relative residual above 10 max(tol, 1e3 eps) (module doc, convergence policy).
 
     State: `phi` (the pseudofermion field, set by `refresh`) and `X` (the last solution of
     M X = phi). `stats` counts calls, solves and CG iterations; `cg_iterations` adds the
@@ -105,7 +138,12 @@ class TwoFlavourWilson(ActionTerm):
     """
 
     def __init__(self, kappa, geometry, time_sign=-1.0, even_odd=True, solver_tol=1e-10,
-                 action_tol=None, max_iter=2000, reuse_guess=True):
+                 action_tol=None, max_iter=2000, reuse_guess=True, on_unconverged="raise"):
+        if on_unconverged not in ON_UNCONVERGED:
+            raise ValueError(f"on_unconverged must be one of {ON_UNCONVERGED}, got {on_unconverged!r}")
+        self.on_unconverged = on_unconverged
+        self._warned = set()
+        self._solve_kind = None
         self.kappa = kappa
         self.geometry = geometry
         self.time_sign = float(time_sign)
@@ -124,9 +162,11 @@ class TwoFlavourWilson(ActionTerm):
     def reset_stats(self):
         self.stats = {"refresh_calls": 0, "action_calls": 0, "force_calls": 0, "solves": 0,
                       "cg_iterations": 0, "cg_iterations_per_sample": None, "last_iterations": None,
-                      "last_residual": None}
+                      "last_residual": None, "unconverged_solves": 0}
 
-    def _count(self, result):
+    def _count(self, result, tol=None, kind=None):
+        """Book-keeping of one solve, then the convergence check (module doc). Without `tol`
+        (subclasses that solve on their own) the check uses max(solver_tol, action_tol)."""
         it = result.iterations
         self.stats["solves"] += 1
         self.stats["cg_iterations"] += int(it.max().item())
@@ -134,6 +174,48 @@ class TwoFlavourWilson(ActionTerm):
         self.stats["cg_iterations_per_sample"] = it.clone() if tot is None or tot.shape != it.shape else tot + it
         self.stats["last_iterations"] = it
         self.stats["last_residual"] = result.residual
+        self._check_converged(result, tol, kind)
+
+    def _check_converged(self, result, tol=None, kind=None):
+        if tol is None:
+            tol, kind = max(self.solver_tol, self.action_tol), (kind or "solve")
+        res = result.residual
+        limit = convergence_limit(float(tol), res.dtype)
+        bad = ~(res <= limit)  # NaN counts as unconverged
+        if not bool(bad.any()):
+            return
+        self.stats["unconverged_solves"] = self.stats.get("unconverged_solves", 0) + 1
+        policy = getattr(self, "on_unconverged", "raise")
+        if policy == "ignore":
+            return
+        samples = bad.nonzero().flatten().tolist()
+        worst = float(res[bad].nan_to_num(nan=float("inf")).max().item())
+        its = result.iterations[bad].tolist()
+        msg = (f"{type(self).__name__} {kind}: CG not converged, relative residual {worst:.3e} > {limit:.1e} "
+               f"(tol {float(tol):.1e} x slack 10, eps floor 1e3 eps) for sample(s) {samples}, "
+               f"iterations {its}, max_iter {self.max_iter}")
+        if policy == "raise":
+            raise RuntimeError(msg)
+        warned = getattr(self, "_warned", None)
+        if warned is None:
+            warned = self._warned = set()
+        if kind not in warned:
+            warned.add(kind)
+            warnings.warn(msg, UnconvergedSolveWarning, stacklevel=4)
+
+    def _solve_kind_of(self, tol):
+        kind = getattr(self, "_solve_kind", None)
+        if kind is not None:
+            return kind
+        return "action" if tol == self.action_tol else "force"
+
+    def _solve_as(self, kind, op, tol):
+        """`_solve(op, tol)` with the kind (action/force) named in the convergence check."""
+        self._solve_kind = kind
+        try:
+            return self._solve(op, tol)
+        finally:
+            self._solve_kind = None
 
     @property
     def n_components(self):
@@ -158,7 +240,7 @@ class TwoFlavourWilson(ActionTerm):
             raise RuntimeError("the pseudofermion field is not set: call refresh(U, generator) first")
         x0 = self.X if (self.reuse_guess and self.X is not None) else None
         res = cg(op.normal, self.phi, x0=x0, tol=tol, max_iter=self.max_iter)
-        self._count(res)
+        self._count(res, tol, self._solve_kind_of(tol))
         self.X = res.x
         return res.x
 
@@ -179,7 +261,7 @@ class TwoFlavourWilson(ActionTerm):
     def action(self, U):
         """S_pf = phi^dagger M^-1 phi per configuration, shape (B,), one CG solve at `action_tol`."""
         self.stats["action_calls"] += 1
-        X = self._solve(self.operator(U), self.action_tol)
+        X = self._solve_as("action", self.operator(U), self.action_tol)
         return (self.phi.conj() * X).real.reshape(X.shape[0], -1).sum(1)
 
     def action_difference(self, U_old, U_new):
@@ -200,7 +282,7 @@ class TwoFlavourWilson(ActionTerm):
         """Algebra gradient of S_pf (module doc), hermitian traceless, shape like U."""
         self.stats["force_calls"] += 1
         op = self.operator(U)
-        X = self._solve(op, self.solver_tol)
+        X = self._solve_as("force", op, self.solver_tol)
         if self.even_odd:
             w = op.wilson
             Y = op.apply(X)

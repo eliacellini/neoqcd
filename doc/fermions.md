@@ -19,6 +19,14 @@ This page describes the code as it is. The plan holds the motivation and the lit
   for tiny lattices.
 - Hasenbusch mass preconditioning for N_f = 2 Wilson (`hasenbusch.py`): heavy and ratio terms,
   three-level Hamiltonian. On 2D 4×4 it saves no cost; the gain is to be measured on larger lattices.
+- Clover term for Wilson (`clover.py`, openQCD convention by default): clover pseudofermion,
+  small determinant det A_oo, clover Hamiltonian, exact-determinant Metropolis.
+- RHMC for rooted staggered fermions (`rhmc.py`, `rational.py`): multishift CG, Zolotarev and
+  Remez rational approximations, N_f = 2 in 4D, also at light masses.
+- An opt-in fast path for N_f = 2 Wilson (`fast.py`, `main_hmc.py --fast`): half-lattice
+  even-odd operator, lean and mixed-precision CG (§5b).
+  (Hasenbusch, clover and RHMC are implemented and reviewed; status in `fermions_plan.md`,
+  "Aggiornamento del 13/14 novembre".)
 - `QCDAction`: one parametric joint action S(U, φ; λ) with λ ∈ {β, κ, bc} (Wilson) or
   {β, mass, bc} (`fermions="staggered"`). The defect `bc` enters the gauge action only
   (Bonanno et al., arXiv:2404.14151).
@@ -35,18 +43,18 @@ This page describes the code as it is. The plan holds the motivation and the lit
 **Verified only on tiny lattices.** The exact checks run on CPU in complex128 on 2D 4×4 (SU(2),
 SU(3)), 2^3×4, 2^4 and 4^4 (the last only for operator-level dense checks). These checks cover
 Jarzynski against exact reweighting, HMC against the exact-determinant Metropolis, and REX
-against plain HMC. No physics number on 4^4 or 8^4 has been produced yet.
+against plain HMC. On an A100 the N_f = 2 Wilson HMC (c_sw = 0) is validated against openQCD 2.4.3
+at 4^4, β = 1.0, κ = 0.1 and at 8^4, β = 5.6, κ = 0.153 (§5b).
 
 **Not done.**
 
-- Clover term.
-- RHMC: staggered N_f = 2 in 4D, Zolotarev, multishift CG.
 - DD-HMC.
 - Staggered SNF with layers (in progress).
 - O-REX and NEO-REX with fermions (out of this plan).
-- The 4^4 (β = 1, κ = 0.1) and 8^4 (β = 5.6, κ = 0.153, 0.1545) benchmarks.
-- The comparison with openQCD/Grid.
-- Any run on CUDA: the drivers accept `--device cuda` but the CUDA path is untested.
+- The 8^4, β = 5.6, κ = 0.1545 point (openQCD reference 0.5687(3) available) and the
+  comparison with Grid. The 4^4 and 8^4 κ = 0.153 openQCD comparisons are done (§5b).
+- CUDA: `main_hmc.py` (reference and `--fast`) has run on an A100; the SNF/REX drivers and the
+  fast path outside `main_hmc.py` have not.
 - A line-of-constant-physics protocol. The β protocols at fixed κ are algorithmic only, since
   the quark mass changes. The β interval (5.45 → 5.6) is open until t0 is measured.
 
@@ -203,7 +211,10 @@ periodic top rung (guarded). The swap uniforms come from a separate CPU generato
 | `solver.py` | `LinearOperator`, `SolverResult`, `cg`, `bicgstab`, `solve` (cgne/bicgstab, even-odd aware), `solve_normal` |
 | `staggered.py` | `staggered_phases`, `staggered_epsilon`, `StaggeredDirac`, `StaggeredEvenOdd`, `solve_staggered`, `staggered_dense_matrix`, `free_staggered_(normal_)eigenvalues` |
 | `hmc.py` | `ActionTerm`, `WilsonGaugeAction`, `Hamiltonian`, `WilsonGaugeHamiltonian`, `HMC`, `random_momenta`, `kinetic_energy`, `(batched_)defect_plaquette_weights`, `INTEGRATORS`, `OMELYAN_LAMBDA` |
-| `pseudofermion.py` | `hopping_derivative`, `TwoFlavourWilson` (action/refresh/force/stats), `TwoFlavourHamiltonian` |
+| `pseudofermion.py` | `hopping_derivative`, `TwoFlavourWilson` (action/refresh/force/stats, `on_unconverged`), `TwoFlavourHamiltonian`, `convergence_limit`, `UnconvergedSolveWarning` |
+| `fast.py` | `HalfLatticeWilson`, `lean_cg`, `mixed_precision_cg`, `FastTwoFlavourWilson`, `FastTwoFlavourHamiltonian`, `to_half`/`to_full`, `site_tables`, `colour_mul` (§5b) |
+| `clover.py` | `CloverWilsonDirac`, `EvenOddCloverDirac`, `TwoFlavourClover`, `CloverDeterminantTerm`, `CloverHamiltonian`, `ExactCloverMetropolis` |
+| `rhmc.py`, `rational.py` | `RootedStaggeredPseudofermion`, `RootedStaggeredHamiltonian`, `ExactRootedMetropolis`; rational approximations |
 | `hasenbusch.py` | `HeavyWilsonTerm`, `RatioWilsonTerm`, `HasenbuschHamiltonian` (layouts `nested`, `shared` or explicit levels), `LEVEL_LAYOUTS` |
 | `staggered_pseudofermion.py` | `staggered_hopping_derivative`, `StaggeredPseudofermion`, `StaggeredHamiltonian` |
 | `exact.py` | `log_det_two_flavour`, `assemble_hopping`, `assemble_even_odd`, `ExactMetropolis` |
@@ -263,14 +274,21 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 - Fermions: `--fermions wilson|staggered|none`, with `--kappa` (Wilson) or `--mass` (staggered).
 - Lattice and couplings: `--D --T --L --N --beta --time-sign`.
 - Integrator: `--tau --n-steps --n-gauge-substeps --integrator omelyan|leapfrog|outer,inner`.
-- Solver: `--solver-tol` (force), `--action-tol` (Metropolis), `--max-iter`, `--no-reuse-guess`.
+- Solver: `--solver-tol` (force), `--action-tol` (Metropolis), `--max-iter`, `--no-reuse-guess`,
+  `--on-unconverged raise|warn|ignore` (Wilson, default raise; convergence policy in §5b).
+- Fast path (Wilson, §5b): `--fast`, `--precision double|mixed`, `--colour-product`,
+  `--check-every`, `--inner-tol`, `--max-outer` (all rejected without `--fast`; the last two
+  need `--precision mixed`).
 - Run length: `--batch --start cold|hot --therm --n-traj --meas-every --checkpoint-every`.
 - `--exact-logdet` measures the dense log det for dense dimension ≤ `--exact-max-dim`
   (default 3072).
 - Control: `--seed --device auto|cpu|cuda --out --resume --overwrite`.
 - Outputs in `--out` (default `output/hmc_fermions/<name>/`):
   - `observables.csv`: one row per trajectory × replica, with the plaquette, dH, accepted,
-    exp(−dH), log det, solves, CG iterations and timings.
+    exp(−dH), log det, solves, CG iterations, timings and `max_residual` (largest true relative
+    residual of the trajectory's solves). With `--precision mixed`, `cg_iter` is the real cost:
+    complex64 inner applications plus complex128 outer applications (`run_meta.json`
+    "cg_iter_definition").
   - `observables.npz`.
   - `run_meta.json`: parameters plus a Gamma-method summary, acceptance, ⟨e^{−ΔH}⟩, seconds per
     trajectory and per solve, and CG iterations per solve.
@@ -324,6 +342,66 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   4 ladders, DEO swaps with translation, 50 + 200 steps. It starts from the SNF nemcmc pool if
   present.
 
+## 5b. Fast path (`fast.py`, `main_hmc.py --fast`)
+
+**What it is.** `FastTwoFlavourWilson` is `TwoFlavourWilson` (even-odd) with the same heat-bath
+draws, action and force to the solver tolerance, computed differently:
+
+- `HalfLatticeWilson`: D̂ = 1 − κ² H_eo H_oe on half-lattice fields (B, V/2, S, N), sites of each
+  parity in lexicographic order. Spin projection to half spinors before the neighbour gather,
+  links gathered once per configuration with the boundary phase absorbed, colour product
+  `matmul`, `broadcast` or `broadcast_sum` (`auto` = `broadcast_sum` on CUDA, `matmul` on CPU).
+  complex128 or complex64 (`to(dtype)`; an upcast re-gathers from the complex128 links).
+- `lean_cg`: CG with a host convergence check every `check_every` iterations and no per-sample
+  masking; returns the true residual and restarts from r = b − A x if a sample's true residual is
+  above 10 max(tol, 1e3 ε) at exit (bounded by `max_iter`, stops at a true-residual floor).
+- `mixed_precision_cg`: defect correction, complex64 inner CG, complex128 residuals; stops on
+  convergence, on stagnation (true residual not halved in an outer step) or when the total inner
+  budget `max_iter` is spent.
+- The operator is cached per links tensor (`_version`) and per value of κ, time_sign,
+  colour product and geometry. Writes through `U.data` or numpy views do not bump `_version`
+  and are not supported (as for the η†η cache).
+
+**Measured on an A100** (torch 2.0, complex128 unless stated):
+
+| Quantity | Reference | Fast |
+|---|---|---|
+| normal operator, site updates/s | 3.1e6 | 2-2.8e7 (half lattice, `broadcast_sum`) |
+| full solve | 1 | 6-9× faster |
+| HMC at 8^4, per replica | 1 | 7.9× faster (0.65 s per trajectory per replica, 144 CG iterations per solve) |
+| complex64 operator | | 1.5-1.65× over complex128 |
+| mixed precision solve | | 10-20% over lean double |
+
+The hopping term is now memory-bandwidth bound; the fused kernel of fermions_plan.md phase P is
+the next step.
+
+**Validation against openQCD 2.4.3** (Wilson N_f = 2, c_sw = 0, antiperiodic quarks; openQCD
+plaquette = 3 × ours, converted):
+
+| Point | openQCD | neoqcd |
+|---|---|---|
+| 4^4, β = 1.0, κ = 0.1 | 0.060765(28) | 0.06084(19) fast (0.06091(19) reference) |
+| 8^4, β = 5.6, κ = 0.153 | 0.5661(5) | 0.56609(29) fast (16 replicas, trajectories 121-342) |
+
+**Limits.**
+
+- Only `main_hmc.py` uses it; action/SNF/REX use the reference classes
+  (`snf_layers.PseudofermionAction` mixes `_solve` with full-lattice φ).
+- Without per-sample masking every sample of the batch iterates until the slowest has
+  converged, so a sample's solution depends on the batch composition at the level of the solver
+  tolerance: chains are not bit-reproducible across batch sizes. Resume is bitwise at a fixed
+  batch (same device and thread count).
+
+**Convergence policy** (reference and fast terms, and their subclasses). After every solve the
+true relative residual is compared with 10 max(tol, 1e3 ε) (the slack of the Hasenbusch heavy
+refresh). `on_unconverged="raise"` (default) raises a RuntimeError naming the solve kind
+(action/force; "solve" for subclass solves that do not pass their tolerance, then checked
+against the looser of solver_tol and action_tol), the residual, the limit, the iterations and the
+sample indices; `"warn"` warns once per kind and term; `"ignore"` only counts
+(`stats["unconverged_solves"]`). An unconverged action solve would bias the Metropolis step
+silently. `main_hmc.py --on-unconverged` sets it; `max_residual` in observables.csv records the
+largest residual per trajectory.
+
 ## 6. Known limitations and TODO
 
 - **Exact comparison and determinant normalisation.** The HMC against `ExactMetropolis` test
@@ -344,7 +422,7 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 - **Batch cost.** The batched solvers iterate until the slowest sample converges, and
   `cg_iterations` counts that maximum. Per-sample counts are kept separately.
 - **Staggered refresh.** It costs one extra solve per trajectory (S_pf at the refresh links is not
-  χ†χ). Staggered is HMC only, with N_f = 4 in 4D; N_f = 2 in 4D needs RHMC (not done).
+  χ†χ). `StaggeredPseudofermion` is N_f = 4 in 4D; N_f = 2 in 4D is the RHMC term of `rhmc.py`.
 - **O(V) swap table.** `swap_action_difference` builds each of the n_rungs columns from a sum
   over the whole lattice of (w_old − w_new) Re tr U_p. The terms vanish beyond the plaquettes that
   touch the defect, so this is O(n_rungs·V) work that could be restricted to the defect halo.
@@ -354,8 +432,8 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   only on Gloo/CPU.
 - **Hasenbusch.** On 2D 4×4 the two-term HMC gives no cost saving at equal acceptance; the
   choice of κ' and of the layout is to be measured on 4^4/8^4. Not yet wired into the drivers.
-- **CUDA in general.** No fermion code has run on a GPU yet. Generators must be on the device
-  (`torch.Generator(device=U.device)`). `stats["acceptance"]` syncs once per trajectory.
+- **CUDA in general.** Only `main_hmc.py` (reference and `--fast`) has run on a GPU (A100).
+  Generators must be on the device (`torch.Generator(device=U.device)`). `stats["acceptance"]` syncs once per trajectory.
 - **Exact tools.** `ExactMetropolis` recomputes a dense determinant per proposal, which is
   practical only up to about 2^3×4 in a unit test. Exact log det on 4^4 even-odd is 1536² and
   feasible. On 8^4 (24576², 9.6 GB) it is planned on A100 but untested.
@@ -376,8 +454,8 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 - **Open questions from the plan.**
   1. The β interval 5.45 → 5.6, to fix after measuring t0.
   2. Whether to build the 2D Schwinger test bed.
-  3. When to add clover.
+  3. Clover is implemented (`clover.py`); when to use it in production is open.
   4. Whether to run the 12^3×24, κ = 0.156 check (about 1 A100 day), after the phase-1 cost
      measurement.
-  5. Further work: Hasenbusch on larger lattices, DD-HMC, RHMC, openQCD/Grid reference runs, and the
+  5. Further work: Hasenbusch on larger lattices, DD-HMC, Grid reference runs, and the
      convention-alignment checklist (κ, plaquette normalisation, τ_int).

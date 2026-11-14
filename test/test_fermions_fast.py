@@ -11,6 +11,7 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,12 @@ from neoqcd.fermions.fast import (
     to_half,
 )
 from neoqcd.fermions.lattice import Geometry, even_odd_masks
-from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian, TwoFlavourWilson, hopping_derivative
+from neoqcd.fermions.pseudofermion import (
+    TwoFlavourHamiltonian,
+    TwoFlavourWilson,
+    UnconvergedSolveWarning,
+    hopping_derivative,
+)
 from neoqcd.fermions.solver import _norm2, cg
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +67,20 @@ def rel(a, b):
 
 def kappas(*values):
     return torch.tensor(values, dtype=torch.float64)
+
+
+def clustered_system(levels, n=48, batch=2, seed=5):
+    """Dense hermitian positive-definite A = Q diag(levels, each repeated) Q^dagger and a rhs:
+    CG converges in ~len(levels) iterations, but with levels spanning 1e8 the true residual
+    |b - A x| / |b| has a floor ~1e-8 while the recursive one keeps falling."""
+    g = torch.Generator().manual_seed(seed)
+    Q, _ = torch.linalg.qr(torch.randn(n, n, dtype=C, generator=g))
+    d = torch.tensor(levels, dtype=torch.float64).repeat_interleave(n // len(levels))
+    A = (Q * d.to(C)) @ Q.conj().T
+    A = 0.5 * (A + A.conj().T)
+    b = torch.randn(batch, n, dtype=C, generator=g)
+    A64 = A.to(C64)
+    return (lambda x: x @ A.T), (lambda x: x @ A64.T), b
 
 
 class HalfLatticeOperatorTest(unittest.TestCase):
@@ -110,6 +130,41 @@ class HalfLatticeOperatorTest(unittest.TestCase):
         self.assertLess(rel(op.prepare_rhs(psi), to_half(eo.prepare_rhs(psi), geo)), 1e-13)
         x_e = to_half(field(geo, 2, 5), geo)
         self.assertLess(rel(op.reconstruct(x_e, psi), eo.reconstruct(to_full(x_e, geo), psi)), 1e-13)
+
+    def test_upcast_recovers_double_precision_links(self):
+        """to(C64).to(C128) and dtype=C64 then to(C128) re-gather the complex128 links (item 2)."""
+        geo = G46
+        U = links(geo, 2, 60)
+        k = kappas(0.12, 0.13)
+        psi = field(geo, 2, 61)
+        x = to_half(psi, geo)
+        ref = to_half(WilsonDirac(U, k, geo).even_odd().normal(psi), geo)
+        op = HalfLatticeWilson(U, k, geo)
+        for name, up in (("to(C64).to(C128)", op.to(C64).to(C)),
+                         ("dtype=C64 .to(C128)", HalfLatticeWilson(U, k, geo, dtype=C64).to(C))):
+            with self.subTest(name):
+                self.assertEqual(up.dtype, C)
+                self.assertEqual(up._links[0].dtype, C)
+                self.assertLess(rel(up.normal(x), ref), 1e-13)
+                self.assertTrue(torch.equal(up._links[1], op._links[1]))
+        # the complex64 operator itself is untouched by the upcast copy
+        op64 = op.to(C64)
+        op64.to(C)
+        self.assertEqual(op64._links[0].dtype, C64)
+
+    def test_site_order_both_parities_lexicographic(self):
+        """sites[0] and sites[1] are the even / odd sites in lexicographic order (t, x_1, ...)."""
+        for geo in (G4s, G2, G46):
+            even, odd = even_odd_masks(geo, dtype=torch.float64)
+            tab = site_tables(geo)
+            for p, mask in ((0, even), (1, odd)):
+                sites = mask.reshape(-1).nonzero().squeeze(-1)
+                self.assertTrue(torch.equal(tab["sites"][p], sites), (geo.lattice, p))
+                self.assertTrue(bool((sites[1:] > sites[:-1]).all()))
+                # and to_half picks exactly those sites in that order
+                psi = field(geo, 1, 62)
+                flat = psi.reshape(1, geo.volume, geo.spin, geo.N)
+                self.assertTrue(torch.equal(to_half(psi, geo, p), flat[:, sites]))
 
     def test_conversion_round_trip(self):
         for geo in (G4s, G2, G46):
@@ -343,6 +398,89 @@ class LeanCGTest(unittest.TestCase):
         c = lean_cg(op.normal, b.conj().resolve_conj(), tol=1e-12)
         self.assertTrue(torch.equal(a.x, c.x))
 
+    def test_max_iter_honoured(self):
+        """max_iter caps the loop; non-convergence is reported (item 6c)."""
+        geo = G44
+        op = HalfLatticeWilson(links(geo, 2, 63), kappas(0.12, 0.13), geo)
+        b = to_half(field(geo, 2, 64), geo)
+        for check_every in (1, 3, 10):
+            info = {}
+            res = lean_cg(op.normal, b, tol=1e-12, max_iter=5, check_every=check_every, info=info)
+            self.assertEqual(info["loop_iterations"], 5)
+            self.assertEqual(res.iterations.tolist(), [5, 5])
+            self.assertFalse(bool(info["converged"].any()))
+            self.assertGreater(res.residual.min().item(), 1e-6)
+            self.assertEqual(info["restarts"], 0)
+
+    def test_returned_residual_is_true_residual(self):
+        """On an ill-conditioned system the recursive residual drops below tol while the true
+        one stays ~1e-8: the returned residual is the true one (item 6d)."""
+        A, _, b = clustered_system([1.0, 1e4, 1e8])
+        ref = cg(A, b, tol=1e-10, max_iter=200)  # recursive convergence in ~7 iterations
+        self.assertLess(ref.iterations.max().item(), 20)
+        for max_restarts in (0, None):
+            with self.subTest(max_restarts=max_restarts):
+                info = {}
+                res = lean_cg(A, b, tol=1e-10, max_iter=200, check_every=1, info=info, max_restarts=max_restarts)
+                true = torch.sqrt(_norm2(b - A(res.x)) / _norm2(b))
+                self.assertLess((res.residual - true).abs().max().item(), 1e-20)
+                self.assertGreater(res.residual.min().item(), 1e-9)  # far above tol: not the recursive one
+                self.assertFalse(bool(info["converged"].any()))
+
+    def test_restart_when_true_residual_above_target(self):
+        """Item 5. A sample flagged converged on its recursive residual but with a true residual
+        above 10 tol is restarted from r = b - A x instead of returned. Forced with an operator
+        that is perturbed (A + delta) for the first loop applications only: CG converges for
+        A + delta, the exit check with the exact A finds the true residual ~delta, and the
+        restart (exact A from then on) converges."""
+        geo = G4s
+        op = HalfLatticeWilson(links(geo, 2, 65), kappas(0.12, 0.13), geo)
+        b = to_half(field(geo, 2, 66), geo)
+        delta = 1e-6
+
+        class Perturbed:
+            def __init__(self, n_perturbed):
+                self.calls, self.n = 0, n_perturbed
+
+            def __call__(self, x):
+                y = op.normal(x)
+                if self.calls < self.n:
+                    y = y + delta * x
+                self.calls += 1
+                return y
+
+        first = {}
+        stage1 = lean_cg(Perturbed(10 ** 9), b, tol=1e-12, max_iter=500, check_every=1, info=first)
+        n1 = first["loop_iterations"]
+        true1 = torch.sqrt(_norm2(b - op.normal(stage1.x)) / _norm2(b))
+        self.assertGreater(true1.min().item(), 1e-9)  # the forced case: converged for A + delta only
+        info = {}
+        apply = Perturbed(n1)
+        res = lean_cg(apply, b, tol=1e-12, max_iter=500, check_every=1, info=info)
+        self.assertEqual(info["restarts"], 1)
+        self.assertGreater(info["loop_iterations"], n1)
+        self.assertTrue(bool(info["converged"].all()))
+        self.assertLess(res.residual.max().item(), 1e-11)
+        true = torch.sqrt(_norm2(b - op.normal(res.x)) / _norm2(b))
+        self.assertLess((true - res.residual).abs().max().item(), 1e-20)
+        # without restarts the same forced case returns the residual ~delta, reported as such
+        info0 = {}
+        res0 = lean_cg(Perturbed(n1), b, tol=1e-12, max_iter=500, check_every=1, info=info0, max_restarts=0)
+        self.assertEqual(info0["loop_iterations"], n1)
+        self.assertGreater(res0.residual.min().item(), 1e-9)
+        self.assertFalse(bool(info0["converged"].any()))
+
+    def test_restarts_stop_at_true_residual_floor(self):
+        """Below the attainable residual the restarts stop (floor rule) well before max_iter."""
+        A, _, b = clustered_system([1.0, 1e4, 1e8])
+        info = {}
+        res = lean_cg(A, b, tol=1e-12, max_iter=2000, check_every=1, info=info)
+        self.assertGreaterEqual(info["restarts"], 1)
+        self.assertTrue(info["stagnated"])
+        self.assertLess(info["loop_iterations"], 100)
+        self.assertFalse(bool(info["converged"].any()))
+        self.assertGreater(res.residual.min().item(), 1e-10)
+
     def test_tol_zero_stops_at_roundoff(self):
         geo = G2
         op = HalfLatticeWilson(links(geo, 2, 20), 0.2, geo)
@@ -383,6 +521,43 @@ class MixedPrecisionTest(unittest.TestCase):
         self.assertLess(res.residual.max().item(), 1e-10)
 
 
+    def test_stagnation_exit(self):
+        """Tolerance below the attainable double residual: the outer loop stops on stagnation
+        (true residual not halved in an outer step), long before max_outer (item 3)."""
+        A, A64, b = clustered_system([1.0, 1e2, 1e4])
+        info = {}
+        res = mixed_precision_cg(A, A64, b, tol=1e-15, max_outer=30, max_iter=5000, info=info)
+        self.assertLess(info["outer"], 10)
+        self.assertTrue(bool(info["stagnated"].all()))
+        self.assertFalse(bool(info["converged"].any()))
+        self.assertFalse(info["budget_exhausted"])
+        self.assertEqual(info["double_applications"], info["outer"])
+        self.assertLess(res.residual.max().item(), 1e-11)  # it got to the floor (~1e-12)
+        true = torch.sqrt(_norm2(b - A(res.x)) / _norm2(b))
+        self.assertLess((true - res.residual).abs().max().item(), 1e-20)
+        # an attainable tolerance converges, not stagnated
+        info = {}
+        res = mixed_precision_cg(A, A64, b, tol=1e-10, info=info)
+        self.assertTrue(bool(info["converged"].all()))
+        self.assertFalse(bool(info["stagnated"].any()))
+        self.assertLess(res.residual.max().item(), 1e-10)
+
+    def test_max_iter_is_total_inner_budget(self):
+        geo = G44
+        op = HalfLatticeWilson(links(geo, 2, 67), kappas(0.12, 0.13), geo)
+        b = to_half(field(geo, 2, 68), geo)
+        free = {}
+        mixed_precision_cg(op, op.to(C64), b, tol=1e-12, inner_tol=1e-3, max_iter=10000, info=free)
+        self.assertGreaterEqual(free["outer"], 3)
+        budget = free["loop_iterations"] // 2
+        info = {}
+        res = mixed_precision_cg(op, op.to(C64), b, tol=1e-12, inner_tol=1e-3, max_iter=budget, info=info)
+        self.assertLessEqual(info["loop_iterations"], budget)
+        self.assertTrue(info["budget_exhausted"])
+        self.assertFalse(bool(info["converged"].all()))
+        self.assertGreater(res.residual.max().item(), 1e-12)
+
+
 class FastTermTest(unittest.TestCase):
     def _pair(self, geo, k, precision="double", **kw):
         ref = TwoFlavourWilson(k, geo, **kw)
@@ -413,6 +588,129 @@ class FastTermTest(unittest.TestCase):
                 self.assertGreater(fast.stats["cg_loop_iterations"], 0)
                 if precision == "mixed":
                     self.assertGreater(fast.stats["outer_iterations"], 0)
+
+    def test_periodic_time_sign_matches_reference(self):
+        """time_sign = +1: refresh, action and force against the reference (item 6a)."""
+        geo = G46
+        k = kappas(0.11, 0.13)
+        U, U2 = links(geo, 2, 70), links(geo, 2, 71)
+        ref, fast = self._pair(geo, k, time_sign=1.0, solver_tol=1e-12)
+        anti = FastTwoFlavourWilson(k, geo, time_sign=-1.0, solver_tol=1e-12)
+        for term in (ref, fast, anti):
+            term.refresh(U, torch.Generator().manual_seed(72))
+        self.assertLess(rel(fast.phi, ref.phi), 1e-14)
+        S_ref, S_fast = ref.action(U2), fast.action(U2)
+        self.assertLess(((S_fast - S_ref).abs() / S_ref.abs()).max().item(), 1e-10)
+        self.assertGreater(((anti.action(U2) - S_ref).abs() / S_ref.abs()).max().item(), 1e-4)
+        self.assertLess(rel(fast.force(U2), ref.force(U2)), 1e-9)
+
+    def test_action_solved_at_action_tol(self):
+        """Loose solver_tol, tight action_tol: the action solve reaches action_tol, the force
+        solve only solver_tol (item 6b)."""
+        geo = G46
+        k = kappas(0.12, 0.13)
+        U, U2 = links(geo, 2, 73), links(geo, 2, 74)
+        for precision in ("double", "mixed"):
+            with self.subTest(precision=precision):
+                ref, fast = self._pair(geo, k, precision, solver_tol=1e-4, action_tol=1e-12, reuse_guess=False)
+                for term in (ref, fast):
+                    term.refresh(U, torch.Generator().manual_seed(75))
+                S_ref, S_fast = ref.action(U2), fast.action(U2)
+                self.assertLess(fast.stats["last_residual"].max().item(), 1e-11)
+                self.assertLess(((S_fast - S_ref).abs() / S_ref.abs()).max().item(), 1e-10)
+                fast.force(U2)
+                self.assertGreater(fast.stats["last_residual"].max().item(), 1e-9)
+                self.assertLess(fast.stats["last_residual"].max().item(), 1e-3)
+
+    def test_refresh_resets_warm_start(self):
+        """After refresh the next solve starts from zero: bitwise the result of a fresh term (6f)."""
+        geo = G4s
+        U, U2 = links(geo, 2, 76), links(geo, 2, 77)
+        used = FastTwoFlavourWilson(0.12, geo, solver_tol=1e-8, action_tol=1e-8)
+        used.refresh(U2, torch.Generator().manual_seed(78))
+        used.action(U)  # leaves a guess X for an unrelated phi
+        self.assertIsNotNone(used._X_h)
+        used.refresh(U, torch.Generator().manual_seed(79))
+        self.assertIsNone(used._X_h)
+        fresh = FastTwoFlavourWilson(0.12, geo, solver_tol=1e-8, action_tol=1e-8)
+        fresh.refresh(U, torch.Generator().manual_seed(79))
+        self.assertTrue(torch.equal(used.action(U2), fresh.action(U2)))
+        self.assertTrue(torch.equal(used.force(U2), fresh.force(U2)))
+
+    def test_operator_cache_follows_parameters(self):
+        """Changing kappa (float, tensor, in place), time_sign or colour_product after an operator
+        was cached for the same links takes effect (item 1)."""
+        geo = G4s
+        U, U2 = links(geo, 2, 80), links(geo, 2, 81)
+        fast = FastTwoFlavourWilson(0.12, geo, solver_tol=1e-12)
+        fast.refresh(U, torch.Generator().manual_seed(82))
+        phi = fast.phi
+        fast.action(U2)
+        op_before = fast.operator(U2)
+        self.assertIs(fast.operator(U2), op_before)
+
+        def reference(kappa, time_sign=-1.0):
+            ref = TwoFlavourWilson(kappa, geo, time_sign=time_sign, solver_tol=1e-12)
+            ref.phi = phi
+            return ref.action(U2)
+
+        def close(a, b):
+            return ((a - b).abs() / b.abs()).max().item() < 1e-10
+
+        fast.kappa = 0.13
+        self.assertTrue(close(fast.action(U2), reference(0.13)))
+        fast.kappa = kappas(0.12, 0.14)
+        self.assertTrue(close(fast.action(U2), reference(kappas(0.12, 0.14))))
+        fast.kappa[1] = 0.11  # in place: compared by value
+        self.assertTrue(close(fast.action(U2), reference(kappas(0.12, 0.11))))
+        fast.time_sign = 1.0
+        self.assertTrue(close(fast.action(U2), reference(kappas(0.12, 0.11), 1.0)))
+        fast.colour_product = "broadcast"
+        self.assertEqual(fast.operator(U2).colour_product, "broadcast")
+        op = fast.operator(U2)
+        self.assertIs(fast.operator(U2), op)  # unchanged parameters: still cached
+
+    def test_convergence_policy(self):
+        """on_unconverged: raise (default) names kind, residual and samples; warn once per kind;
+        ignore counts (item 4, fast term, double and mixed)."""
+        geo = G4s
+        U, U2 = links(geo, 2, 83), links(geo, 2, 84)
+        with self.assertRaises(ValueError):
+            FastTwoFlavourWilson(0.12, geo, on_unconverged="maybe")
+        for precision in ("double", "mixed"):
+            with self.subTest(precision=precision):
+                term = FastTwoFlavourWilson(0.12, geo, precision=precision, max_iter=2, max_outer=2)
+                self.assertEqual(term.on_unconverged, "raise")
+                term.refresh(U, torch.Generator().manual_seed(85))
+                with self.assertRaisesRegex(RuntimeError, r"action: CG not converged, relative residual .* sample\(s\) \[0, 1\]"):
+                    term.action(U2)
+                with self.assertRaisesRegex(RuntimeError, "force: CG not converged"):
+                    term.force(U2)
+                self.assertEqual(term.stats["unconverged_solves"], 2)
+                warn = FastTwoFlavourWilson(0.12, geo, precision=precision, max_iter=2, max_outer=2,
+                                            on_unconverged="warn")
+                warn.refresh(U, torch.Generator().manual_seed(85))
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    warn.action(U2)
+                    warn.action(U2)
+                    warn.force(U2)
+                kinds = [str(w.message).split(":")[0] for w in caught if issubclass(w.category, UnconvergedSolveWarning)]
+                self.assertEqual(kinds, ["FastTwoFlavourWilson action", "FastTwoFlavourWilson force"])
+                self.assertEqual(warn.stats["unconverged_solves"], 3)
+                quiet = FastTwoFlavourWilson(0.12, geo, precision=precision, max_iter=2, max_outer=2,
+                                             on_unconverged="ignore")
+                quiet.refresh(U, torch.Generator().manual_seed(85))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    quiet.action(U2)
+                self.assertEqual(quiet.stats["unconverged_solves"], 1)
+                # converged solves pass silently under the default
+                ok = FastTwoFlavourWilson(0.12, geo, precision=precision, solver_tol=1e-12)
+                ok.refresh(U, torch.Generator().manual_seed(85))
+                ok.action(U2)
+                ok.force(U2)
+                self.assertEqual(ok.stats["unconverged_solves"], 0)
 
     def test_cache_and_full_lattice_views(self):
         geo = G4s
@@ -473,6 +771,53 @@ class FastTermTest(unittest.TestCase):
         self.assertGreater((U1 - U0).abs().max().item(), 0.1)
         self.assertLess((U2 - U0).abs().max().item(), 1e-10)
         self.assertLess((P2 + P).abs().max().item(), 1e-10)
+
+    def test_reuse_guess_flag_honoured(self):
+        """At a loose solver tolerance (1e-4) the warm start breaks reversibility at O(tol)
+        (measured ~5e-6) while the cold start is reversible to rounding (~3e-15) (item 6e)."""
+        geo = G2
+        U0 = links(geo, 3, 30)
+        err = {}
+        for reuse in (False, True):
+            gen = torch.Generator().manual_seed(32)
+            ham = FastTwoFlavourHamiltonian(2.0, 0.2, geo, n_gauge_substeps=2, solver_tol=1e-4, reuse_guess=reuse)
+            self.assertEqual(ham.fermion.reuse_guess, reuse)
+            ham.refresh(U0, gen)
+            P = H.random_momenta(U0.shape, generator=gen)
+            hmc = H.HMC(geo, ham, tau=0.5, n_steps=4)
+            U1, P1, _ = hmc.integrate(U0, P)
+            U2, P2, _ = hmc.integrate(U1, -P1)
+            err[reuse] = max((U2 - U0).abs().max().item(), (P2 + P).abs().max().item())
+        self.assertLess(err[False], 1e-12)
+        self.assertGreater(err[True], 1e-8)
+
+    def test_hmc_with_rejections_matches_reference(self):
+        """Large step size (acceptance 0.3-0.8): same accept/reject pattern as the reference and
+        the same links, rejected replicas restored bitwise, in 2D and on 2^3 x 4 (item 6h)."""
+        for geo, beta, kappa, B in ((G2, 2.0, 0.2, 8), (G4s, 5.0, 0.12, 4)):
+            with self.subTest(lattice=geo.lattice):
+                U0 = links(geo, B, 50)
+                out = {}
+                for name, cls in (("ref", TwoFlavourHamiltonian), ("fast", FastTwoFlavourHamiltonian)):
+                    ham = cls(beta, kappa, geo, n_gauge_substeps=1, solver_tol=1e-12, action_tol=1e-13)
+                    hmc = H.HMC(geo, ham, tau=0.8, n_steps=1)
+                    gen = torch.Generator().manual_seed(51)
+                    U = U0.clone()
+                    accs, dHs = [], []
+                    for _ in range(3):
+                        U_prev = U.clone()
+                        U, acc, dH, _ = hmc.trajectory(U, gen)
+                        for b in (~acc).nonzero().flatten().tolist():
+                            self.assertTrue(torch.equal(U[b], U_prev[b]))
+                        accs.append(acc)
+                        dHs.append(dH)
+                    out[name] = (U, torch.stack(accs), torch.stack(dHs))
+                rate = out["ref"][1].double().mean().item()
+                self.assertGreaterEqual(rate, 0.3)
+                self.assertLessEqual(rate, 0.8)
+                self.assertTrue(torch.equal(out["fast"][1], out["ref"][1]))
+                self.assertLess((out["fast"][2] - out["ref"][2]).abs().max().item(), 1e-9)
+                self.assertLess((out["fast"][0] - out["ref"][0]).abs().max().item(), 1e-10)
 
 
 class BenchRowsTest(unittest.TestCase):
@@ -535,6 +880,30 @@ class MainHMCFastTest(unittest.TestCase):
             main.parse_args(common + ["--precision", "mixed"])
         with self.assertRaises(SystemExit):
             main.parse_args(common[:-8] + ["--fermions", "staggered", "--mass", "0.3", "--fast"])
+
+    def test_fast_flag_periodic_time(self):
+        """--time-sign 1: the --fast run reproduces the reference run (item 6a)."""
+        spec = importlib.util.spec_from_file_location("main_hmc", ROOT / "main" / "main_hmc.py")
+        main = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(main)
+        from neoqcd.fermions.io import read_observables
+
+        common = ["--D", "2", "--T", "4", "--L", "4", "--N", "3", "--beta", "2.0", "--batch", "2", "--tau", "0.5",
+                  "--n-steps", "3", "--n-gauge-substeps", "2", "--device", "cpu", "--seed", "8", "--start", "hot",
+                  "--quiet", "--fermions", "wilson", "--kappa", "0.2", "--n-traj", "3", "--solver-tol", "1e-12",
+                  "--time-sign", "1"]
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = {}
+            for name, extra in (("ref", []), ("fast", ["--fast"]), ("anti", ["--fast", "--time-sign", "-1"])):
+                out = Path(tmp) / name
+                main.main(common + extra + ["--out", str(out)])
+                cols[name] = read_observables(out / "observables.csv")
+                meta = json.loads((out / "run_meta.json").read_text())
+                self.assertEqual(meta["parameters"]["time_sign"], -1.0 if name == "anti" else 1.0)
+            np.testing.assert_allclose(cols["fast"]["dH"], cols["ref"]["dH"], rtol=0, atol=1e-8)
+            np.testing.assert_allclose(cols["fast"]["plaquette"], cols["ref"]["plaquette"], rtol=0, atol=1e-10)
+            np.testing.assert_array_equal(cols["fast"]["accepted"], cols["ref"]["accepted"])
+            self.assertGreater(np.abs(cols["anti"]["dH"] - cols["ref"]["dH"]).max(), 1e-6)
 
 
 if __name__ == "__main__":

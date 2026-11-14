@@ -76,8 +76,12 @@ Solvers
 `lean_cg`: CG with the convergence test on the host only every `check_every` iterations; no
 per-sample masking (every sample iterates until the slowest has converged; the divisions are
 guarded on the device with torch.where). Per-sample iteration counts are those of `solver.cg`
-(iterations performed while above the target); the loop count is returned through `info`.
-`mixed_precision_cg`: defect correction with complex64 inner solves and complex128 residuals.
+(iterations performed while above the target); the loop count is returned through `info`. The
+returned residual is the true one; a sample above 10 max(tol, 1e3 eps) at exit triggers a
+restart with the true residual (within `max_iter`).
+`mixed_precision_cg`: defect correction with complex64 inner solves and complex128 residuals,
+with a stagnation exit (outer step reducing |r| by less than 2) and `max_iter` as the total inner
+budget.
 
 Pseudofermion term
 ------------------
@@ -96,7 +100,7 @@ from neoqcd.fermions.algebra import project_hermitian_traceless
 from neoqcd.fermions.dirac import _kappa_tensor, gamma_matrices
 from neoqcd.fermions.hmc import Hamiltonian, WilsonGaugeAction
 from neoqcd.fermions.lattice import Geometry, fermion_boundary_links, parity
-from neoqcd.fermions.pseudofermion import TwoFlavourWilson
+from neoqcd.fermions.pseudofermion import TwoFlavourWilson, convergence_limit
 from neoqcd.fermions.solver import SolverResult, _norm2, _target
 
 __all__ = [
@@ -279,7 +283,7 @@ class HalfLatticeWilson:
         colour_product: "auto" (default), "matmul", "broadcast" or "broadcast_sum" (module
             docstring); the resolved mode is the attribute `colour_product`.
         dtype: complex dtype of the operator (default U.dtype); links are gathered in U.dtype
-            and then cast.
+            and then cast (`to(dtype)` changes it later; an upcast re-gathers from U).
 
     Fields are (B', V/2, S, N) on even sites (`apply`, `apply_dagger`, `normal`) with B' = B, or
     any B' if the links have B = 1. Layout and contraction: module docstring.
@@ -322,8 +326,11 @@ class HalfLatticeWilson:
 
     def _set_dtype(self, dtype):
         dev = self.U.device
-        self._dtype = dtype
         real = _REAL[dtype]
+        if self._links[0].dtype == torch.complex64 and dtype == torch.complex128 and self.U.dtype == torch.complex128:
+            # upcast: re-gather from the complex128 links, never from the rounded complex64 copy
+            self._links = self._gather_links(self.U)
+        self._dtype = dtype
         self._links = [l.to(dtype).contiguous() for l in self._links]
         sp = self._spin
         D, H = self.geometry.D, sp["H"]
@@ -341,7 +348,8 @@ class HalfLatticeWilson:
         self._k2 = (self.kappa ** 2).to(real).view(-1, 1, 1, 1)
 
     def to(self, dtype):
-        """The same operator in another complex dtype (tables shared, links cast)."""
+        """The same operator in another complex dtype (tables shared, links cast; an upcast to
+        complex128 re-gathers the links from `self.U`, so no single-precision rounding survives)."""
         if dtype == self._dtype:
             return self
         new = copy.copy(self)
@@ -475,7 +483,7 @@ def _bview(c, field):
     return c.view((-1,) + (1,) * (field.dim() - 1))
 
 
-def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, info=None):
+def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, info=None, max_restarts=None):
     """CG for a batched hermitian positive-definite system with few host synchronisations.
 
     The convergence test (a host sync) runs every `check_every` iterations (first at iteration
@@ -486,13 +494,26 @@ def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, 
     by zero and their x keeps improving or stays put. A sample's result therefore depends on how
     long the batch runs, at the level of its tolerance.
 
+    At exit the TRUE residual b - A x is recomputed. The recursive residual can drift below the
+    true one (and a sample flagged converged keeps iterating), so if some sample has a true
+    relative residual above max(`pseudofermion.convergence_limit(tol)`, 10 sqrt(target) / |b|)
+    = 10 max(tol, 1e3 eps, ...) and iterations are left, CG restarts from the current x with
+    r = b - A x (residual replacement) for the whole batch (samples within the limit are marked
+    converged again). `max_iter` bounds the loop iterations over all restarts, `max_restarts`
+    (None: unbounded) their number; restarts also stop when a restart round did not reduce the
+    largest true residual of the offending samples by 2 (a true-residual floor above the limit:
+    the sample ends unconverged, "stagnated" in `info`).
+
     Returns SolverResult(x, iterations, residual): `iterations` (B,) counts, as in `solver.cg`,
     the iterations performed while the sample was above its target (sticky once reached);
     `tol` is a float or a (B,) tensor of per-sample tolerances.
-    `residual` is the true |b - A x| / |b| (one extra application of A). If `info` is a dict it
-    receives "loop_iterations" (applications of A in the loop: the cost) and "checks".
+    `residual` is the true |b - A x| / |b| (one extra application of A per exit). If `info` is a
+    dict it receives "loop_iterations" (applications of A in the loop: the cost), "checks",
+    "restarts", "converged" ((B,) bool: true residual within the limit above) and "stagnated"
+    (bool: restarts stopped by the floor rule).
     """
     check_every = max(1, int(check_every))
+    max_iter = int(max_iter)
     B = b.shape[0]
     b = b.resolve_conj()  # a lazily conjugated rhs would break view_as_real in _rdot
     x0 = None if x0 is None else x0.resolve_conj()
@@ -502,42 +523,69 @@ def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, 
     else:
         x = x0.clone()
         r = b - apply_normal(x)
-    p = r.clone()
     rr = _norm2(r)
     if torch.is_tensor(tol):
         tol = tol.to(device=b.device, dtype=rr.dtype)
     target = _target(b, r, tol)
+    b2 = _norm2(b)
+    b2s = torch.where(b2 > 0, b2, torch.ones_like(b2))
+    limit = convergence_limit(tol, rr.dtype)
+    accept = torch.maximum(limit ** 2 * b2s, 100.0 * target)  # squared absolute
     tiny = torch.finfo(rr.dtype).tiny
     converged = rr <= target
     iterations = torch.zeros(B, dtype=torch.long, device=b.device)
     zero = torch.zeros_like(rr)
     one = torch.ones_like(rr)
-    n, checks = 0, 0
-    for n in range(int(max_iter) + 1):
-        if n % check_every == 0 or n == int(max_iter):
-            checks += 1
-            if bool((converged | ~torch.isfinite(rr)).all()) or n == int(max_iter):
-                break
-        Ap = apply_normal(p)
-        pAp = _rdot(p, Ap)
-        ok = pAp > tiny
-        alpha = torch.where(ok, rr / torch.where(ok, pAp, one), zero)
-        a = _bview(alpha.to(b.dtype), b)
-        x.addcmul_(p, a)
-        r.addcmul_(Ap, a, value=-1)
-        rr_new = _norm2(r)
-        ok = rr > tiny
-        beta = torch.where(ok, rr_new / torch.where(ok, rr, one), zero)
-        p.mul_(_bview(beta.to(b.dtype), p)).add_(r)
-        iterations += (~converged).long()
-        rr = rr_new
-        converged = converged | (rr <= target)
+    n_total, checks, restarts = 0, 0, 0
+    worst_prev, stagnated = None, False
+    while True:
+        p = r.clone()
+        n = 0
+        while True:
+            if n % check_every == 0 or n_total == max_iter:
+                checks += 1
+                if bool((converged | ~torch.isfinite(rr)).all()) or n_total >= max_iter:
+                    break
+            Ap = apply_normal(p)
+            pAp = _rdot(p, Ap)
+            ok = pAp > tiny
+            alpha = torch.where(ok, rr / torch.where(ok, pAp, one), zero)
+            a = _bview(alpha.to(b.dtype), b)
+            x.addcmul_(p, a)
+            r.addcmul_(Ap, a, value=-1)
+            rr_new = _norm2(r)
+            ok = rr > tiny
+            beta = torch.where(ok, rr_new / torch.where(ok, rr, one), zero)
+            p.mul_(_bview(beta.to(b.dtype), p)).add_(r)
+            iterations += (~converged).long()
+            rr = rr_new
+            converged = converged | (rr <= target)
+            n += 1
+            n_total += 1
+        r_true = b - apply_normal(x)
+        rr_true = _norm2(r_true)
+        good = rr_true <= accept
+        bad = ~good & torch.isfinite(rr_true)
+        if n_total >= max_iter or not bool(bad.any()):
+            break
+        if max_restarts is not None and restarts >= int(max_restarts):
+            break
+        worst = float((rr_true / accept)[bad].max().item())
+        if worst_prev is not None and not worst * 4.0 <= worst_prev:
+            stagnated = True
+            break
+        worst_prev = worst
+        restarts += 1  # residual replacement (docstring)
+        r = r_true
+        rr = rr_true
+        converged = good | (rr <= target)
     if info is not None:
-        info["loop_iterations"] = n
+        info["loop_iterations"] = n_total
         info["checks"] = checks
-    r_true = _norm2(b - apply_normal(x))
-    b2 = _norm2(b)
-    residual = torch.sqrt(r_true / torch.where(b2 > 0, b2, torch.ones_like(b2)))
+        info["restarts"] = restarts
+        info["converged"] = good
+        info["stagnated"] = stagnated
+    residual = torch.sqrt(rr_true / b2s)
     return SolverResult(x, iterations, residual)
 
 
@@ -546,7 +594,7 @@ def _normal_of(op):
 
 
 def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_outer=30, max_iter=1000,
-                       check_every=10, info=None):
+                       check_every=10, info=None, stagnation_factor=2.0):
     """Defect correction (iterative refinement) for A x = b, A hermitian positive definite.
 
     `op128` and `op64` are the operator in complex128 and complex64 (objects with `normal`, e.g.
@@ -557,42 +605,67 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
     step) and update x += |r| e. Converged samples get a zero inner right-hand side (they exit the
     inner CG at once).
 
+    Stagnation: when the requested tolerance is below the attainable double-precision residual
+    the outer steps stop reducing |r|. A sample whose true residual did not decrease by
+    `stagnation_factor` over an outer step (and is not converged) is marked stagnated and frozen
+    (a step that increased |r| is undone); the loop ends when every sample is converged or
+    stagnated, after `max_outer` steps, or when the inner budget is spent.
+    `max_iter` is a total budget of complex64 loop iterations over all inner solves.
+
     Returns SolverResult(x complex128, iterations (B,) = inner CG iterations summed over the outer
     steps, residual = true complex128 relative residual). `info` (dict) receives "outer" (outer
-    steps taken), "inner_iterations" (list of per-outer max inner counts) and "loop_iterations"
-    (total complex64 operator applications in the inner loops).
+    steps taken), "inner_iterations" (list of per-outer max inner counts), "loop_iterations"
+    (total complex64 operator applications in the inner loops), "double_applications" (complex128
+    applications of A: the outer residuals), "converged" and "stagnated" ((B,) bool) and
+    "budget_exhausted" (bool).
     """
     A128, A64 = _normal_of(op128), _normal_of(op64)
     low = torch.complex64 if b.dtype == torch.complex128 else b.dtype
     B = b.shape[0]
+    budget = int(max_iter)
+    doubles = 0
     if x0 is None:
         x = torch.zeros_like(b)
         r = b.clone()
     else:
         x = x0.clone()
         r = b - A128(x)
+        doubles += 1
     target = _target(b, r, tol)
+    rr = _norm2(r)
+    factor2 = float(stagnation_factor) ** 2
+    stagnated = torch.zeros(B, dtype=torch.bool, device=b.device)
     iterations = torch.zeros(B, dtype=torch.long, device=b.device)
     inner_max, loops, outer = [], 0, 0
     for outer in range(int(max_outer) + 1):
-        rr = _norm2(r)
-        done = (rr <= target) | ~torch.isfinite(rr)
-        if bool(done.all()) or outer == int(max_outer):
+        done = (rr <= target) | ~torch.isfinite(rr) | stagnated
+        if bool(done.all()) or outer == int(max_outer) or loops >= budget:
             break
         scale = torch.sqrt(torch.where(done, torch.ones_like(rr), rr))
         rhs = torch.where(_bview(done, r), torch.zeros_like(r), r / _bview(scale, r).to(r.dtype)).to(low)
         sub = {}
         inner = torch.clamp(0.5 * torch.sqrt(target) / scale, min=float(inner_tol), max=0.5)
-        e = lean_cg(A64, rhs, tol=inner, max_iter=max_iter, check_every=check_every, info=sub)
+        # no restarts inside: the outer loop is the residual replacement
+        e = lean_cg(A64, rhs, tol=inner, max_iter=budget - loops, check_every=check_every, info=sub,
+                    max_restarts=0)
         loops += sub["loop_iterations"]
         inner_max.append(int(e.iterations.max().item()))
         iterations += e.iterations
-        x.addcmul_(e.x.to(b.dtype), _bview(scale.to(b.dtype), x))
-        r = b - A128(x)
+        x_new = x + e.x.to(b.dtype) * _bview(scale.to(b.dtype), x)
+        r_new = b - A128(x_new)
+        doubles += 1
+        rr_new = _norm2(r_new)
+        keep = (rr_new <= rr) | done  # undo a step that increased the residual
+        stagnated = stagnated | (~done & ~(rr_new * factor2 <= rr) & ~(rr_new <= target))
+        x = torch.where(_bview(keep, x), x_new, x)
+        r = torch.where(_bview(keep, r), r_new, r)
+        rr = torch.where(keep, rr_new, rr)
     if info is not None:
-        info.update(outer=outer, inner_iterations=inner_max, loop_iterations=loops)
+        info.update(outer=outer, inner_iterations=inner_max, loop_iterations=loops, double_applications=doubles,
+                    converged=rr <= target, stagnated=stagnated & ~(rr <= target),
+                    budget_exhausted=bool(loops >= budget))
     b2 = _norm2(b)
-    residual = torch.sqrt(_norm2(r) / torch.where(b2 > 0, b2, torch.ones_like(b2)))
+    residual = torch.sqrt(rr / torch.where(b2 > 0, b2, torch.ones_like(b2)))
     return SolverResult(x, iterations, residual)
 
 
@@ -603,26 +676,34 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
     Same physics, heat bath (the same Gaussian draws: eta is drawn on the full lattice exactly as
     in the reference and restricted to the even sites), action and force as `TwoFlavourWilson`
     to the solver tolerance; same `stats` keys plus "cg_loop_iterations" (operator applications
-    actually performed by the batch, the cost of `lean_cg`) and "outer_iterations" (mixed).
+    actually performed by the batch, the cost of `lean_cg`; complex64 applications with mixed
+    precision), "outer_iterations" and "double_applications" (mixed: outer steps and complex128
+    applications of the normal operator). Same convergence policy (`on_unconverged`, default
+    "raise": `pseudofermion` module doc) on the true residual of every solve.
     The eta^dagger eta cache of `action_difference` keeps the identity + `_version` guard.
 
     Extra args:
         precision: "double" (lean_cg in complex128) or "mixed" (complex64 inner solves,
             complex128 residuals, converging to the same tolerances).
         check_every: host convergence check interval of lean_cg.
-        inner_tol, max_outer: of `mixed_precision_cg`.
+        inner_tol, max_outer: of `mixed_precision_cg` (`max_iter` is its total inner budget).
+        on_unconverged: "raise" (default), "warn" or "ignore" (as `TwoFlavourWilson`).
         colour_product: of `HalfLatticeWilson` ("auto": broadcast_sum on CUDA, matmul on CPU).
 
     Internally `phi` and `X` are half-lattice fields (`_phi_h`, `_X_h`); the attributes `phi`
     and `X` read/write full-lattice tensors (odd sites zero) for compatibility. `_solve(op, tol)`
     takes a `HalfLatticeWilson` and returns the half-lattice X, so code that mixes `_solve` with
     full-lattice phi (snf_layers.PseudofermionAction) must keep using the reference class.
-    The operator (and its complex64 copy) is cached per links tensor (identity and `_version`).
+    The operator (and its complex64 copy) is cached per links tensor (identity and `_version`)
+    and per value of every parameter that defines it (kappa, time_sign, colour_product, geometry),
+    so changing `term.kappa` or `term.time_sign` between calls takes effect. Writes through
+    `U.data`, `U.detach()` views or numpy views do not bump `U._version` and are NOT detected
+    (stale operator): unsupported, as for the eta^dagger eta cache.
     """
 
     def __init__(self, kappa, geometry, time_sign=-1.0, even_odd=True, solver_tol=1e-10, action_tol=None,
                  max_iter=2000, reuse_guess=True, precision="double", check_every=10, inner_tol=1e-6,
-                 max_outer=30, colour_product="auto"):
+                 max_outer=30, colour_product="auto", on_unconverged="raise"):
         if not even_odd:
             raise ValueError("FastTwoFlavourWilson is even-odd only")
         if precision not in ("double", "mixed"):
@@ -638,12 +719,14 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
             raise ValueError(f"colour_product must be one of {COLOUR_PRODUCTS}, got {colour_product!r}")
         self.colour_product = colour_product
         super().__init__(kappa, geometry, time_sign=time_sign, even_odd=True, solver_tol=solver_tol,
-                         action_tol=action_tol, max_iter=max_iter, reuse_guess=reuse_guess)
+                         action_tol=action_tol, max_iter=max_iter, reuse_guess=reuse_guess,
+                         on_unconverged=on_unconverged)
 
     def reset_stats(self):
         super().reset_stats()
         self.stats["cg_loop_iterations"] = 0
         self.stats["outer_iterations"] = 0
+        self.stats["double_applications"] = 0
 
     # ---- full-lattice views of the internal half fields --------------------------------------
     @property
@@ -663,14 +746,30 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
         self._X_h = None if value is None else to_half(value, self.geometry)
 
     # ---- operators ---------------------------------------------------------------------------
+    def _operator_key(self):
+        """Every parameter that defines the operator besides the links (kappa by value)."""
+        k = self.kappa
+        kappa = ("tensor", k.detach().to("cpu", torch.float64).clone()) if torch.is_tensor(k) else ("float", float(k))
+        return (kappa, float(self.time_sign), self.colour_product, self.geometry)
+
+    @staticmethod
+    def _same_key(a, b):
+        if a[1:] != b[1:] or a[0][0] != b[0][0]:
+            return False
+        if a[0][0] == "float":
+            return a[0][1] == b[0][1]
+        return a[0][1].shape == b[0][1].shape and bool(torch.equal(a[0][1], b[0][1]))
+
     def operator(self, U):
-        """HalfLatticeWilson at links U, cached while U is the same tensor with the same _version."""
+        """HalfLatticeWilson at links U, cached while U is the same tensor with the same _version
+        and the parameters (kappa, time_sign, colour_product, geometry) are unchanged."""
         c = self._op_cache
-        if c is not None and c[0] is U and c[1] == U._version:
-            return c[2]
+        key = self._operator_key()
+        if c is not None and c[0] is U and c[1] == U._version and self._same_key(c[2], key):
+            return c[3]
         op = HalfLatticeWilson(U, self.kappa, self.geometry, self.time_sign, colour_product=self.colour_product)
         op._low = None
-        self._op_cache = (U, U._version, op)
+        self._op_cache = (U, U._version, key, op)
         return op
 
     @staticmethod
@@ -694,8 +793,9 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
                                      inner_tol=self.inner_tol, max_outer=self.max_outer,
                                      max_iter=self.max_iter, check_every=self.check_every, info=info)
             self.stats["outer_iterations"] += info["outer"]
+            self.stats["double_applications"] += info["double_applications"]
         self.stats["cg_loop_iterations"] += info["loop_iterations"]
-        self._count(res)
+        self._count(res, tol, self._solve_kind_of(tol))
         self._X_h = res.x
         return res.x
 
@@ -715,7 +815,7 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
 
     def action(self, U):
         self.stats["action_calls"] += 1
-        X = self._solve(self.operator(U), self.action_tol)
+        X = self._solve_as("action", self.operator(U), self.action_tol)
         return (self._phi_h.conj() * X).real.reshape(X.shape[0], -1).sum(1)
 
     def force(self, U):
@@ -723,7 +823,7 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
         X, W = H_oe X, Y = D_hat X = X - kappa^2 H_eo W, Z = (H^dagger)_oe Y."""
         self.stats["force_calls"] += 1
         op = self.operator(U)
-        X = self._solve(op, self.solver_tol)
+        X = self._solve_as("force", op, self.solver_tol)
         W = op.hop(X, 1)
         Y = op.hop(W, 0).mul_(-op._k2).add_(X)
         Z = op.hop(Y, 1, dagger=True)

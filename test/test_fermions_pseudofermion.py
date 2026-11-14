@@ -9,6 +9,7 @@ converges in a few tens of iterations.
 
 import math
 import unittest
+import warnings
 
 import torch
 
@@ -18,7 +19,12 @@ from neoqcd.fermions.dirac import WilsonDirac, dense_matrix
 from neoqcd.fermions.exact import assemble_even_odd, assemble_hopping, log_det_two_flavour
 from neoqcd.fermions.hmc import link_sum
 from neoqcd.fermions.lattice import Geometry
-from neoqcd.fermions.pseudofermion import TwoFlavourWilson, hopping_derivative
+from neoqcd.fermions.pseudofermion import (
+    TwoFlavourWilson,
+    UnconvergedSolveWarning,
+    convergence_limit,
+    hopping_derivative,
+)
 
 G4 = Geometry(4, 4, 2, 3)  # 2^3 x 4, SU(3)
 G2 = Geometry(2, 4, 4, 3)  # 2D 4 x 4, SU(3)
@@ -232,6 +238,77 @@ class ForceExpectationTest(unittest.TestCase):
         if direction == "force":
             self.assertGreater(abs(exact), 10 * err)  # discriminating
         self.assertLess(abs(est - exact), 4 * err)
+
+
+
+class ConvergencePolicyTest(unittest.TestCase):
+    """on_unconverged of the reference term: raise (default), warn once per kind, ignore."""
+
+    def setUp(self):
+        self.U, _ = haar_links(G4, 2, 90)
+        self.U2, _ = haar_links(G4, 2, 91)
+
+    def _term(self, **kw):
+        term = TwoFlavourWilson(0.12, G4, max_iter=2, **kw)
+        term.refresh(self.U, torch.Generator().manual_seed(92))
+        return term
+
+    def test_limit(self):
+        eps = torch.finfo(torch.float64).eps
+        self.assertEqual(convergence_limit(1e-8, torch.float64), 1e-7)
+        self.assertAlmostEqual(convergence_limit(1e-16, torch.float64), 1e4 * eps)
+        self.assertAlmostEqual(convergence_limit(1e-8, torch.float32), 1e4 * torch.finfo(torch.float32).eps)
+        with self.assertRaises(ValueError):
+            TwoFlavourWilson(0.12, G4, on_unconverged="sometimes")
+
+    def test_raise_is_default(self):
+        term = self._term()
+        self.assertEqual(term.on_unconverged, "raise")
+        with self.assertRaisesRegex(RuntimeError, r"TwoFlavourWilson action: CG not converged, relative residual "
+                                                  r".*sample\(s\) \[0, 1\], iterations \[2, 2\], max_iter 2"):
+            term.action(self.U2)
+        with self.assertRaisesRegex(RuntimeError, "TwoFlavourWilson force: CG not converged"):
+            term.force(self.U2)
+        self.assertEqual(term.stats["unconverged_solves"], 2)
+        # equal tolerances: still named by the calling method
+        same = self._term(solver_tol=1e-10, action_tol=1e-10)
+        with self.assertRaisesRegex(RuntimeError, "force: CG not converged"):
+            same.force(self.U2)
+        # converged solves pass
+        ok = TwoFlavourWilson(0.12, G4, solver_tol=1e-12)
+        ok.refresh(self.U, torch.Generator().manual_seed(92))
+        ok.action(self.U2)
+        ok.force(self.U2)
+        self.assertEqual(ok.stats["unconverged_solves"], 0)
+
+    def test_warn_once_per_kind_and_ignore(self):
+        term = self._term(on_unconverged="warn")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                term.action(self.U2)
+                term.force(self.U2)
+        msgs = [str(w.message) for w in caught if issubclass(w.category, UnconvergedSolveWarning)]
+        self.assertEqual(len(msgs), 2)
+        self.assertTrue(msgs[0].startswith("TwoFlavourWilson action: CG not converged"))
+        self.assertTrue(msgs[1].startswith("TwoFlavourWilson force: CG not converged"))
+        self.assertEqual(term.stats["unconverged_solves"], 4)
+        quiet = self._term(on_unconverged="ignore")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            quiet.action(self.U2)
+        self.assertEqual(quiet.stats["unconverged_solves"], 1)
+
+    def test_count_without_tolerance_uses_looser_tolerance(self):
+        """Subclasses that call `_count(result)` themselves get the check at max(solver_tol, action_tol)."""
+        from neoqcd.fermions.solver import SolverResult
+        term = TwoFlavourWilson(0.12, G4, solver_tol=1e-6, action_tol=1e-12)
+        res = lambda r: SolverResult(torch.zeros(1), torch.tensor([3]), torch.tensor([r], dtype=torch.float64))
+        term._count(res(5e-6))  # above action_tol, below 10 solver_tol
+        with self.assertRaisesRegex(RuntimeError, "TwoFlavourWilson solve: CG not converged"):
+            term._count(res(2e-5))
+        with self.assertRaisesRegex(RuntimeError, "not converged"):
+            term._count(res(float("nan")))
 
 
 if __name__ == "__main__":

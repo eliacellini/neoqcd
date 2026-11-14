@@ -24,8 +24,24 @@ always written.
 --fast (Wilson only, default off) uses neoqcd.fermions.fast.FastTwoFlavourWilson: the same
 action, heat bath and force through the half-lattice even-odd operator and lean_cg;
 --precision mixed (with --fast) solves with complex64 inner CG and complex128 residuals to the
-same tolerances; --colour-product picks the SU(N) x spinor product (auto: broadcast on CUDA,
-matmul on CPU). All are recorded in run_meta.json ("parameters" and "run").
+same tolerances (--inner-tol, --max-outer; --max-iter is then the total inner budget per solve);
+--colour-product picks the SU(N) x spinor product (auto: broadcast_sum on CUDA, matmul on CPU);
+--check-every is the host convergence check interval of lean_cg. --precision, --colour-product,
+--check-every, --inner-tol and --max-outer are rejected without --fast (the last two also
+without --precision mixed). All are recorded in run_meta.json ("parameters" and "run").
+
+Cost columns. `cg_iter` is the sum over the solves of the trajectory of the largest per-replica
+CG iteration count (the reference and --fast double: one operator application each). With
+--precision mixed it is instead the real cost of the batch: complex64 operator applications of
+the inner loops (`cg_loop_iterations`) plus the complex128 applications of the outer residuals
+(`double_applications`), so `cg_iter_per_solve` and `seconds_per_cg_iter` in run_meta.json are
+per operator application of either precision; `cg_iter_replica` stays the per-replica inner
+iteration count. run_meta.json "run"."cg_iter_definition" records which one applies.
+
+Convergence (Wilson): every solve is checked on its true relative residual
+(neoqcd.fermions.pseudofermion, convergence policy); --on-unconverged raise (default) | warn |
+ignore. `max_residual` is the largest true relative residual of the solves of the trajectory
+(over replicas and solves; empty without fermion solves).
 
 Resume: --resume reads <out>/checkpoint.*, checks that the physics parameters agree, drops CSV
 rows past the checkpoint and continues with the stored generator state: the continuation is
@@ -83,6 +99,7 @@ OBS_FIELDS = (
     "wall_s",          # wall time of the trajectory (whole batch)
     "solve_s",         # wall time spent inside the CG solves of this trajectory
     "s_per_solve",     # solve_s / solves
+    "max_residual",    # largest true relative CG residual of the trajectory's solves (all replicas)
 )
 
 STATE_NAME = "checkpoint"
@@ -118,10 +135,17 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Wilson only: half-lattice operator and lean CG (neoqcd.fermions.fast); same physics.")
     p.add_argument("--precision", choices=("double", "mixed"), default="double",
                    help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
-    p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default="auto",
-                   help="With --fast: SU(N) x spinor product; auto = broadcast on CUDA, matmul on CPU.")
-    p.add_argument("--check-every", type=int, default=10,
-                   help="With --fast: host convergence check of the CG every k iterations.")
+    p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default=None,
+                   help="With --fast: SU(N) x spinor product; auto (default) = broadcast_sum on CUDA, matmul on CPU.")
+    p.add_argument("--check-every", type=int, default=None,
+                   help="With --fast: host convergence check of the CG every k iterations (default 10).")
+    p.add_argument("--inner-tol", type=float, default=None,
+                   help="With --precision mixed: relative tolerance of the complex64 inner solves (default 1e-6).")
+    p.add_argument("--max-outer", type=int, default=None,
+                   help="With --precision mixed: maximum outer (defect-correction) steps per solve (default 30).")
+    p.add_argument("--on-unconverged", choices=("raise", "warn", "ignore"), default=None,
+                   help="Wilson: a solve above 10 max(tol, 1e3 eps) in true relative residual raises (default), "
+                        "warns once per kind, or is ignored.")
     p.add_argument("--start", choices=("cold", "hot"), default="cold")
     p.add_argument("--therm", type=int, default=0, help="Thermalisation trajectories (recorded with therm = 1).")
     p.add_argument("--n-traj", type=int, default=100, help="Measured trajectories after thermalisation.")
@@ -170,8 +194,24 @@ def validate_args(args):
         raise SystemExit("--fast is for --fermions wilson")
     if args.precision != "double" and not args.fast:
         raise SystemExit("--precision mixed needs --fast")
+    for name in ("colour_product", "check_every"):
+        if getattr(args, name) is not None and not args.fast:
+            raise SystemExit(f"--{name.replace('_', '-')} needs --fast")
+    for name in ("inner_tol", "max_outer"):
+        if getattr(args, name) is not None and args.precision != "mixed":
+            raise SystemExit(f"--{name.replace('_', '-')} needs --fast --precision mixed")
+    if args.on_unconverged is not None and args.fermions != "wilson":
+        raise SystemExit("--on-unconverged is for --fermions wilson")
+    args.colour_product = "auto" if args.colour_product is None else args.colour_product
+    args.check_every = 10 if args.check_every is None else args.check_every
+    args.inner_tol = 1e-6 if args.inner_tol is None else args.inner_tol
+    args.max_outer = 30 if args.max_outer is None else args.max_outer
+    if args.fermions == "wilson":  # the staggered term keeps its own behaviour (recorded as None)
+        args.on_unconverged = "raise" if args.on_unconverged is None else args.on_unconverged
     if args.check_every < 1:
         raise SystemExit("--check-every must be >= 1")
+    if args.max_outer < 1 or not args.inner_tol > 0:
+        raise SystemExit("--max-outer must be >= 1 and --inner-tol > 0")
     if args.resume and args.overwrite:
         raise SystemExit("--resume and --overwrite exclude each other")
     levels = 1 if args.fermions == "none" else 2
@@ -226,10 +266,12 @@ def build_hamiltonian(args, geometry):
     if args.fermions == "wilson" and args.fast:
         ham = FastTwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps,
                                         precision=args.precision, check_every=args.check_every,
-                                        colour_product=args.colour_product, **kw)
+                                        colour_product=args.colour_product, inner_tol=args.inner_tol,
+                                        max_outer=args.max_outer, on_unconverged=args.on_unconverged, **kw)
         return ham, ham.fermion
     if args.fermions == "wilson":
-        ham = TwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps, **kw)
+        ham = TwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps,
+                                    on_unconverged=args.on_unconverged, **kw)
         return ham, ham.fermion
     if args.fermions == "staggered":
         ham = StaggeredHamiltonian(args.beta, args.mass, geometry, n_gauge_substeps=args.n_gauge_substeps, **kw)
@@ -253,19 +295,27 @@ def exact_logdet(args, geometry, U):
 
 
 class SolveTimer:
-    """Wraps the fermion term's `_solve` (instance attribute, the class is untouched) to time it."""
+    """Wraps the fermion term's `_solve` (instance attribute, the class is untouched) to time it
+    and to track the largest true residual (`max_residual`, None until a solve has run)."""
 
     def __init__(self, term, device):
         self.seconds = 0.0
+        self.max_residual = None
         self.device = device
         original = term._solve
 
         def timed(op, tol):
             _sync(device)
             t0 = time.perf_counter()
-            x = original(op, tol)
-            _sync(device)
-            self.seconds += time.perf_counter() - t0
+            try:
+                x = original(op, tol)
+            finally:
+                _sync(device)
+                self.seconds += time.perf_counter() - t0
+                last = term.stats.get("last_residual")
+                if last is not None:
+                    worst = float(last.max().item())
+                    self.max_residual = worst if self.max_residual is None else max(self.max_residual, worst)
             return x
 
         term._solve = timed
@@ -444,6 +494,11 @@ def main(argv=None):
         "fermion_operator": "half_lattice_fast" if args.fast else "reference",
         "precision": args.precision,
         "colour_product": resolve_colour_product(args.colour_product, device) if args.fast else None,
+        "on_unconverged": args.on_unconverged,
+        "cg_iter_definition": (
+            "complex64 inner loop applications + complex128 outer applications per trajectory (real cost)"
+            if args.fast and args.precision == "mixed" else
+            "sum over solves of the largest per-replica CG iteration count"),
     }
 
     def checkpoint(final=False):
@@ -468,6 +523,7 @@ def main(argv=None):
             s0 = dict(fermion.stats)
             per_sample0 = s0["cg_iterations_per_sample"]
             timer.seconds = 0.0
+            timer.max_residual = None
         _sync(device)
         t0 = time.perf_counter()
         U, accepted, dH, stats = hmc.trajectory(U, generator)
@@ -476,7 +532,11 @@ def main(argv=None):
 
         if fermion is not None:
             solves = fermion.stats["solves"] - s0["solves"]
-            cg_iter = fermion.stats["cg_iterations"] - s0["cg_iterations"]
+            if args.fast and args.precision == "mixed":  # real cost (module doc, cost columns)
+                cg_iter = (fermion.stats["cg_loop_iterations"] - s0["cg_loop_iterations"]
+                           + fermion.stats["double_applications"] - s0["double_applications"])
+            else:
+                cg_iter = fermion.stats["cg_iterations"] - s0["cg_iterations"]
             per_sample = fermion.stats["cg_iterations_per_sample"]
             if per_sample is None:
                 cg_rep = torch.zeros(args.batch, dtype=torch.long)
@@ -485,7 +545,9 @@ def main(argv=None):
             else:
                 cg_rep = (per_sample - per_sample0).cpu()
             solve_s = timer.seconds
+            max_res = timer.max_residual
         else:
+            max_res = None
             solves, cg_iter, solve_s = 0, 0, 0.0
             cg_rep = torch.zeros(args.batch, dtype=torch.long)
 
@@ -503,6 +565,7 @@ def main(argv=None):
             "logdet": None if logdet is None else logdet[b],
             "solves": solves, "cg_iter": cg_iter, "cg_iter_replica": int(cg_rep[b]),
             "wall_s": wall, "solve_s": solve_s, "s_per_solve": (solve_s / solves) if solves else None,
+            "max_residual": max_res,
         } for b in range(args.batch)]
         writer.write_rows(rows)
         traj_done += 1

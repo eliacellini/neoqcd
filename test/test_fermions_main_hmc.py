@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -137,6 +138,16 @@ class MainHMCTest(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(cols["logdet"])))
 
     def test_argument_checks(self):
+        for extra in (["--colour-product", "broadcast"], ["--check-every", "5"], ["--fast", "--inner-tol", "1e-5"],
+                      ["--fast", "--max-outer", "5"], ["--inner-tol", "1e-5"], ["--precision", "mixed"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                MAIN.parse_args(WILSON + extra)
+        with self.assertRaises(SystemExit):  # Wilson only
+            MAIN.parse_args(COMMON + ["--fermions", "staggered", "--mass", "0.3", "--on-unconverged", "warn"])
+        args = MAIN.parse_args(WILSON + ["--fast", "--precision", "mixed", "--inner-tol", "1e-5", "--max-outer", "7"])
+        self.assertEqual((args.inner_tol, args.max_outer, args.check_every, args.colour_product, args.on_unconverged),
+                         (1e-5, 7, 10, "auto", "raise"))
+        self.assertIsNone(MAIN.parse_args(COMMON + ["--fermions", "staggered", "--mass", "0.3"]).on_unconverged)
         with self.assertRaises(SystemExit):
             MAIN.parse_args(COMMON + ["--fermions", "wilson"])  # no kappa
         with self.assertRaises(SystemExit):
@@ -144,6 +155,46 @@ class MainHMCTest(unittest.TestCase):
         with self.assertRaises(SystemExit):  # 8^4 Wilson SU(3) is far too large for the dense determinant
             MAIN.main(["--D", "4", "--T", "8", "--L", "8", "--kappa", "0.153", "--exact-logdet",
                        "--device", "cpu", "--quiet", "--out", str(self.tmp / "big")])
+
+    def test_max_residual_and_convergence_policy(self):
+        """max_residual column and --on-unconverged (default raise) for reference and --fast."""
+        for extra in ([], ["--fast"], ["--fast", "--precision", "mixed"]):
+            with self.subTest(extra=extra):
+                out = self.tmp / ("ok" + "_".join(extra))
+                MAIN.main(WILSON + extra + ["--n-traj", "2", "--solver-tol", "1e-10", "--out", str(out)])
+                cols = read_observables(out / "observables.csv")
+                self.assertTrue(np.all(cols["max_residual"] > 0) and np.all(cols["max_residual"] < 1e-9))
+                meta = json.loads((out / "run_meta.json").read_text())
+                self.assertEqual(meta["run"]["on_unconverged"], "raise")
+                self.assertEqual(meta["parameters"]["on_unconverged"], "raise")
+                with self.assertRaisesRegex(RuntimeError, "not converged"):
+                    MAIN.main(WILSON + extra + ["--n-traj", "2", "--max-iter", "2", "--out", str(out) + "_raise"])
+                out = self.tmp / ("warn" + "_".join(extra))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    MAIN.main(WILSON + extra + ["--n-traj", "2", "--max-iter", "2", "--on-unconverged", "warn",
+                                                "--out", str(out)])
+                cols = read_observables(out / "observables.csv")
+                self.assertTrue(np.all(cols["max_residual"] > 1e-6))
+        # quenched: no solves, empty column
+        out = self.tmp / "quenched"
+        MAIN.main(COMMON + ["--fermions", "none", "--n-traj", "2", "--out", str(out)])
+        self.assertTrue(np.all(np.isnan(read_observables(out / "observables.csv")["max_residual"])))
+
+    def test_mixed_cost_columns(self):
+        """--precision mixed: cg_iter counts complex64 loop + complex128 outer applications."""
+        out = self.tmp / "mixed"
+        MAIN.main(WILSON + ["--fast", "--precision", "mixed", "--n-traj", "2", "--inner-tol", "1e-4",
+                            "--max-outer", "20", "--out", str(out)])
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertIn("complex64 inner loop applications", meta["run"]["cg_iter_definition"])
+        cols = read_observables(out / "observables.csv")
+        # the real cost exceeds the per-replica inner counts by at least one outer application per solve
+        self.assertTrue(np.all(cols["cg_iter"] >= cols["cg_iter_replica"] + cols["solves"]))
+        ref = self.tmp / "ref"
+        MAIN.main(WILSON + ["--n-traj", "2", "--out", str(ref)])
+        meta = json.loads((ref / "run_meta.json").read_text())
+        self.assertEqual(meta["run"]["cg_iter_definition"], "sum over solves of the largest per-replica CG iteration count")
 
     @staticmethod
     def _ar1(seed=33, phi=0.5, n=50, B=16):
