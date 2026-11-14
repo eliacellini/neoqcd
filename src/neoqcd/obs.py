@@ -20,6 +20,21 @@ from itertools import groupby
 np.set_printoptions(formatter={'object': lambda x: str(x)})
 
 
+def _drho_terms(rho, i, w_max):
+    """Terms of the Madras-Sokal error of rho(i).
+
+    Returns the vector rho(k + i) + rho(|k - i|) - 2 rho(i) rho(k) for
+    k = 1 .. w_max - i - 1, from rho[0:w_max]. The middle term is the
+    reversed slice rho(i - 1) .. rho(max(0, 2 i - w_max + 1)) (k = 1 .. min(i, w_max - i - 1),
+    rho(0) = 1 included at k = i) followed by rho(1) .. rho(w_max - 2 i - 1) (k > i).
+    """
+    stop = None if 2 * i - w_max < 0 else 2 * i - w_max
+    return (rho[i + 1:w_max]
+            + np.concatenate([rho[i - 1:stop:-1],
+                              rho[1:max(1, w_max - 2 * i)]])
+            - 2 * rho[i] * rho[1:w_max - i])
+
+
 class Obs:
     """Class for a general observable.
     Instances of Obs are the basic objects of a pyerrors error analysis.
@@ -289,10 +304,7 @@ class Obs:
             self.e_n_dtauint[e_name][0] = 0.0
 
             def _compute_drho(i):
-                tmp = (self.e_rho[e_name][i + 1:w_max]
-                       + np.concatenate([self.e_rho[e_name][i - 1:None if i - w_max // 2 < 0 else 2 * (i - w_max // 2):-1],
-                                         self.e_rho[e_name][1:max(1, w_max - 2 * i)]])
-                       - 2 * self.e_rho[e_name][i] * self.e_rho[e_name][1:w_max - i])
+                tmp = _drho_terms(self.e_rho[e_name], i, w_max)
                 self.e_drho[e_name][i] = np.sqrt(np.sum(tmp ** 2) / e_N)
 
             if self.tau_exp[e_name] > 0:
