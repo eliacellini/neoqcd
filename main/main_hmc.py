@@ -21,8 +21,9 @@ traj = therm + n_traj. Summaries use the therm = 0 rows only.
 trajectories (field empty otherwise); the cheap per-trajectory data (plaquette, dH, cost) are
 always written.
 
---fast (Wilson only, default off) uses neoqcd.fermions.fast.FastTwoFlavourWilson: the same
-action, heat bath and force through the half-lattice even-odd operator and lean_cg;
+--fast (default off) uses neoqcd.fermions.fast.FastTwoFlavourWilson (Wilson) or
+neoqcd.fermions.fast_terms.FastStaggeredPseudofermion (staggered): the same action, heat bath and
+force through the half-lattice even-odd operator and lean_cg;
 --precision mixed (with --fast) solves with complex64 inner CG and complex128 residuals to the
 same tolerances (--inner-tol, --max-outer; --max-iter is then the total inner budget per solve);
 --colour-product picks the SU(N) x spinor product (auto: broadcast_sum on CUDA, matmul on CPU);
@@ -38,7 +39,15 @@ the inner loops (`cg_loop_iterations`) plus the complex128 applications of the o
 per operator application of either precision; `cg_iter_replica` stays the per-replica inner
 iteration count. run_meta.json "run"."cg_iter_definition" records which one applies.
 
-Convergence (Wilson): every solve is checked on its true relative residual
+Hasenbusch (Wilson): --kappa-heavy K' (0 < K' < --kappa) runs HasenbuschHamiltonian (reference)
+or FastHasenbuschHamiltonian (--fast) with --hasenbusch-layout nested (ratio > heavy > gauge,
+three integrator levels: --n-ratio-substeps, --n-heavy-substeps, --n-gauge-substeps) or shared
+([ratio, heavy] > gauge, two levels; --n-heavy-substeps rejected). The cost columns sum both
+fermion terms; solve_s and max_residual cover the light and heavy MD/action solves but not the
+heavy solve inside the ratio refresh (guarded by the term itself). kappa_heavy and the layout
+are recorded in run_meta.json and are part of the resume key.
+
+Convergence (Wilson, and staggered with --fast): every solve is checked on its true relative residual
 (neoqcd.fermions.pseudofermion, convergence policy); --on-unconverged raise (default) | warn |
 ignore. `max_residual` is the largest true relative residual of the solves of the trajectory
 (over replicas and solves; empty without fermion solves).
@@ -80,6 +89,8 @@ from neoqcd.fermions.io import (  # noqa: E402
     write_npz,
 )
 from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_product  # noqa: E402
+from neoqcd.fermions.fast_terms import FastHasenbuschHamiltonian, FastStaggeredHamiltonian  # noqa: E402
+from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian  # noqa: E402
 from neoqcd.fermions.staggered_pseudofermion import StaggeredHamiltonian  # noqa: E402
@@ -132,7 +143,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-reuse-guess", dest="reuse_guess", action="store_false",
                    help="Start every CG from zero (exactly reversible trajectories).")
     p.add_argument("--fast", action="store_true",
-                   help="Wilson only: half-lattice operator and lean CG (neoqcd.fermions.fast); same physics.")
+                   help="Wilson or staggered: half-lattice operator and lean CG (neoqcd.fermions.fast, "
+                        "fast_terms); same physics.")
+    p.add_argument("--kappa-heavy", type=float, default=None,
+                   help="Wilson: Hasenbusch mass preconditioning with this heavier-quark kappa' < kappa.")
+    p.add_argument("--hasenbusch-layout", choices=("nested", "shared"), default=None,
+                   help="With --kappa-heavy: nested (ratio > heavy > gauge, default) or shared ([ratio, heavy] > gauge).")
+    p.add_argument("--n-ratio-substeps", type=int, default=None,
+                   help="With --kappa-heavy: steps of the ratio level per HMC outer step (default 1).")
+    p.add_argument("--n-heavy-substeps", type=int, default=None,
+                   help="With --kappa-heavy --hasenbusch-layout nested: heavy steps per ratio position update (default 1).")
     p.add_argument("--precision", choices=("double", "mixed"), default="double",
                    help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
     p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default=None,
@@ -190,8 +210,23 @@ def validate_args(args):
         raise SystemExit("even-odd pseudofermions need even T and L")
     if args.exact_logdet and args.fermions == "none":
         raise SystemExit("--exact-logdet needs fermions")
-    if args.fast and args.fermions != "wilson":
-        raise SystemExit("--fast is for --fermions wilson")
+    if args.fast and args.fermions == "none":
+        raise SystemExit("--fast is for --fermions wilson or staggered")
+    if args.kappa_heavy is not None:
+        if args.fermions != "wilson":
+            raise SystemExit("--kappa-heavy is for --fermions wilson")
+        if not 0 < args.kappa_heavy < args.kappa:
+            raise SystemExit("--kappa-heavy must satisfy 0 < kappa_heavy < kappa")
+        args.hasenbusch_layout = "nested" if args.hasenbusch_layout is None else args.hasenbusch_layout
+        if args.n_heavy_substeps is not None and args.hasenbusch_layout != "nested":
+            raise SystemExit("--n-heavy-substeps needs --hasenbusch-layout nested")
+        for name in ("n_ratio_substeps", "n_heavy_substeps"):
+            if getattr(args, name) is not None and getattr(args, name) < 1:
+                raise SystemExit(f"--{name.replace('_', '-')} must be >= 1")
+    else:
+        for name in ("hasenbusch_layout", "n_ratio_substeps", "n_heavy_substeps"):
+            if getattr(args, name) is not None:
+                raise SystemExit(f"--{name.replace('_', '-')} needs --kappa-heavy")
     if args.precision != "double" and not args.fast:
         raise SystemExit("--precision mixed needs --fast")
     for name in ("colour_product", "check_every"):
@@ -200,13 +235,14 @@ def validate_args(args):
     for name in ("inner_tol", "max_outer"):
         if getattr(args, name) is not None and args.precision != "mixed":
             raise SystemExit(f"--{name.replace('_', '-')} needs --fast --precision mixed")
-    if args.on_unconverged is not None and args.fermions != "wilson":
-        raise SystemExit("--on-unconverged is for --fermions wilson")
+    if args.on_unconverged is not None and not (args.fermions == "wilson" or (args.fermions == "staggered" and args.fast)):
+        raise SystemExit("--on-unconverged is for --fermions wilson, or staggered with --fast")
     args.colour_product = "auto" if args.colour_product is None else args.colour_product
     args.check_every = 10 if args.check_every is None else args.check_every
     args.inner_tol = 1e-6 if args.inner_tol is None else args.inner_tol
     args.max_outer = 30 if args.max_outer is None else args.max_outer
-    if args.fermions == "wilson":  # the staggered term keeps its own behaviour (recorded as None)
+    if args.fermions == "wilson" or (args.fermions == "staggered" and args.fast):
+        # the reference staggered term keeps its own behaviour (recorded as None)
         args.on_unconverged = "raise" if args.on_unconverged is None else args.on_unconverged
     if args.check_every < 1:
         raise SystemExit("--check-every must be >= 1")
@@ -215,6 +251,8 @@ def validate_args(args):
     if args.resume and args.overwrite:
         raise SystemExit("--resume and --overwrite exclude each other")
     levels = 1 if args.fermions == "none" else 2
+    if args.kappa_heavy is not None and args.hasenbusch_layout == "nested":
+        levels = 3
     integrator = [s.strip().lower() for s in args.integrator.split(",")]
     if len(integrator) == 1:
         integrator = integrator * levels
@@ -225,7 +263,7 @@ def validate_args(args):
 
 def default_name(args):
     if args.fermions == "wilson":
-        f = f"wilson_k{args.kappa:g}"
+        f = f"wilson_k{args.kappa:g}" + ("" if args.kappa_heavy is None else f"_hb{args.kappa_heavy:g}")
     elif args.fermions == "staggered":
         f = f"staggered_m{args.mass:g}"
     else:
@@ -242,6 +280,8 @@ def physics_key(args):
         "kappa": None if args.kappa is None else float(args.kappa),
         "mass": None if args.mass is None else float(args.mass),
         "time_sign": float(args.time_sign),
+        "kappa_heavy": None if args.kappa_heavy is None else float(args.kappa_heavy),
+        "hasenbusch_layout": args.hasenbusch_layout,
     }
 
 
@@ -259,10 +299,52 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
+class FermionTerms:
+    """Several fermion terms seen as one by the driver: `stats` sums the counters of every term
+    (per-sample tensors added, `last_residual` the elementwise largest); `terms` lists them."""
+
+    SUMMED = ("solves", "cg_iterations", "cg_loop_iterations", "double_applications", "outer_iterations",
+              "refresh_calls", "action_calls", "force_calls", "unconverged_solves")
+
+    def __init__(self, terms):
+        self.terms = list(terms)
+
+    @property
+    def stats(self):
+        out = {k: sum(t.stats.get(k, 0) for t in self.terms) for k in self.SUMMED}
+        for key in ("cg_iterations_per_sample", "last_residual"):
+            vals = [t.stats.get(key) for t in self.terms if t.stats.get(key) is not None]
+            if not vals:
+                out[key] = None
+            elif key == "last_residual":
+                out[key] = torch.stack([v.reshape(-1) for v in vals]).max(dim=0).values
+            else:
+                out[key] = sum(vals[1:], vals[0].clone())
+        return out
+
+
 def build_hamiltonian(args, geometry):
-    """Hamiltonian and its fermion term (None for --fermions none)."""
+    """Hamiltonian and its fermion term (None for --fermions none; `FermionTerms` for Hasenbusch)."""
     kw = dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
               max_iter=args.max_iter, reuse_guess=args.reuse_guess)
+    fast_kw = dict(precision=args.precision, check_every=args.check_every, colour_product=args.colour_product,
+                   inner_tol=args.inner_tol, max_outer=args.max_outer)
+    if args.fermions == "wilson" and args.kappa_heavy is not None:
+        sub = {"n_ratio_substeps": args.n_ratio_substeps, "n_gauge_substeps": args.n_gauge_substeps}
+        if args.hasenbusch_layout == "nested":
+            sub["n_heavy_substeps"] = args.n_heavy_substeps
+        if args.fast:
+            ham = FastHasenbuschHamiltonian(args.beta, args.kappa, args.kappa_heavy, geometry,
+                                            layout=args.hasenbusch_layout, on_unconverged=args.on_unconverged,
+                                            **sub, **fast_kw, **kw)
+        else:
+            ham = HasenbuschHamiltonian(args.beta, args.kappa, args.kappa_heavy, geometry, layout=args.hasenbusch_layout,
+                                        on_unconverged=args.on_unconverged, **sub, **kw)
+        return ham, FermionTerms([ham.ratio, ham.heavy])
+    if args.fermions == "staggered" and args.fast:
+        ham = FastStaggeredHamiltonian(args.beta, args.mass, geometry, n_gauge_substeps=args.n_gauge_substeps,
+                                       on_unconverged=args.on_unconverged, **fast_kw, **kw)
+        return ham, ham.fermion
     if args.fermions == "wilson" and args.fast:
         ham = FastTwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps,
                                         precision=args.precision, check_every=args.check_every,
@@ -295,20 +377,27 @@ def exact_logdet(args, geometry, U):
 
 
 class SolveTimer:
-    """Wraps the fermion term's `_solve` (instance attribute, the class is untouched) to time it
-    and to track the largest true residual (`max_residual`, None until a solve has run)."""
+    """Wraps the fermion term's `_solve` (and `_solve_light` of the reference Hasenbusch ratio term;
+    instance attributes, the classes are untouched) to time it and to track the largest true
+    residual (`max_residual`, None until a solve has run). `term` may be a `FermionTerms`."""
 
     def __init__(self, term, device):
         self.seconds = 0.0
         self.max_residual = None
         self.device = device
-        original = term._solve
+        for t in getattr(term, "terms", [term]):
+            for name in ("_solve", "_solve_light"):
+                if hasattr(t, name):
+                    setattr(t, name, self._wrap(t, getattr(t, name)))
 
-        def timed(op, tol):
+    def _wrap(self, term, original):
+        device = self.device
+
+        def timed(*a, **k):
             _sync(device)
             t0 = time.perf_counter()
             try:
-                x = original(op, tol)
+                x = original(*a, **k)
             finally:
                 _sync(device)
                 self.seconds += time.perf_counter() - t0
@@ -318,7 +407,7 @@ class SolveTimer:
                     self.max_residual = worst if self.max_residual is None else max(self.max_residual, worst)
             return x
 
-        term._solve = timed
+        return timed
 
 
 def initial_links(args, geometry, device, generator):
@@ -456,6 +545,7 @@ def main(argv=None):
             raise SystemExit(f"--resume: no checkpoint in {out}")
         U, meta, rng_state = load_state(state_prefix, device=device)
         stored = {k: meta[k] for k in ("geometry", "batch", "beta", "fermions", "kappa", "mass", "time_sign")}
+        stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout")})
         if stored != physics_key(args):
             raise SystemExit(f"--resume: checkpoint parameters {stored} differ from {physics_key(args)}")
         if meta["rng"]["device"].split(":")[0] != device.type:
@@ -494,6 +584,9 @@ def main(argv=None):
         "fermion_operator": "half_lattice_fast" if args.fast else "reference",
         "precision": args.precision,
         "colour_product": resolve_colour_product(args.colour_product, device) if args.fast else None,
+        "hasenbusch": (None if args.kappa_heavy is None else
+                       {"kappa_heavy": args.kappa_heavy, "layout": args.hasenbusch_layout,
+                        "levels": [[[type(t).__name__ for t in terms], n] for terms, n in ham.levels]}),
         "on_unconverged": args.on_unconverged,
         "cg_iter_definition": (
             "complex64 inner loop applications + complex128 outer applications per trajectory (real cost)"
@@ -504,7 +597,9 @@ def main(argv=None):
     def checkpoint(final=False):
         save_state(state_prefix, U, geometry=geometry, beta=args.beta, fermions=args.fermions,
                    trajectory=traj_done, time_sign=args.time_sign, kappa=args.kappa, mass=args.mass,
-                   generator=generator, extra={"seed": args.seed, "final": bool(final)})
+                   generator=generator, extra={"seed": args.seed, "final": bool(final),
+                                               "kappa_heavy": args.kappa_heavy,
+                                               "hasenbusch_layout": args.hasenbusch_layout})
         try:
             summary, _ = summarize(csv_path, args.batch, args.gamma_S)
         except Exception as exc:  # checkpoint files are already written; never die on statistics

@@ -878,8 +878,10 @@ class MainHMCFastTest(unittest.TestCase):
                 np.testing.assert_array_equal(cols[name]["accepted"], cols["ref"]["accepted"])
         with self.assertRaises(SystemExit):
             main.parse_args(common + ["--precision", "mixed"])
-        with self.assertRaises(SystemExit):
-            main.parse_args(common[:-8] + ["--fermions", "staggered", "--mass", "0.3", "--fast"])
+        # --fast with staggered fermions is accepted (fast_terms.FastStaggeredPseudofermion)
+        args = main.parse_args(common[:-8] + ["--fermions", "staggered", "--mass", "0.3", "--fast"])
+        self.assertTrue(args.fast)
+        self.assertEqual(args.fermions, "staggered")
 
     def test_fast_flag_periodic_time(self):
         """--time-sign 1: the --fast run reproduces the reference run (item 6a)."""

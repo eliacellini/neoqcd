@@ -243,6 +243,59 @@ class MainHMCTest(unittest.TestCase):
         meta = json.loads((out / "run_meta.json").read_text())
         self.assertEqual(meta["trajectories_done"], 6)
 
+    def test_fast_staggered_and_hasenbusch_match_reference(self):
+        """--fast staggered and --kappa-heavy (both layouts): --fast gives the reference dH."""
+        tight = ["--n-traj", "3", "--no-reuse-guess", "--solver-tol", "1e-13", "--action-tol", "1e-13"]
+        cases = {
+            "staggered": COMMON + ["--fermions", "staggered", "--mass", "0.3"],
+            "hb_nested": WILSON + ["--kappa-heavy", "0.08", "--n-heavy-substeps", "2"],
+            "hb_shared": WILSON + ["--kappa-heavy", "0.08", "--hasenbusch-layout", "shared", "--n-ratio-substeps", "2"],
+        }
+        for name, base in cases.items():
+            with self.subTest(case=name):
+                cols = {}
+                for fast in ([], ["--fast"]):
+                    out = self.tmp / (name + "_".join(fast))
+                    MAIN.main(base + tight + fast + ["--out", str(out)])
+                    cols[bool(fast)] = read_observables(out / "observables.csv")
+                    meta = json.loads((out / "run_meta.json").read_text())
+                    self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fast" if fast else "reference")
+                    if name.startswith("hb"):
+                        hb = meta["run"]["hasenbusch"]
+                        self.assertEqual(hb["kappa_heavy"], 0.08)
+                        self.assertEqual(hb["layout"], name[3:])
+                        self.assertEqual(len(hb["levels"]), 3 if name == "hb_nested" else 2)
+                        self.assertEqual(hb["levels"][0][0][0], "FastRatioWilsonTerm" if fast else "RatioWilsonTerm")
+                        self.assertEqual(meta["parameters"]["kappa_heavy"], 0.08)
+                    self.assertTrue(np.all(cols[bool(fast)]["solves"] > 0))
+                    self.assertTrue(np.all(cols[bool(fast)]["max_residual"] < 1e-11))
+                self.assertLess(np.abs(cols[True]["dH"] - cols[False]["dH"]).max(), 1e-8)
+                self.assertTrue(np.array_equal(cols[True]["accepted"], cols[False]["accepted"]))
+                self.assertLess(np.abs(cols[True]["plaquette"] - cols[False]["plaquette"]).max(), 1e-10)
+
+    def test_hasenbusch_arguments_and_resume_key(self):
+        for extra in (["--hasenbusch-layout", "shared"], ["--n-heavy-substeps", "2"], ["--n-ratio-substeps", "2"],
+                      ["--kappa-heavy", "0.2"], ["--kappa-heavy", "0.08", "--hasenbusch-layout", "shared",
+                                                 "--n-heavy-substeps", "2"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                MAIN.parse_args(WILSON + extra)
+        with self.assertRaises(SystemExit):
+            MAIN.parse_args(COMMON + ["--fermions", "staggered", "--mass", "0.3", "--kappa-heavy", "0.1"])
+        with self.assertRaises(SystemExit):
+            MAIN.parse_args(COMMON + ["--fermions", "none", "--fast"])
+        args = MAIN.parse_args(WILSON + ["--kappa-heavy", "0.08"])
+        self.assertEqual((args.hasenbusch_layout, args.integrator_levels), ("nested", ["omelyan"] * 3))
+        args = MAIN.parse_args(COMMON + ["--fermions", "staggered", "--mass", "0.3", "--fast"])
+        self.assertEqual(args.on_unconverged, "raise")
+        out = self.tmp / "hb"
+        MAIN.main(WILSON + ["--kappa-heavy", "0.08", "--n-traj", "2", "--out", str(out)])
+        with self.assertRaisesRegex(SystemExit, "differ"):
+            MAIN.main(WILSON + ["--kappa-heavy", "0.09", "--n-traj", "3", "--resume", "--out", str(out)])
+        with self.assertRaisesRegex(SystemExit, "differ"):
+            MAIN.main(WILSON + ["--n-traj", "3", "--resume", "--out", str(out)])
+        MAIN.main(WILSON + ["--kappa-heavy", "0.08", "--n-traj", "3", "--resume", "--out", str(out)])
+        self.assertEqual(json.loads((out / "run_meta.json").read_text())["trajectories_done"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
