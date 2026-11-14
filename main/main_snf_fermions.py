@@ -6,10 +6,20 @@ S(U, phi; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa) (`neoqcd.fermions.act
     --protocol ... --initial lambda_0 --protocol-file f                       (lambda_1 .. lambda_n).
 --mode nemcmc: `snf.FermionNEMCMC` (HMC blocks only, --layers none);
 --mode snf:    `snf_layers.FermionSNF` (a pure-gauge layer before every HMC block, --layers
-               smearing|smearing_signed|residual, trained on mean(W) with Adam for --train-steps
-               steps; smearing_signed --rho-init 0 starts at the identity and trains, --lr-warmup
-               ramps the learning rate). Adam's first steps move every parameter by about --lr,
-               so --lr should be well below --rho-init.
+               smearing|smearing_signed|residual|hyper-residual, trained on mean(W) with Adam for
+               --train-steps steps; smearing_signed --rho-init 0 starts at the identity and trains,
+               --lr-warmup ramps the learning rate). Adam's first steps move every parameter by
+               about --lr, so --lr should be well below --rho-init.
+Residual layers (`ResidualCouplingLayer`, pure-gauge spelling of main_nemcmc_snf.py
+--nf-architecture): --layers residual (static coefficients) or hyper-residual (coefficients from a
+hyper-network of the conditioning value), --residual-n-pt, --residual-mask-mod,
+--residual-[no-]include-imag, --residual-[no-]quadratic, --residual-coeff-init, --residual-coeff-max,
+--hyper-time-embedding-dim, --hyper-hidden-dim, --hyper-depth, --hyper-activation (same names,
+defaults and validation as the pure-gauge driver); --residual-condition time|parameter and
+--residual-delta fraction|step choose what the layers receive as beta and delta_beta
+(`snf_layers.layer_conditioning`; default time/fraction: the same scale for every protocol
+parameter, see doc/fermions.md). The architecture is in run_meta.json, in the resume key and in
+the flow.json sidecar: --load-flow refuses a flow of another architecture.
 --fast (Wilson): `QCDAction(fast=True)`, the half-lattice operator and lean CG of
 `neoqcd.fermions.fast` (--precision, --colour-product, --check-every, --inner-tol, --max-outer as
 in main_hmc.py); same physics to the solver tolerance. The fast settings are in run_meta.json and
@@ -52,6 +62,7 @@ the checkpoint and continues training or evaluation where the checkpoint left it
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import platform
@@ -89,7 +100,18 @@ from neoqcd.fermions.snf import (  # noqa: E402
     effective_sample_size,
     jarzynski_free_energy,
 )
-from neoqcd.fermions.snf_layers import LAYER_KINDS, FermionSNF, make_gauge_layers  # noqa: E402
+from neoqcd.fermions.snf_layers import (  # noqa: E402
+    CONDITION_MODES,
+    DELTA_MODES,
+    HYPER_ACTIVATIONS,
+    LAYER_KINDS,
+    RESIDUAL_KINDS,
+    RESIDUAL_OPTIONS,
+    FermionSNF,
+    default_sharing,
+    make_gauge_layers,
+    residual_options,
+)
 
 SAMPLE_FIELDS = (
     "batch",         # evaluation batch index
@@ -202,7 +224,10 @@ def parse_args(argv=None):
                         "smearing it must be nonzero for training: that layer uses |rho|, whose gradient at "
                         "rho = 0 is zero, so the layers would never move; use --layers smearing_signed "
                         "--rho-init 0 for a trainable identity start. Unused with --layers none or residual.")
-    p.add_argument("--load-flow", type=str, default=None, help="flow.pt of a previous snf run (layer weights).")
+    add_residual_args(p)
+    p.add_argument("--load-flow", type=str, default=None,
+                   help="flow.pt of a previous snf run (layer weights); its flow.json sidecar must record the "
+                        "same layer architecture.")
     p.add_argument("--train-steps", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3,
                    help="Adam learning rate. Adam's first steps move every parameter by about lr whatever "
@@ -220,6 +245,93 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     validate_args(args)
     return args
+
+
+def add_residual_args(p):
+    """The residual-layer options (--layers residual|hyper-residual), named as main_nemcmc_snf.py."""
+    p.add_argument("--residual-include-imag", action="store_true", default=True)
+    p.add_argument("--residual-no-include-imag", dest="residual_include_imag", action="store_false")
+    p.add_argument("--residual-quadratic", action="store_true", default=True)
+    p.add_argument("--residual-no-quadratic", dest="residual_quadratic", action="store_false")
+    p.add_argument("--residual-coeff-init", type=float, default=None,
+                   help="Initial linear coefficients (static) or hyper-network output bias (default 1e-3); "
+                        "0 is the identity and a regular point (trainable).")
+    p.add_argument("--residual-coeff-max", type=float, default=0.0, help="tanh bound of the coefficients (0: off).")
+    p.add_argument("--residual-n-pt", type=int, default=0,
+                   help="Gauge-covariant convolutions of frozen links per residual substep (0: original plaquettes).")
+    p.add_argument("--residual-mask-mod", type=int, choices=(2, 4), default=2,
+                   help="Colouring of the residual updates (T and L multiples of it if n-pt > 0 or mod 4).")
+    p.add_argument("--hyper-time-embedding-dim", type=int, default=8)
+    p.add_argument("--hyper-hidden-dim", type=int, default=16)
+    p.add_argument("--hyper-depth", type=int, default=2)
+    p.add_argument("--hyper-activation", choices=HYPER_ACTIVATIONS, default="silu")
+    p.add_argument("--residual-condition", choices=CONDITION_MODES, default="time",
+                   help="Conditioning value of the layers: time = normalised protocol position in (0, 1] "
+                        "(default), parameter = lambda_i (pure-gauge convention).")
+    p.add_argument("--layer-sharing", choices=("shared", "per_step"), default=None,
+                   help="Residual layers: one layer for the whole protocol (shared) or one per step; default "
+                        "shared for hyper-residual, per_step for residual (as main_nemcmc_snf.py).")
+    p.add_argument("--residual-delta", choices=DELTA_MODES, default="fraction",
+                   help="Step scale of the layers' generator: fraction = (lambda_i - lambda_{i-1}) / total "
+                        "variation (default, 1/n for a linear protocol), step = pure-gauge forward difference.")
+
+
+RESIDUAL_ARG_DEFAULTS = {"residual_include_imag": True, "residual_quadratic": True, "residual_coeff_init": None,
+                         "residual_coeff_max": 0.0, "residual_n_pt": 0, "residual_mask_mod": 2,
+                         "hyper_time_embedding_dim": 8, "hyper_hidden_dim": 16, "hyper_depth": 2,
+                         "hyper_activation": "silu", "residual_condition": "time", "residual_delta": "fraction",
+                         "layer_sharing": None}
+
+
+def validate_residual_args(args):
+    """args.residual: the `residual_options` dict (None unless --layers residual|hyper-residual);
+    residual options with other layers are refused, as in main_nemcmc_snf.py."""
+    args.residual = None
+    if args.layers not in RESIDUAL_KINDS:
+        changed = [k for k, v in RESIDUAL_ARG_DEFAULTS.items() if getattr(args, k) != v]
+        if changed:
+            raise SystemExit(f"--{changed[0].replace('_', '-')} requires --layers residual or hyper-residual")
+        return
+    if args.N != 3:
+        raise SystemExit("the residual layers support SU(3) only (--N 3)")
+    kw = {key: getattr(args, attr) for key, (attr, _) in RESIDUAL_OPTIONS.items() if hasattr(args, attr)}
+    if kw.get("coeff_init") is None:
+        kw.pop("coeff_init", None)
+    try:
+        args.residual = residual_options(args.layers, lattice=(args.T,) + (args.L,) * (args.D - 1), **kw)
+    except ValueError as exc:
+        raise SystemExit(f"residual options: {exc}")
+    if args.layer_sharing is None:
+        args.layer_sharing = default_sharing(args.layers)
+
+
+def flow_architecture(args):
+    """What a flow checkpoint must match to be loaded: layer kind, residual options, conditioning."""
+    arch = {"layers": args.layers}
+    if args.residual is not None:  # coeff_init is an initial value, not architecture
+        arch["residual"] = {k: v for k, v in args.residual.items() if k != "coeff_init"}
+        arch["sharing"] = args.layer_sharing
+        arch["condition"] = args.residual_condition
+        arch["delta"] = args.residual_delta
+    return arch
+
+
+def check_flow_sidecar(args, flow_pt):
+    """Refuse a flow.pt whose sidecar records another architecture (or no sidecar at all)."""
+    sidecar = Path(flow_pt).with_suffix(".json")
+    if not sidecar.exists():
+        raise SystemExit(f"--load-flow: no sidecar {sidecar} (the layer architecture cannot be checked)")
+    meta = json.loads(sidecar.read_text())
+    recorded = meta.get("architecture")
+    if recorded is None:  # sidecars written before the residual options: layer kind only
+        recorded = {"layers": meta.get("layers")}
+        if meta.get("layers") in RESIDUAL_KINDS or meta.get("layers") != args.layers:
+            raise SystemExit(f"--load-flow: {sidecar} records layers {meta.get('layers')!r} without the "
+                             f"architecture; this run has {flow_architecture(args)}")
+        return
+    if recorded != clean_json(flow_architecture(args)):
+        raise SystemExit(f"--load-flow: the flow of {sidecar} has architecture {recorded}, this run "
+                         f"{clean_json(flow_architecture(args))}")
 
 
 def learning_rate(args, step):
@@ -326,7 +438,7 @@ def validate_args(args):
     if args.mode == "nemcmc" and args.layers != "none":
         raise SystemExit("--mode nemcmc has no layers (use --layers none or --mode snf)")
     if args.mode == "snf" and args.layers == "none":
-        raise SystemExit("--mode snf needs --layers smearing or residual")
+        raise SystemExit("--mode snf needs --layers smearing, smearing_signed, residual or hyper-residual")
     if args.mode == "nemcmc" and (args.train_steps or args.load_flow):
         raise SystemExit("--train-steps / --load-flow need --mode snf")
     if args.layers == "smearing" and args.rho_init == 0.0 and args.train_steps:
@@ -343,6 +455,7 @@ def validate_args(args):
         raise SystemExit("--eval-samples must be 0 or >= 2 (Jarzynski error)")
     uses_defect = args.protocol == "bc" or args.bc != 1.0
     args.uses_defect = uses_defect
+    validate_residual_args(args)
 
 
 def default_name(args):
@@ -371,7 +484,17 @@ def physics_key(args):
         "n_traj": args.n_traj, "tau": float(args.tau), "n_steps": args.n_steps,
         "n_gauge_substeps": args.n_gauge_substeps, "integrator": list(args.integrator_levels),
         **staggered_key(args),
+        **residual_key(args),
     }
+
+
+def residual_key(args):
+    """Resume-key entries of the residual layers (none for other layers: their keys unchanged)."""
+    if getattr(args, "residual", None) is None:
+        return {}
+    arch = flow_architecture(args)
+    return {"residual": dict(args.residual), "sharing": arch["sharing"], "condition": arch["condition"],
+            "delta": arch["delta"]}
 
 
 # ---- helpers shared with main_rex_fermions.py ---------------------------------------------------
@@ -637,8 +760,12 @@ def main(argv=None):
         flow_pars = FlowPars(D=args.D, T=args.T, L=args.L, N=args.N,
                              mask=create_mask(args.D, args.T, args.L).to(device), protocol=protocol,
                              batch_size=args.batch, device=str(device))
-        layers = make_gauge_layers(flow_pars, args.layers, rho=args.rho_init)
-        flow = FermionSNF(action, protocol, layers, flow_pars, initial_parameter=lam0, **hmc_kw).to(device)
+        layers = make_gauge_layers(flow_pars, args.layers, rho=args.rho_init,
+                                   residual=None if args.residual is None else
+                                   {k: v for k, v in args.residual.items() if k != "parameterization"},
+                                   sharing=getattr(args, "layer_sharing", None) if args.residual is not None else None)
+        flow = FermionSNF(action, protocol, layers, flow_pars, initial_parameter=lam0,
+                          condition=args.residual_condition, delta=args.residual_delta, **hmc_kw).to(device)
         params = [p for p in flow.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(params, lr=args.lr) if params else None
         if args.train_steps and not params:
@@ -647,6 +774,7 @@ def main(argv=None):
         flow = FermionNEMCMC(action, protocol, initial_parameter=lam0, **hmc_kw)
         params, optimizer = [], None
     if args.load_flow:
+        check_flow_sidecar(args, args.load_flow)
         payload = torch.load(args.load_flow, map_location=device)
         flow.load_state_dict(payload["state_dict"])
 
@@ -701,6 +829,8 @@ def main(argv=None):
                 fermions=args.fermions, mass=args.mass,
                 initial_couplings={"beta": beta0, fermion_parameter(args)[0]: kappa0, "bc": bc0},
                 defect_links=int(defect_mask[1].sum().item()) if defect_mask is not None else 0)
+    if args.mode == "snf":
+        info.update(flow_architecture=flow_architecture(args), layer_conditioning=[list(c) for c in flow.conditioning])
 
     def checkpoint(phase_, progress_, final=False):
         save_state(pool_prefix, pool.U, geometry=geometry, beta=beta0, trajectory=progress_,
@@ -712,6 +842,8 @@ def main(argv=None):
                         "optimizer": optimizer.state_dict() if optimizer is not None else None,
                         "train_step": int(progress_ if phase_ == "train" else args.train_steps)}, flow_path)
             atomic_json_save(clean_json({"physics": key, "layers": args.layers, "rho_init": args.rho_init,
+                                         "architecture": flow_architecture(args),
+                                         "conditioning": [list(c) for c in flow.conditioning],
                                          "protocol": protocol, "initial": lam0,
                                          "flow_pars": {"rho_shape": list(flow_pars.rho_shape)
                                                        if hasattr(flow_pars, "rho_shape") else None}}),

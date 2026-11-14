@@ -84,8 +84,40 @@ Identity start (`make_gauge_layers(..., kind="smearing_signed", rho=0)`, `Signed
 the pure-gauge stout layer uses |rho|, whose gradient vanishes at rho = 0, so a layer starting at
 the identity never trains; the signed variant passes rho itself to the stout map (linear in rho
 through the staples, exact log-Jacobian unchanged), so rho = 0 is the identity and a regular point.
+
+Residual layers (`make_gauge_layers(..., kind="residual"|"hyper-residual", residual={...})`, the
+pure-gauge `ResidualCouplingLayer`, SU(3) only). Options (`residual_options`, names and defaults of
+main_nemcmc_snf.py): include_imag, quadratic, coeff_init, coeff_max, n_pt (frozen-link
+convolutions), mask_mod (2 or 4; extents multiples of it when n_pt > 0 or mod 4), hyper_* (sizes of
+the hyper-network, hyper-residual only). "residual" has static coefficients, one layer per step;
+"hyper-residual" a hyper-network of the conditioning value, one layer shared by all steps (the
+pure-gauge `_nf_layer_sharing`; `sharing=` overrides). Each layer's dlogJ is the exact Haar
+log-Jacobian (dense check to ~1e-13, test_fermions_snf_residual).
+
+Conditioning (`layer_conditioning`, `FermionSNF(condition=..., delta=...)`). The pure-gauge layer
+receives beta (input of the hyper-network: Fourier features sin/cos(2^k beta), k < emb_dim/2, and
+beta itself) and delta_beta, which multiplies its generator: delta = 0 is exactly the identity.
+Passing the raw protocol value and step for kappa or bc is badly scaled: kappa ~ 0.15 spans
+~0.03 over a protocol (the Fourier features barely change: 8 * 0.03 = 0.24 rad at the highest
+frequency) and dkappa ~ 1e-3 makes the generator ~1e-3 of what the same coefficients give for a
+unit step, so the layer is a near-identity (reviewer: <log J> ~ -2e-3 at the default init). The
+default here is the same for every protocol parameter: condition "time", c_i = normalised
+protocol position in (0, 1] (i/n for a linear protocol), and delta "fraction",
+d_i = (lambda_i - lambda_{i-1}) / sum_j |lambda_j - lambda_{j-1}| (1/n for a linear protocol; the
+step INTO lambda_i, the jump this layer follows; exactly 0 for a zero step, so the identity limit
+is kept). "parameter" / "step" reproduce the pure-gauge convention (lambda_i, forward difference,
+0 for n = 1). Under "fraction" the coefficients are scaled per protocol fraction rather than per
+unit of the parameter, the same for beta, kappa, mass and bc.
+
+Identity start. coeff_init = 0 (static: zero linear and quadratic coefficients; hyper: zero output
+layer) is the exact identity (U' = U bitwise) and a regular point: the gradient with respect to the
+linear coefficients (static) or the output layer (hyper) is nonzero there. Only second-order
+parameters have zero gradient at that point (conv_eta: the convolutions enter only through
+coefficient-weighted staples; the inner hyper layers: the zero output weights), and they start
+moving after the first step. There is no analogue of the stout |rho| dead point.
 """
 
+import copy
 import warnings
 
 import torch
@@ -99,7 +131,9 @@ from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion, stag
 from neoqcd.fermions.snf import OBSERVABLES, FieldState, HMCBlock
 
 __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "FermionLayerBlock",
-           "FermionSNF", "make_gauge_layers", "SignedSmearing", "SignedCouplingLayer", "LAYER_KINDS"]
+           "FermionSNF", "make_gauge_layers", "SignedSmearing", "SignedCouplingLayer", "LAYER_KINDS",
+           "RESIDUAL_KINDS", "RESIDUAL_OPTIONS", "residual_options", "residual_flow_pars",
+           "layer_conditioning", "CONDITION_MODES", "DELTA_MODES", "default_sharing"]
 
 
 def _fermion_kind(fermion):
@@ -237,8 +271,9 @@ class FermionLayerBlock(torch.nn.Module):
         action: the `QCDAction` (holds phi and the couplings).
         flow_pars: the `FlowPars` the layer was built with (mask, ...).
         condition, delta_condition: what the layer receives as beta and delta_beta (its
-            conditioning for hyper/residual parametrisations), as `Flow._forward_layer`: the
-            protocol value lambda_i and the forward difference lambda_{i+1} - lambda_i.
+            conditioning for hyper/residual parametrisations); `FermionSNF` sets them from
+            `layer_conditioning` (default: normalised position and fractional step; "parameter" /
+            "step" give `Flow._forward_layer`'s lambda_i and lambda_{i+1} - lambda_i).
 
     `forward(state, parameter, S_old=None)` -> (new_state, dW, S_new, dlogJ):
         state: `FieldState` (U, phi); phi must be the field held by `action`;
@@ -317,20 +352,133 @@ class SignedCouplingLayer(CouplingLayer):
         self.smearing = SignedSmearing(flow_pars, time)
 
 
-LAYER_KINDS = ("smearing", "smearing_signed", "residual")
+RESIDUAL_KINDS = ("residual", "hyper-residual")
+LAYER_KINDS = ("smearing", "smearing_signed") + RESIDUAL_KINDS
+HYPER_ACTIVATIONS = ("silu", "gelu", "tanh", "relu")
+
+# Options of the residual layers (`ResidualNormalizingFlows`), keyword -> FlowPars attribute. The
+# defaults are those of the pure-gauge driver main_nemcmc_snf.py (--residual-*, --hyper-*).
+RESIDUAL_OPTIONS = {
+    "include_imag": ("residual_include_imag", True),
+    "quadratic": ("residual_quadratic", True),
+    "coeff_init": ("residual_coeff_init", 1e-3),
+    "coeff_max": ("residual_coeff_max", 0.0),
+    "n_pt": ("residual_n_pt", 0),
+    "mask_mod": ("residual_mask_mod", 2),
+    "hyper_time_embedding_dim": ("hyper_time_embedding_dim", 8),
+    "hyper_hidden_dim": ("hyper_hidden_dim", 16),
+    "hyper_depth": ("hyper_depth", 2),
+    "hyper_activation": ("hyper_activation", "silu"),
+}
 
 
-def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3):
+def _exact_int(name, value):
+    if isinstance(value, bool) or int(value) != value:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return int(value)
+
+
+def residual_options(kind="residual", lattice=None, **options):
+    """The complete, validated option set of a residual layer kind ("residual": static trainable
+    coefficients; "hyper-residual": coefficients from the hyper-network of the conditioning value,
+    `ResidualNormalizingFlows`), as a plain dict (parameterization + `RESIDUAL_OPTIONS` keys, unset
+    keys at their pure-gauge defaults); suitable for run_meta and the flow sidecar.
+
+    Validation as main_nemcmc_snf.py: n_pt >= 0, mask_mod 2 or 4, coeff_max >= 0, and with
+    `lattice` (the extents) every extent divisible by mask_mod when n_pt > 0 or mask_mod = 4
+    (periodic colouring); hyper sizes positive, embedding dimension even. In D = 2 a single
+    convolution with mask_mod = 2 adds no effective dependence (README): a RuntimeWarning."""
+    if kind not in RESIDUAL_KINDS:
+        raise ValueError(f"residual options need a residual layer kind {RESIDUAL_KINDS}, got {kind!r}")
+    unknown = set(options) - set(RESIDUAL_OPTIONS)
+    if unknown:
+        raise ValueError(f"unknown residual options {sorted(unknown)} (known: {sorted(RESIDUAL_OPTIONS)})")
+    opt = {k: options.get(k, default) for k, (_, default) in RESIDUAL_OPTIONS.items()}
+    opt["include_imag"], opt["quadratic"] = bool(opt["include_imag"]), bool(opt["quadratic"])
+    opt["coeff_init"], opt["coeff_max"] = float(opt["coeff_init"]), float(opt["coeff_max"])
+    for name in ("n_pt", "mask_mod", "hyper_time_embedding_dim", "hyper_hidden_dim", "hyper_depth"):
+        opt[name] = _exact_int(name, opt[name])
+    opt["hyper_activation"] = str(opt["hyper_activation"]).lower()
+    if opt["n_pt"] < 0:
+        raise ValueError("n_pt (residual-n-pt) must be non-negative")
+    if opt["mask_mod"] not in (2, 4):
+        raise ValueError("mask_mod (residual-mask-mod) must be 2 or 4")
+    if not opt["coeff_max"] >= 0.0:
+        raise ValueError("coeff_max must be >= 0 (0: no tanh bound)")
+    if opt["hyper_time_embedding_dim"] <= 0 or opt["hyper_time_embedding_dim"] % 2:
+        raise ValueError("hyper_time_embedding_dim must be a positive even integer")
+    if opt["hyper_hidden_dim"] < 1 or opt["hyper_depth"] < 1:
+        raise ValueError("hyper_hidden_dim and hyper_depth must be >= 1")
+    if opt["hyper_activation"] not in HYPER_ACTIVATIONS:
+        raise ValueError(f"hyper_activation must be one of {HYPER_ACTIVATIONS}")
+    if lattice is not None:
+        lattice = tuple(int(x) for x in lattice)
+        if (opt["n_pt"] or opt["mask_mod"] != 2) and any(x % opt["mask_mod"] for x in lattice):
+            raise ValueError(f"lattice extents {lattice} must be multiples of mask_mod = {opt['mask_mod']} "
+                             "for the periodic colouring (n_pt > 0 or mask_mod = 4)")
+        if len(lattice) == 2 and opt["n_pt"] == 1 and opt["mask_mod"] == 2:
+            warnings.warn("residual n_pt = 1 with mask_mod = 2 in D = 2 adds no effective dependence (README): "
+                          "use n_pt >= 2 or mask_mod = 4", RuntimeWarning, stacklevel=2)
+    opt["parameterization"] = "static" if kind == "residual" else "hyper"
+    return opt
+
+
+def residual_flow_pars(flow_pars, kind="residual", **options):
+    """A shallow copy of `flow_pars` with the residual_* / hyper_* attributes of `residual_options`
+    set (the layers read them at construction; the mask is shared)."""
+    lattice = (int(flow_pars.T),) + (int(flow_pars.L),) * (int(flow_pars.D) - 1)
+    opt = residual_options(kind, lattice=lattice, **options)
+    if int(flow_pars.N) != 3:
+        raise ValueError("the residual layers support SU(3) only")
+    fp = copy.copy(flow_pars)
+    fp.residual_parameterization = opt["parameterization"]
+    for key, (attr, _) in RESIDUAL_OPTIONS.items():
+        setattr(fp, attr, opt[key])
+    return fp
+
+
+def default_sharing(kind):
+    """"shared" for hyper-residual, "per_step" otherwise: the rule of main_nemcmc_snf.py
+    (`_nf_layer_sharing`: hyper architectures shared across the protocol, the others per block)."""
+    return "shared" if kind == "hyper-residual" else "per_step"
+
+
+def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3, residual=None, sharing=None):
     """One pure-gauge layer per protocol step, as `Flow.__init__` builds them for flow_type='snf'
     (time (i+1)/n): kind "smearing" -> `CouplingLayer` with rho_layer = rho * ones(rho_shape)
     (a float or a tensor of shape rho_shape), "smearing_signed" -> `SignedCouplingLayer` (same,
-    with a signed rho: trainable from rho = 0, the identity), "residual" -> `ResidualCouplingLayer`.
+    with a signed rho: trainable from rho = 0, the identity), "residual" / "hyper-residual" ->
+    `ResidualCouplingLayer` with static / hyper-network coefficients (the pure-gauge spelling of
+    main_nemcmc_snf.py --nf-architecture), configured by the dict `residual` of
+    `residual_options` keywords (n_pt, mask_mod, include_imag, quadratic, coeff_init, coeff_max,
+    hyper_*; unset keys at the pure-gauge defaults; rho is unused). The residual layer's
+    generator is proportional to the delta_condition its `FermionLayerBlock` passes, so the
+    conditioning of `FermionSNF` (condition, delta) decides its strength (module doc).
+
+    sharing (residual kinds): "per_step" builds n independent layers; "shared" returns the same
+    layer object n times (one set of parameters for the whole protocol, told apart only by the
+    conditioning c_i, d_i). Default `default_sharing(kind)`: shared for hyper-residual (a
+    hyper-network of a per-step constant input would be only a reparametrisation of static
+    coefficients), per_step for residual. The stout kinds are always per_step.
 
     The default rho is small but nonzero: the stout layer of kind "smearing" uses |rho|
     (`Smearing._mask_rho`), whose gradient at rho = 0 exactly is zero, so "smearing" layers built
     with rho = 0 are silently untrainable (pass rho = 0.0 explicitly for fixed identity layers,
-    the NE-MCMC limit). For an identity start that trains, use kind "smearing_signed" with rho = 0."""
+    the NE-MCMC limit). For an identity start that trains, use kind "smearing_signed" with rho = 0,
+    or a residual kind with coeff_init = 0 (a regular point, see the module doc)."""
+    if kind not in LAYER_KINDS:
+        raise ValueError(f"unknown layer kind {kind!r} (one of {LAYER_KINDS})")
+    if kind in RESIDUAL_KINDS:
+        flow_pars = residual_flow_pars(flow_pars, kind, **(residual or {}))
+    elif residual:
+        raise ValueError(f"residual options given for layer kind {kind!r}")
+    sharing = default_sharing(kind) if sharing is None else sharing
+    if sharing not in ("shared", "per_step") or (sharing == "shared" and kind not in RESIDUAL_KINDS):
+        raise ValueError(f"sharing must be 'per_step', or 'shared' for a residual kind; got {sharing!r} for {kind!r}")
     n = int(flow_pars.nstep)
+    if sharing == "shared":
+        r = torch.zeros(flow_pars.rho_shape, dtype=torch.float64).to(flow_pars.device)
+        return [ResidualCouplingLayer(flow_pars, r, 1.0)] * n
     layers = []
     for i in range(n):
         r = torch.as_tensor(rho, dtype=torch.float64) * torch.ones(flow_pars.rho_shape, dtype=torch.float64)
@@ -339,11 +487,56 @@ def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3):
             layers.append(CouplingLayer(flow_pars, r, (i + 1) / n))
         elif kind == "smearing_signed":
             layers.append(SignedCouplingLayer(flow_pars, r, (i + 1) / n))
-        elif kind == "residual":
-            layers.append(ResidualCouplingLayer(flow_pars, r, (i + 1) / n))
         else:
-            raise ValueError(f"unknown layer kind {kind!r}")
+            layers.append(ResidualCouplingLayer(flow_pars, r, (i + 1) / n))
     return layers
+
+
+CONDITION_MODES = ("time", "parameter")
+DELTA_MODES = ("fraction", "step")
+
+
+def layer_conditioning(initial, protocol, condition="time", delta="fraction"):
+    """[(c_i, d_i)], i = 1 .. n: what the layer of step i receives as beta and delta_beta.
+
+    condition "parameter": c_i = lambda_i (the pure-gauge convention, beta-conditioned);
+              "time":      c_i = s_i / s_n in (0, 1], s_i = sum_{j <= i} |lambda_j - lambda_{j-1}|
+                           (normalised protocol position; i/n for a linear protocol, and if
+                           every step is zero).
+    delta     "step":      d_i = lambda_{i+1} - lambda_i (last step: lambda_n - lambda_{n-1};
+                           0 for n = 1), exactly `Flow._forward_layer`;
+              "fraction":  d_i = (lambda_i - lambda_{i-1}) / s_n, the step INTO lambda_i (the jump
+                           the layer follows, lambda_0 = initial) as a fraction of the protocol's
+                           total variation: sum_i |d_i| = 1, 1/n for a linear protocol, whatever
+                           the parameter and its scale. d_i = 0 exactly when lambda_i =
+                           lambda_{i-1} (and all d_i = 0 if every step is zero), so a zero step
+                           still gives the identity layer."""
+    if condition not in CONDITION_MODES:
+        raise ValueError(f"condition must be one of {CONDITION_MODES}, got {condition!r}")
+    if delta not in DELTA_MODES:
+        raise ValueError(f"delta must be one of {DELTA_MODES}, got {delta!r}")
+    lam = [float(initial)] + [float(p) for p in protocol]
+    n = len(lam) - 1
+    steps = [lam[i] - lam[i - 1] for i in range(1, n + 1)]
+    total = sum(abs(s) for s in steps)
+    out = []
+    cumulative = 0.0
+    for i in range(1, n + 1):
+        cumulative += abs(steps[i - 1])
+        if condition == "parameter":
+            c = lam[i]
+        else:
+            c = cumulative / total if total > 0 else i / n
+        if delta == "fraction":
+            d = steps[i - 1] / total if total > 0 else 0.0
+        elif n == 1:
+            d = 0.0
+        elif i < n:
+            d = lam[i + 1] - lam[i]
+        else:
+            d = lam[i] - lam[i - 1]
+        out.append((float(c), float(d)))
+    return out
 
 
 class FermionSNF(torch.nn.Module):
@@ -357,6 +550,11 @@ class FermionSNF(torch.nn.Module):
         flow_pars: the `FlowPars` of the layers.
         initial_parameter: lambda_0 (default: the current parameter of `action`).
         block: an `HMCBlock`, or None to build one from `hmc_kwargs`.
+        condition, delta: what every layer receives as beta and delta_beta
+            (`layer_conditioning`; default "time" and "fraction", the normalised protocol position
+            and the fractional step, the same scale for beta, kappa, mass and bc; "parameter" and
+            "step" are the pure-gauge convention of `Flow._forward_layer`). Only the conditioned
+            layers use them (residual, hyper-smearing); the plain stout layers ignore them.
 
     `forward(state0, generator=None, int_meas=None)` -> (state, W, Q, logJ, int_obs):
         as `FermionNEMCMC.forward`, plus logJ; W carries the gradient with respect to the layer
@@ -367,7 +565,7 @@ class FermionSNF(torch.nn.Module):
     """
 
     def __init__(self, action, protocol, layers, flow_pars, initial_parameter=None, block=None,
-                 **hmc_kwargs):
+                 condition="time", delta="fraction", **hmc_kwargs):
         super().__init__()
         self.action = action
         self.protocol = [_as_parameter(p) for p in protocol]
@@ -379,15 +577,10 @@ class FermionSNF(torch.nn.Module):
         if any(torch.is_tensor(p) for p in self.protocol):
             raise ValueError("FermionSNF takes a scalar protocol (the layers are conditioned on it)")
         self.initial_parameter = action.parameter if initial_parameter is None else _as_parameter(initial_parameter)
-        blocks = []
-        for i, layer in enumerate(layers):
-            if n == 1:
-                delta = 0.0
-            elif i < n - 1:
-                delta = self.protocol[i + 1] - self.protocol[i]
-            else:
-                delta = self.protocol[i] - self.protocol[i - 1]
-            blocks.append(FermionLayerBlock(layer, action, flow_pars, self.protocol[i], delta))
+        self.condition_mode, self.delta_mode = condition, delta
+        self.conditioning = layer_conditioning(self.initial_parameter, self.protocol, condition, delta)
+        blocks = [FermionLayerBlock(layer, action, flow_pars, c, d)
+                  for layer, (c, d) in zip(layers, self.conditioning)]
         self.blocks = torch.nn.ModuleList(blocks)
         self.block = HMCBlock(action, **hmc_kwargs) if block is None else block
         self.last_run = None

@@ -264,6 +264,7 @@ Hasenbusch and staggered-action files (their times not yet measured), all passin
 | `rex` | local swap ΔS = full action difference, translation keeps the weight, rung plaquette = plain HMC (bc = 0 and 1), history and round trips, three-rung detailed balance, translation needs a periodic top rung, three Gloo ranks with `ParallelTempering` | 30s |
 | `main_hmc` | Wilson outputs and bitwise resume, rows past the checkpoint dropped, quenched and staggered runs, argument checks | 3s |
 | `main_snf_rex` | NE-MCMC in κ, SNF in bc with training and resume, interrupted SNF resumes identically, residual layers, REX outputs and resume (outputs only, not physics) | 7s |
+| `snf_residual` | residual layers: options and conditioning; SU(3) output, dlogJ = dense Haar log-Jacobian (static/hyper × n_pt 0, 1, 2 × mod 2, 4 in 2D, n_pt 1 in 4D 2^4), exact identity at zero step; dS_pf/dθ vs FD and dense solve, nonzero gradient at the identity; bookkeeping (κ, β, bc), identity layers = NE-MCMC, Jarzynski in κ; driver training, resume, architecture check of `--load-flow` | 50s |
 
 ## 5. How to run
 
@@ -301,11 +302,15 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 
 - Protocol: `--protocol beta|kappa|bc` with `--initial --final --n-step` (linear) or
   `--protocol-file`.
-- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|smearing_signed|residual --rho-init`
-  (default 1e-3; with `smearing` ρ = 0 cannot train and is refused for training,
+- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|smearing_signed|residual|hyper-residual
+  --rho-init` (default 1e-3; with `smearing` ρ = 0 cannot train and is refused for training,
   `smearing_signed --rho-init 0` is a trainable identity start) `--train-steps --lr --lr-warmup
-  --grad-clip --load-flow`. `param_abs_mean` in training.csv is the mean |ρ| the step ran with
-  (before its optimizer step).
+  --grad-clip --load-flow`. `param_abs_mean` in training.csv is the mean |parameter| the step ran
+  with (before its optimizer step).
+- Residual layers (see "Residual layers" below): `--residual-n-pt --residual-mask-mod
+  --residual-[no-]include-imag --residual-[no-]quadratic --residual-coeff-init --residual-coeff-max
+  --hyper-time-embedding-dim --hyper-hidden-dim --hyper-depth --hyper-activation --layer-sharing
+  --residual-condition --residual-delta`; refused with the other layer kinds.
 - Solver and fast path: `--solver-tol --action-tol --max-iter --no-reuse-guess --on-unconverged`
   and `--fast --precision --colour-product --check-every --inner-tol --max-outer` (§5b; part of the
   resume key; also in the two REX drivers).
@@ -319,7 +324,52 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   - `training.csv`.
   - `run_meta.json`: ΔF = −log⟨e^{−W}⟩ with jackknife error, ESS, solves and CG iterations
     per sample.
-  - `flow.pt/.json` and `pool.pt/.json` (resume).
+  - `flow.pt/.json` and `pool.pt/.json` (resume). `flow.json` records the layer architecture
+    (`architecture`: layer kind, residual options except coeff_init, sharing, conditioning modes)
+    and the per-step conditioning (c_i, d_i); `--load-flow` refuses a flow whose sidecar records
+    another architecture (or has no sidecar). The residual options are also in the resume key and
+    in `run_meta.json` (`run.flow_architecture`, `run.layer_conditioning`).
+
+**Residual layers** (`--layers residual|hyper-residual`, `snf_layers.make_gauge_layers(...,
+kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
+
+- Kinds, in the pure-gauge spelling of `main_nemcmc_snf.py --nf-architecture`: `residual` has
+  static trainable coefficients, one layer per protocol step; `hyper-residual` takes them from a
+  hyper-network of the conditioning value, one layer shared by the whole protocol (as the
+  pure-gauge `_nf_layer_sharing`; `--layer-sharing per_step|shared` overrides; a per-step
+  hyper-network of a constant input is only a reparametrisation of static coefficients).
+- Options, with the pure-gauge names, defaults and checks (`snf_layers.residual_options`):
+  `n_pt` frozen-link convolutions (default 0), `mask_mod` 2 or 4 (T and L multiples of it when
+  n_pt > 0 or mod 4; in D = 2, n_pt = 1 with mod 2 adds no effective dependence and warns),
+  imaginary and quadratic trace features (on), `coeff_init` (1e-3), `coeff_max` (tanh bound, 0 =
+  off), hyper-network embedding/hidden/depth/activation (8/16/2/silu).
+- Conditioning (`snf_layers.layer_conditioning`, `FermionSNF(condition=, delta=)`). The layer
+  receives a conditioning value c (the hyper-network input: sin/cos(2^k c) and c) and a step d that
+  multiplies its generator (d = 0 is exactly the identity). The pure-gauge convention passes β_i
+  and Δβ; for κ (≈ 0.15, Δκ ≈ 1e-3) and bc ∈ [0, 1] that is badly scaled: the Fourier features
+  barely change over a κ protocol and the layer is a near-identity (⟨log J⟩ ≈ −2e-3 at the
+  default init with Δκ = 0.0075). The default is therefore the same for every protocol parameter:
+  `--residual-condition time`, c_i = normalised protocol position s_i/s_n ∈ (0, 1] with
+  s_i = Σ_{j≤i} |λ_j − λ_{j−1}| (i/n for a linear protocol); `--residual-delta fraction`,
+  d_i = (λ_i − λ_{i−1}) / s_n, the step into λ_i (the jump the layer follows) as a fraction of the
+  total variation (1/n for a linear protocol, negative for a decreasing one, exactly 0 for a zero
+  step). `parameter` / `step` reproduce the pure-gauge convention (λ_i and the forward difference,
+  0 for n = 1). Measured on 2D 4×4, κ 0.18 → 0.21 in 4 steps (d = 1/4): static coefficients
+  1e-3 / 0.02 / 0.1 / 0.5 give ⟨log J⟩ ≈ −0.06 / −1.2 / −6 / −37, i.e. the useful range of the
+  coefficients is 1e-2-1e-1 per link (intensive: the same per-link scale on larger lattices).
+- Identity start and training: `--residual-coeff-init 0` is the exact identity (U′ = U bitwise,
+  so the SNF reproduces NE-MCMC) and a regular point: the gradient of the work with respect to
+  the linear coefficients (static) or the output layer (hyper) is nonzero there (unit test). The
+  convolution weights and the inner hyper layers have zero gradient at that point (they enter at
+  second order) and start moving after the first step; there is no dead point like the stout |ρ|.
+  Recommended: `--residual-coeff-init 0 --lr 1e-3 --lr-warmup 5` (Adam moves every coefficient by
+  ≈ lr per step, against a useful scale of 1e-2-1e-1); for hyper-residual lr ≤ 1e-3 (its output
+  coefficients move by several lr per step: every hidden unit contributes). CPU check on 2D 4×4,
+  κ 0.18 → 0.21 in 4 steps (NE-MCMC already at ESS 0.77, dissipated work 0.15), 20 Adam steps of
+  batch 16 from the identity, paired ⟨W⟩ change on 128 fixed-seed samples: lr = 1e-3 neutral
+  (−0.001 ± 0.004 for static and hyper, n_pt 0 or 2); lr = 3e-3 neutral to slightly worse; lr = 1e-2
+  worse (static +0.03-0.04 ± 0.02, hyper +0.13-0.20 ± 0.03-0.04, ESS 0.77 → 0.64-0.70). So no gain is visible on
+  this toy problem and larger rates overshoot; the gain has to be measured on 4^4 (debug job).
 
 **`main/main_rex_fermions.py`** runs single-process REX.
 
@@ -346,6 +396,9 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
   - nemcmc: 100 thermalisation trajectories and 256 samples.
   - snf: starts from the nemcmc pool, 20 Adam steps with stout layers (ρ_init = 1e-3), then 128 samples.
   - Both with `--fast`; output directories end in `_fast` (no old non-fast checkpoint is resumed).
+  - residual (optional, `POINTS="nemcmc residual"`): static residual layers with two frozen-link
+    convolutions, `--residual-coeff-init 0 --lr 1e-3 --lr-warmup 5`, 20 Adam steps, 128 samples,
+    from the nemcmc pool.
 - `job/debug_rex_fermions.sh`: 4^4, β = 5.6, κ = 0.153, a 2-link line defect, ladder bc = 0, 0.5, 1,
   4 ladders, DEO swaps with translation, 50 + 200 steps. It starts from the SNF nemcmc pool if
   present. `--fast`, directory ending in `_fast` (as `job/debug_rex_fermions_distributed.sh`).
@@ -488,6 +541,11 @@ largest residual per trajectory.
   - The legacy SU(2) stout log-Jacobian is doubled, as in `Flow._full_logdet`. This is not the
     exact Haar log-Jacobian (relative error ~1e-3 at ρ = 0.01-0.1), so SU(2) stout SNF is only
     approximately Jarzynski-exact. SU(3) is exact to ~1e-14 (unit test).
+  - Residual layers: SU(3) and the full periodic lattice only (no cropped defect patch, no
+    `residual_mode=class`); 4D mask mod 4 is tested only through the 2D Jacobian checks (a dense
+    4^4 Jacobian is too large for a unit test). Up to 14 November the fermionic `--layers residual`
+    was the hyper parameterisation with raw (λ_i, forward-difference) conditioning; it is now the
+    static one (pure-gauge spelling), and such old flows are refused by `--load-flow`.
   - The stout layer uses |ρ|, whose gradient vanishes at ρ = 0, hence the default ρ = 1e-3.
     `--layers smearing_signed` (`snf_layers.SignedCouplingLayer`, a `Smearing` subclass with a
     signed ρ; the map and its exact log-Jacobian are linear in ρ through the staples, checked
