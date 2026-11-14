@@ -358,3 +358,18 @@ Entrambi i driver girano su A100 senza errori (primo run con NCCL del driver dis
 - **REX a 4 GPU, scala [0, 1/3, 2/3, 1], L_d = 2, 100 passi:** etichette corrette, <exp(-dH)> = 1 su ogni gradino, plaquette crescente con bc (0.5506 → 0.5761), ma accettanza degli scambi 3.5% / 0.5% / 0%: nessun round trip. Servono circa 10-15 gradini (scala ottima dai dati di questo run) e migliaia di passi.
 
 Per renderli significativi: (a) SNF: protocollo più duro (meno passi o Δκ più grande, così che l'ESS del NE-MCMC scenda ben sotto 1), partenza dall'identità con lr ≤ 1e-4, training lungo in produzione; (b) REX: scala ottima, più gradini per GPU con `--allow-shared-gpu` o più nodi, run in produzione. Su 4^4 il costo è dominato dalla latenza (3.1 s per traiettoria con 4 o 16 catene): i batch grandi sono gratis.
+
+### Aggiunte ancora da fare (elenco concordato il 14 novembre)
+
+| Voce | Stato | Cosa manca |
+|---|---|---|
+| Kernel fuso per il termine di hopping | in corso | backend disponibile su Leonardo senza installazioni, benchmark |
+| Strato veloce per staggered, clover, Hasenbusch | non iniziato | oggi solo Wilson semplice |
+| Rete residual | in parte | lo strato residual gira nell'SNF fermionico (gradiente verificato), ma solo con la configurazione di default: mancano iper-rete, convoluzioni a link congelati, test dedicato |
+| DD-HMC | non iniziato | blocchi con bordo di Dirichlet, link attivi, complemento di Schur, forza del termine residuo; validazione contro Lüscher 2005 |
+| Training dei flussi con REX | non iniziato | portare ai fermioni il training a path gradient sulla scala di repliche di `cnf_training.py`; ponte verso NEO-REX |
+| Flusso sugli pseudofermioni | non iniziato, ricerca | trasportare φ insieme a U per togliere il rumore dello pseudofermione dal lavoro; compare uno Jacobiano fermionico, esatto e a basso costo solo in forme ristrette (operatori a blocchi, massa più pesante) |
+
+Ordine proposto: kernel fuso e strato veloce per gli altri operatori; rete residual completa; DD-HMC; training con REX; flusso sugli pseudofermioni. Per l'ultimo, prima misurare quanto pesa il rumore di φ nella dissipazione: nel pilota in κ un salto singolo a φ fisso ha ESS 0.48 contro 0.97 con otto passi, quindi la domanda è se un flusso su φ batte "più blocchi stocastici" a parità di solve.
+
+Note sul training SNF (14 novembre): lo stimatore è blockwise (ingressi degli strati staccati, un solve per strato, gradiente di S_pf dalla forza), come `blockwise_training_forward`. Lo Jacobiano dello strato è solo quello di gauge: φ resta fermo e la parte fermionica entra nel lavoro come S_pf(U', φ) - S_pf(U, φ). Il pilota SNF era rumore fin dal primo passo perché lr = ρ iniziale = 1e-3 (il primo passo di Adam sposta ogni parametro di ~lr): usare `--layers smearing_signed --rho-init 0 --lr 1e-4 --lr-warmup k`.
