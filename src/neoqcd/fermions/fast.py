@@ -56,9 +56,12 @@ writes the same (.., M, K) x (.., K, P) product elementwise, accumulating over t
 H) values of the contracted index with one mul and K - 1 in-place addcmul on strided slices
 (no temporary larger than the output); "broadcast_sum" is the one-shot form of
 `sun_utils.SUN_mul` on CUDA, (a[..., :, :, None] * b[..., None, :, :]).sum(-2), with a K x
-temporary. "auto" is "broadcast" on CUDA (tiny batched complex GEMMs were measured 5x slower
-than the broadcast form on an A100 for SU(3) x SU(3), main/bench_sun_mul.py) and "matmul" on
-the CPU. The same mode is used for the force outer products and link products.
+temporary. "auto" is "broadcast_sum" on CUDA and "matmul" on the CPU. Measured on an A100
+(torch 2.0, complex128) per application of the half-lattice normal operator: 8^4 batch 4,
+reference 5.55 ms, matmul 2.51, broadcast 0.625, broadcast_sum 0.592; 16^4 batch 16, reference
+336 ms, matmul 176, broadcast 55.0, broadcast_sum 53.7. broadcast_sum is the fastest in every
+configuration measured (a few per cent ahead of broadcast, 3-4x ahead of matmul: tiny batched
+complex GEMMs are slow on the GPU). The same mode is used for the force outer products and link products.
 The links are gathered once per gauge configuration and parity, with the boundary phase
 absorbed and the dagger resolved (materialised), shape (B, V/2, 2D, N, N) contiguous: memory
 2 x the gauge field. No einsum, no masks: D_hat = 1 - kappa^2 H_eo H_oe costs two half-lattice
@@ -116,11 +119,11 @@ COLOUR_PRODUCTS = ("auto", "matmul", "broadcast", "broadcast_sum")
 
 
 def resolve_colour_product(mode, device):
-    """'auto' -> 'broadcast' on CUDA, 'matmul' elsewhere; other modes are returned checked."""
+    """'auto' -> 'broadcast_sum' on CUDA, 'matmul' elsewhere; other modes are returned checked."""
     if mode not in COLOUR_PRODUCTS:
         raise ValueError(f"colour_product must be one of {COLOUR_PRODUCTS}, got {mode!r}")
     if mode == "auto":
-        return "broadcast" if torch.device(device).type == "cuda" else "matmul"
+        return "broadcast_sum" if torch.device(device).type == "cuda" else "matmul"
     return mode
 
 
@@ -608,7 +611,7 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
             complex128 residuals, converging to the same tolerances).
         check_every: host convergence check interval of lean_cg.
         inner_tol, max_outer: of `mixed_precision_cg`.
-        colour_product: of `HalfLatticeWilson` ("auto": broadcast on CUDA, matmul on CPU).
+        colour_product: of `HalfLatticeWilson` ("auto": broadcast_sum on CUDA, matmul on CPU).
 
     Internally `phi` and `X` are half-lattice fields (`_phi_h`, `_X_h`); the attributes `phi`
     and `X` read/write full-lattice tensors (odd sites zero) for compatibility. `_solve(op, tol)`

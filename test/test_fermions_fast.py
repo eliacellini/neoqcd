@@ -183,7 +183,7 @@ class ColourProductTest(unittest.TestCase):
             self.assertLess(rel(colour_mul(b.transpose(-1, -2), b[:1].conj(), mode),
                                 torch.matmul(b.transpose(-1, -2), b[:1].conj())), 1e-14)
         self.assertEqual(resolve_colour_product("auto", "cpu"), "matmul")
-        self.assertEqual(resolve_colour_product("auto", "cuda"), "broadcast")
+        self.assertEqual(resolve_colour_product("auto", "cuda"), "broadcast_sum")
         with self.assertRaises(ValueError):
             resolve_colour_product("einsum", "cpu")
 
