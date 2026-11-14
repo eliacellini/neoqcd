@@ -27,7 +27,22 @@ order
     D_dOmegaS = P_Omega* (-kappa H_cut) P_Omega    (hops Omega -> Omega*).
 Every face neighbour of a block has the opposite colour, so H_cut only connects different colours.
 
-Factorisation (eq. 3.5, white Schur complement). With the Schur complement on Omega*,
+Naming: COLOUR-MIRRORED with respect to the paper. In hep-lat/0409106 dOmega is the exterior
+boundary of Omega (it lies in Omega*), dOmega* the black sites next to white ones, and R (R_2 on
+dOmega*) comes from the Schur complement on Omega (black). This module takes the Schur complement
+on Omega* (white) and calls "dOmega*" (attribute `exterior_boundary`) the WHITE sites with a black
+neighbour, i.e. the paper's dOmega; `D_dOmega` / `D_dOmegaS` below are the hops white -> black and
+black -> white. Exchanging the colours relabels Omega <-> Omega*, so det D and the algorithm are
+the same; only the names differ. Below, "dOmega*" always means the code's set (paper's dOmega).
+
+Exact deviations from the paper (both leave the target distribution unchanged):
+  - phi_R lives on all spin-colour components of the boundary sites ("dOmega*" x spin x colour),
+    not on the reduced space of eq. (B.4) (the half of the spinor components that the projectors
+    (1 -+ gamma_mu) actually touch); R then contains trivial directions and costs a bit more.
+  - the block heat bath is phi = D_bl_hat^dag eta (the repo convention of TwoFlavourWilson,
+    S = phi^dag (D_hat^dag D_hat)^-1 phi), the same Gaussian as the paper's up to the convention.
+
+Factorisation (eq. 3.5 with the colours mirrored: white Schur complement). With the Schur complement on Omega*,
     det D = det D_Omega det(D_Omega* - D_dOmegaS D_Omega^-1 D_dOmega)
           = det D_Omega det D_Omega* det(1 - K),   K = D_Omega*^-1 D_dOmegaS D_Omega^-1 D_dOmega.
 D_dOmega reads only white sites with a black neighbour, i.e. the exterior boundary of the black
@@ -66,15 +81,20 @@ points iff some transverse y_nu (nu != mu) is in {0, b_nu - 1}, or b_mu = 2. Cou
 direction: a_mu = (b_mu - 1) [b_mu > 2] prod_{nu != mu} (b_nu - 2), fraction
 sum_mu a_mu / (D prod b). For b = 8^4: 7 * 6^3 / 8^4 = 0.369; for 2^D blocks there are none.
 Only active links are evolved in a trajectory (momenta zero elsewhere, forces masked); the gauge
-field is translated by a random vector before every trajectory (eq. 3.9), an exact symmetry of
-the action (the antiperiodic twist can be moved by psi -> -psi on a slab), so that all links are
-updated on average.
+field is translated before every trajectory (eq. 3.9), an exact symmetry of the action (the
+antiperiodic twist can be moved by psi -> -psi on a slab), so that all links are updated on
+average: by a uniform random vector (default) or by one random vector followed by regular
+block-relative steps (`DDHMC(translation="luscher")`). The translation is a symmetry ONLY WITHOUT
+a boundary-condition defect: `DDHMCHamiltonian` takes no plaquette weights, and `DDHMC.cycle`
+raises if the gauge term carries some (`check_translation_invariant`); translation=None is the
+only option with a defect, and then the fixed grid alone is not ergodic.
 """
 
 import math
 
 import torch
 
+from neoqcd.fermions._gauge import mean_plaquette, plaquette_fields
 from neoqcd.fermions.algebra import unitarize
 from neoqcd.fermions.dirac import WilsonDirac
 from neoqcd.fermions.hmc import HMC, ActionTerm, Hamiltonian, WilsonGaugeAction, random_momenta
@@ -82,7 +102,8 @@ from neoqcd.fermions.pseudofermion import TwoFlavourWilson, convergence_limit, h
 from neoqcd.fermions.solver import solve
 
 __all__ = ["BlockDecomposition", "BlockWilsonDirac", "DDOperators", "BlockTwoFlavour", "SchurTwoFlavour",
-           "MaskedActionTerm", "DDHMCHamiltonian", "DDHMC", "random_translation"]
+           "MaskedActionTerm", "DDHMCHamiltonian", "DDHMC", "ddhmc_step", "random_translation", "translate",
+           "random_shifts", "block_offset", "check_translation_invariant"]
 
 
 class BlockDecomposition:
@@ -91,7 +112,8 @@ class BlockDecomposition:
     Attributes (shapes: `lattice` for site masks, (D,) + lattice for link masks, bool):
         block_size, n_blocks: tuples per direction; block_coords (D,) + lattice; block_index
         (lattice, flat block number); colour (0 black / Omega, 1 white / Omega*); black, white;
-        interior_boundary; exterior_boundary (dOmega*: white sites with a black neighbour);
+        interior_boundary; exterior_boundary (the code's "dOmega*": white sites with a black
+        neighbour = the paper's dOmega, colour-mirrored naming, module doc);
         inblock_links, cut_links, active_links.
     """
 
@@ -366,8 +388,11 @@ class MaskedActionTerm(ActionTerm):
 
 class DDHMCHamiltonian(Hamiltonian):
     """Levels: [Schur term] (outermost), [block term] x n_block_substeps, [masked gauge] x
-    n_gauge_substeps. All forces vanish off the active links. Extra kwargs go to both fermion terms
-    (solver_tol, action_tol, max_iter)."""
+    n_gauge_substeps. All forces vanish off the active links. `block_kwargs` go to
+    `BlockTwoFlavour` (i.e. `TwoFlavourWilson`: solver_tol, action_tol, max_iter, reuse_guess,
+    even_odd, ...), `schur_kwargs` to `SchurTwoFlavour` (solver_tol, action_tol, max_iter). No
+    `plaquette_weights`: the gauge term has no defect, as required by the translations of
+    `DDHMC.cycle` (`check_translation_invariant`)."""
 
     def __init__(self, beta, kappa, blocks, n_block_substeps=1, n_gauge_substeps=1, time_sign=-1.0,
                  block_kwargs=None, schur_kwargs=None):
@@ -378,26 +403,89 @@ class DDHMCHamiltonian(Hamiltonian):
         super().__init__([([self.schur], 1), ([self.block], n_block_substeps), ([self.gauge], n_gauge_substeps)])
 
 
-def random_translation(U, generator=None):
-    """Translate every chain by its own random vector, each component uniform in [0, extent).
-
-    Returns (U_translated, shifts (B, D) long). Exact symmetry of the full action (module doc).
-    """
+def translate(U, shifts):
+    """Roll chain b of U by shifts[b] ((B, D) integers): U'(n) = U(n - shifts[b]) (torch.roll)."""
     B, D = U.shape[0], U.shape[1]
-    extents = U.shape[2:2 + D]
-    shifts = torch.stack([torch.randint(0, int(n), (B,), generator=generator, device=U.device)
-                          for n in extents], dim=1)
     out = []
     for b in range(B):
         s = tuple(int(v) for v in shifts[b].tolist())
         out.append(torch.roll(U[b:b + 1], shifts=s, dims=tuple(range(2, 2 + D))))
-    return torch.cat(out, dim=0), shifts
+    return torch.cat(out, dim=0)
+
+
+def random_shifts(B, extents, generator=None, device=None):
+    """(B, D) long: each component uniform in [0, extent)."""
+    return torch.stack([torch.randint(0, int(n), (B,), generator=generator, device=device)
+                        for n in extents], dim=1)
+
+
+def random_translation(U, generator=None):
+    """Translate every chain by its own random vector, each component uniform in [0, extent).
+
+    Returns (U_translated, shifts (B, D) long). Exact symmetry of the action WITHOUT a boundary
+    defect (module doc); `DDHMC.cycle` refuses gauge terms with plaquette weights.
+    """
+    D = U.shape[1]
+    shifts = random_shifts(U.shape[0], U.shape[2:2 + D], generator, U.device)
+    return translate(U, shifts), shifts
+
+
+def block_offset(k, block_size):
+    """The k-th block-relative offset in mixed-radix (odometer) order, direction 0 fastest:
+    k = 0, ..., prod(b) - 1 enumerates every o with 0 <= o_mu < b_mu exactly once."""
+    o = []
+    for b in block_size:
+        o.append(k % b)
+        k //= b
+    return tuple(o)
+
+
+def check_translation_invariant(hamiltonian):
+    """Raise if the gauge term carries plaquette weights (a defect): then a translation is not a
+    symmetry of the target and `DDHMC.cycle` would sample the wrong distribution."""
+    gauge = getattr(hamiltonian, "gauge", None)
+    term = getattr(gauge, "term", gauge)
+    if getattr(term, "plaquette_weights", None) is not None:
+        raise ValueError("DD-HMC translations are a symmetry only without a boundary defect: the gauge "
+                         "term has plaquette_weights; use DDHMC(..., translation=None) and accept that "
+                         "only the active links of the fixed block grid are updated")
 
 
 class DDHMC(HMC):
     """HMC on the active links of a `DDHMCHamiltonian`: momenta drawn only on the active links,
-    inactive links restored exactly after the reunitarisation. `cycle` = random translation +
-    trajectory (Luescher's update cycle)."""
+    inactive links restored exactly after the reunitarisation. `cycle` = translation + trajectory
+    (Luescher's update cycle, eq. 3.9).
+
+    translation:
+        "random" (default): every cycle translates each chain by an independent vector uniform on
+            the lattice.
+        "luscher": one uniform random vector, then `n_regular` cycles in which the field is moved
+            so that its total offset from that random vector runs through the block-relative
+            offsets o(k) = `block_offset(k, block_size)`, k = 1, ..., n_regular; then a new random
+            vector. With n_regular = prod(b) - 1 (the default) a period visits every
+            block-relative offset once, so every link is active in exactly
+            a_mu / prod(b) of the cycles of a period (tests). This is OUR reading of the
+            recommendation of Luescher's appendix C (random shift followed by regular steps);
+            the correspondence with eqs. (C.1), (C.2) of hep-lat/0409106 is UNVERIFIED. Note
+            that a single fixed diagonal step (1, ..., 1) does NOT give uniform coverage (for 4x4
+            blocks in 2D it activates some links twice as often as others), and no single step
+            vector generates all offsets when the b_mu share a factor 2; hence the odometer.
+        None: no translation (cycle = trajectory); the only option allowed with a defect, and
+            then only the active links of the fixed grid move (not ergodic on its own).
+    State of the "luscher" sequence: `self._k` (position in the period), `self._offset` (B, D).
+    """
+
+    def __init__(self, geometry, hamiltonian, tau, n_steps, translation="random", n_regular=None, **kwargs):
+        super().__init__(geometry, hamiltonian, tau, n_steps, **kwargs)
+        if translation not in ("random", "luscher", None):
+            raise ValueError(f"translation must be 'random', 'luscher' or None, got {translation!r}")
+        self.translation = translation
+        bs = hamiltonian.blocks.block_size
+        self.n_regular = math.prod(bs) - 1 if n_regular is None else int(n_regular)
+        if self.n_regular < 0:
+            raise ValueError("n_regular must be >= 0")
+        self._k = 0
+        self._offset = None
 
     def _active(self, U):
         return self.hamiltonian.blocks.link_mask(self.hamiltonian.blocks.active_links, U)
@@ -418,12 +506,37 @@ class DDHMC(HMC):
         accepted = torch.log(r) < -dH
         U_new = torch.where(accepted.reshape((B,) + (1,) * (U.dim() - 1)), U1, U)
         stats = {"exp_minus_dH": torch.exp(-dH), "acceptance": accepted.to(dH.dtype).mean().item(),
-                 "force_evals": force_evals}
+                 "force_evals": force_evals,
+                 "plaquette": mean_plaquette(plaquette_fields(U_new, self.geometry.D), self.geometry.N)}
         return U_new, accepted, dH, stats
 
+    def next_shifts(self, B, generator=None, device=None):
+        """(B, D) shifts to apply in the next cycle (advances the "luscher" sequence)."""
+        extents = self.geometry.lattice
+        if self.translation == "random":
+            return random_shifts(B, extents, generator, device)
+        if self.translation is None:
+            return torch.zeros(B, len(extents), dtype=torch.long, device=device)
+        bs = self.hamiltonian.blocks.block_size
+        if self._k == 0 or self._offset is None or self._offset.shape[0] != B:
+            self._k = 0
+            shifts = random_shifts(B, extents, generator, device)
+            self._offset = torch.zeros(B, len(extents), dtype=torch.long, device=device)
+        else:
+            new = torch.tensor(block_offset(self._k, bs), dtype=torch.long, device=device).expand(B, -1)
+            shifts = new - self._offset
+            self._offset = new.clone()
+        self._k = (self._k + 1) % (self.n_regular + 1)
+        return shifts
+
     def cycle(self, U, generator=None):
-        """Random translation of the gauge field, then one trajectory on the active links."""
-        U, shifts = random_translation(U, generator)
+        """Translation of the gauge field (`translation`), then one trajectory on the active links.
+        stats["shifts"] holds the (B, D) shifts applied (U'(n) = U(n - shift))."""
+        if self.translation is not None:
+            check_translation_invariant(self.hamiltonian)
+        shifts = self.next_shifts(U.shape[0], generator, U.device)
+        if self.translation is not None:
+            U = translate(U, shifts)
         U_new, accepted, dH, stats = self.trajectory(U, generator)
         stats["shifts"] = shifts
         return U_new, accepted, dH, stats

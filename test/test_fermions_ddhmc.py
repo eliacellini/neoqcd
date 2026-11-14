@@ -6,6 +6,7 @@ pseudofermion terms (stochastic determinant ratios, forces vs finite differences
 DD-HMC update. Prints behind NEOQCD_TEST_VERBOSE, slow comparisons behind NEOQCD_SLOW=1.
 """
 
+import itertools
 import math
 import os
 import unittest
@@ -22,11 +23,13 @@ from neoqcd.fermions.ddhmc import (
     DDHMCHamiltonian,
     DDOperators,
     SchurTwoFlavour,
+    ddhmc_step,
     random_translation,
+    translate,
 )
 from neoqcd.fermions.dirac import dense_matrix
 from neoqcd.fermions.exact import ExactMetropolis, assemble_hopping, log_det_two_flavour
-from neoqcd.fermions.lattice import Geometry
+from neoqcd.fermions.lattice import Geometry, even_odd_masks
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian
 
 VERBOSE = bool(os.environ.get("NEOQCD_TEST_VERBOSE"))
@@ -131,10 +134,10 @@ class GeometryTest(unittest.TestCase):
 class FactorisationTest(unittest.TestCase):
     CASES = ((G2_4, 2, 0.2, 11), (G2_8, 4, 0.2, 12), (G4, 2, 0.12, 13))
 
-    def run_case(self, geometry, b, kappa, seed):
+    def run_case(self, geometry, b, kappa, seed, time_sign=-1.0):
         bd = BlockDecomposition(geometry, b)
         U, _ = haar_links(geometry, 1, seed)
-        ops = DDOperators(U, kappa, bd, tol=1e-14)
+        ops = DDOperators(U, kappa, bd, time_sign=time_sign, tol=1e-14)
         M = dense_matrix(ops.full)
         Mb = dense_matrix(ops.block)
         Mdo = dense_matrix(_Wrapped(ops.D_dOmega, geometry))
@@ -179,6 +182,29 @@ class FactorisationTest(unittest.TestCase):
 
     def test_2d_8x8_blocks_4(self):
         self.run_case(*self.CASES[1])
+
+    def test_time_sign_plus_and_su2(self):
+        """Periodic time boundary (time_sign = +1) and SU(2), 2D 4x4 with 2x2 blocks."""
+        self.run_case(G2_4, 2, 0.2, 14, time_sign=1.0)
+        self.run_case(Geometry(2, 4, 4, 2), 2, 0.2, 15)
+        self.run_case(Geometry(2, 4, 4, 2), 2, 0.2, 16, time_sign=1.0)
+
+    def test_per_chain_kappa(self):
+        """A (B,) tensor of kappa: every chain's actions and forces equal those of its scalar kappa."""
+        bd = BlockDecomposition(G2_8, 4)
+        U, gen = haar_links(G2_8, 2, 17)
+        kappas = (0.15, 0.2)
+        kt = torch.tensor(kappas, dtype=torch.float64)
+        for make in (lambda k: SchurTwoFlavour(k, bd, solver_tol=1e-13, action_tol=1e-13),
+                     lambda k: BlockTwoFlavour(k, bd, solver_tol=1e-13, action_tol=1e-13, reuse_guess=False)):
+            batch = make(kt)
+            batch.refresh(U, gen)
+            S, F = batch.action(U), batch.force(U)
+            for b, k in enumerate(kappas):
+                one = make(k)
+                one.phi = batch.phi[b:b + 1].clone()
+                self.assertLess(abs(one.action(U[b:b + 1]).item() - S[b].item()), 1e-9 * abs(S[b].item()))
+                self.assertLess((one.force(U[b:b + 1]) - F[b:b + 1]).abs().max().item(), 1e-9 * F.abs().max().item())
 
     @unittest.skipUnless(SLOW, "4D dense checks take ~80 s: NEOQCD_SLOW=1")
     def test_4d_4x4x4x4_blocks_2(self):
@@ -294,7 +320,9 @@ class TermTest(unittest.TestCase):
         matrices (exact.assemble_hopping, torch.linalg.solve), U(theta) = exp(i theta_a T^a) U with
         an orthonormal basis T^a of su(N), so dS/dtheta_a = tr(F T^a). Schur term
         S_R = |P(phi - D^-1 D_dOmega phi)|^2; block term in its full-lattice form
-        (even_odd=False), S = phi^dag (D_bl^dag D_bl)^-1 phi."""
+        (even_odd=False), S = phi^dag (D_bl^dag D_bl)^-1 phi, and in its even-odd form
+        (production default), S = phi^dag (D_hat^dag D_hat)^-1 phi with
+        D_hat = 1_ee - kappa^2 H_bl,eo H_bl,oe (made invertible on the full space by 1_oo)."""
         bd, G, kappa = self.bd, G2_8, self.KAPPA
         U, gen = haar_links(G, 1, 33)
         N = G.N
@@ -329,35 +357,47 @@ class TermTest(unittest.TestCase):
             return m.reshape(-1).repeat_interleave(G.spin * G.N).to(U.dtype)
 
         black, white, P = site_mask(bd.black), site_mask(bd.white), site_mask(bd.exterior_boundary)
+        even_m, _ = even_odd_masks(G)
+        even = site_mask(even_m.reshape(G.lattice))
+        odd = 1 - even
 
         def dense_ops(theta):
             V = links(theta)
             D = eye - kappa * assemble_hopping(V, G)[0]
             Dbl = eye - kappa * assemble_hopping(V * inblock, G)[0]
             Ddo = black[:, None] * (-kappa * assemble_hopping(V * cut, G)[0]) * white[None, :]
-            return D, Dbl, Ddo
+            Hbl = assemble_hopping(V * inblock, G)[0]
+            Dhat = torch.diag(odd) + torch.diag(even) - kappa ** 2 * (even[:, None] * (Hbl @ (odd[:, None] * Hbl)) * even[None, :])
+            return D, Dbl, Ddo, Dhat
 
         schur = SchurTwoFlavour(kappa, bd, solver_tol=1e-13, action_tol=1e-13)
         block = BlockTwoFlavour(kappa, bd, even_odd=False, solver_tol=1e-13, action_tol=1e-13, reuse_guess=False)
-        for term in (schur, block):
+        block_eo = BlockTwoFlavour(kappa, bd, solver_tol=1e-13, action_tol=1e-13, reuse_guess=False)
+        for term in (schur, block, block_eo):
             term.refresh(U, gen)
         phi_R = schur.phi.reshape(-1)
         phi_b = block.phi.reshape(-1)
+        phi_e = block_eo.phi.reshape(-1)
+        self.assertEqual(phi_e[odd.real > 0].abs().max().item(), 0.0)
 
         def actions(theta):
-            D, Dbl, Ddo = dense_ops(theta)
+            D, Dbl, Ddo, Dhat = dense_ops(theta)
             chi = P * (phi_R - torch.linalg.solve(D, Ddo @ phi_R))
             S_R = (chi.conj() * chi).real.sum()
             y = torch.linalg.solve(Dbl.conj().T, phi_b)
             S_b = (y.conj() * y).real.sum()
-            return S_R, S_b
+            z = torch.linalg.solve(Dhat.conj().T, phi_e)
+            S_e = (z.conj() * z).real.sum()
+            return S_R, S_b, S_e
 
         theta = torch.zeros(U.shape[:-2] + (N * N - 1,), dtype=torch.float64, requires_grad=True)
-        S_R, S_b = actions(theta)
+        S_R, S_b, S_e = actions(theta)
         self.assertLess(abs(S_R.item() - schur.action(U).item()), 1e-9)
         self.assertLess(abs(S_b.item() - block.action(U).item()), 1e-9)
+        self.assertLess(abs(S_e.item() - block_eo.action(U).item()), 1e-9)
         active = bd.link_mask(bd.active_links, U)[..., 0, 0]  # (1, D, lattice)
-        for S, term, label in ((S_R, schur, "Schur"), (S_b, block, "block (full lattice)")):
+        for S, term, label in ((S_R, schur, "Schur"), (S_b, block, "block (full lattice)"),
+                                 (S_e, block_eo, "block (even-odd)")):
             g, = torch.autograd.grad(S, theta, retain_graph=True)
             F_auto = torch.einsum("...a,aij->...ij", g.to(U.dtype), basis) * active[..., None, None]
             F = term.force(U)
@@ -429,6 +469,24 @@ class DDHMCTest(unittest.TestCase):
         self.assertLess(err_U, 1e-9)
         self.assertLess(err_P, 1e-9)
 
+    def test_4d_trajectory_su2(self):
+        """One 4D trajectory, 8^4 SU(2), 4^4 blocks, kappa = 0.12: reversibility, inactive links
+        unchanged (~8 s)."""
+        G = Geometry(4, 8, 8, 2)
+        bd = BlockDecomposition(G, 4)
+        U, gen = haar_links(G, 1, 52)
+        ham = dd_hamiltonian(bd, 2.0, 0.12, tol=1e-12, n_block=1, n_gauge=1)
+        hmc = DDHMC(G, ham, tau=0.5, n_steps=2)
+        ham.refresh(U, gen)
+        P = hmc.momenta(U, gen)
+        U1, P1, _ = hmc.integrate(U, P)
+        U2, P2, _ = hmc.integrate(U1, -P1)
+        inactive = (bd.link_mask(~bd.active_links, U) > 0).expand_as(U)
+        self.assertEqual((U1 - U)[inactive].abs().max().item(), 0.0)
+        self.assertGreater((U1 - U).abs().max().item(), 0.05)
+        self.assertLess((U2 - U).abs().max().item(), 1e-9)
+        self.assertLess((P2 + P).abs().max().item(), 1e-9)
+
     def test_dH_scales_as_eps_squared(self):
         U, gen = haar_links(G2_8, 4, 61)
         ham = dd_hamiltonian(self.bd, self.BETA, self.KAPPA)
@@ -466,6 +524,164 @@ class DDHMCTest(unittest.TestCase):
             f"Schur solves {ham.schur.stats['solves']}, iterations/solve {ham.schur.stats['iterations'] / ham.schur.stats['solves']:.1f}")
         self.assertLess(abs(m - 1.0), 4 * e)
         self.assertGreater(acc, 0.7)
+
+
+class DDHMCUpdateTest(unittest.TestCase):
+    """Metropolis step, `cycle` / `ddhmc_step`, coverage of the translations. 2D 8x8 SU(3), 4x4
+    blocks, beta = 5.0, kappa = 0.2, a coarse step (tau = 1.5, one step) so that some chains are
+    rejected."""
+
+    BETA, KAPPA = 5.0, 0.2
+
+    def setUp(self):
+        self.bd = BlockDecomposition(G2_8, 4)
+
+    def make(self, translation="random", **kw):
+        ham = dd_hamiltonian(self.bd, self.BETA, self.KAPPA, tol=1e-10, n_block=1, n_gauge=1)
+        return ham, DDHMC(G2_8, ham, tau=1.5, n_steps=1, translation=translation, **kw)
+
+    def inactive(self, U):
+        return (self.bd.link_mask(~self.bd.active_links, U) > 0).expand_as(U)
+
+    def test_metropolis_step(self):
+        B = 8
+        gen = torch.Generator().manual_seed(81)
+        ham, hmc = self.make()
+        U = SUN_identity(G2_8.link_shape(B)[:-1], dtype=torch.cdouble)
+        U, _, _, _ = hmc.cycle(U, gen)
+        state = gen.get_state()
+        U_new, acc, dH, st = hmc.trajectory(U, gen)
+        # replay the random stream: refresh, momenta, then the Metropolis uniforms
+        g2 = torch.Generator()
+        g2.set_state(state)
+        ham.refresh(U, g2)
+        hmc.momenta(U, g2)
+        r = torch.rand(B, generator=g2, dtype=dH.dtype)
+        self.assertTrue(torch.equal(acc, torch.log(r) < -dH))
+        self.assertTrue(bool(acc.any()) and bool((~acc).any()), msg=f"{acc.tolist()} {dH.tolist()}")
+        for b in range(B):
+            if acc[b]:
+                self.assertGreater((U_new[b] - U[b]).abs().max().item(), 1e-3)
+            else:
+                self.assertTrue(torch.equal(U_new[b], U[b]))
+        self.assertEqual(st["acceptance"], acc.double().mean().item())
+        p = mean_plaquette(plaquette_fields(U_new, 2), 3)
+        self.assertTrue(torch.equal(st["plaquette"], p))
+        say(f"Metropolis: accepted {acc.tolist()}, dH {[round(x, 3) for x in dH.tolist()]}")
+
+    def check_cycle_output(self, U_in, U_new, acc, st):
+        self.assertEqual(set(st), {"exp_minus_dH", "acceptance", "force_evals", "plaquette", "shifts"})
+        self.assertEqual(tuple(st["shifts"].shape), (U_in.shape[0], 2))
+        # links in SU(N)
+        eye = torch.eye(3, dtype=U_new.dtype)
+        self.assertLess((U_new @ U_new.conj().transpose(-1, -2) - eye).abs().max().item(), 1e-12)
+        self.assertLess((torch.linalg.det(U_new) - 1).abs().max().item(), 1e-12)
+        # the translation comes before the trajectory: rejected chains and the inactive links of
+        # all chains equal the TRANSLATED input
+        Ut = translate(U_in, st["shifts"])
+        inact = self.inactive(U_new)
+        self.assertTrue(torch.equal(U_new[inact], Ut[inact]))
+        for b in range(U_in.shape[0]):
+            if not acc[b]:
+                self.assertTrue(torch.equal(U_new[b], Ut[b]))
+
+    def test_cycle_and_step(self):
+        B = 8
+        gen = torch.Generator().manual_seed(82)
+        ham, hmc = self.make()
+        U = SUN_haar(G2_8.link_shape(B)[:-1], generator=gen)
+        moved = False
+        for i in range(3):
+            step = hmc.cycle if i % 2 == 0 else (lambda V, g: ddhmc_step(hmc, V, g))
+            U_new, acc, dH, st = step(U, gen)
+            self.check_cycle_output(U, U_new, acc, st)
+            moved |= bool((st["shifts"] != 0).any())
+            U = U_new
+        self.assertTrue(moved)
+        # the random shifts are uniform on the lattice, not on the block grid: every residue
+        # modulo the block size occurs (a grid-only translation never changes the active set)
+        s = hmc.next_shifts(256, gen)
+        for mu in range(2):
+            self.assertEqual(set((s[:, mu] % self.bd.block_size[mu]).tolist()), set(range(self.bd.block_size[mu])))
+            self.assertEqual(set(s[:, mu].tolist()), set(range(G2_8.lattice[mu])))
+
+    def test_cycle_refuses_defect(self):
+        ham, hmc = self.make()
+        w = {(0, 1): torch.ones(G2_8.lattice, dtype=torch.float64)}
+        ham.gauge.term.plaquette_weights = w
+        U = SUN_identity(G2_8.link_shape(1)[:-1], dtype=torch.cdouble)
+        with self.assertRaises(ValueError):
+            hmc.cycle(U)
+        hmc.translation = None  # no translation: allowed, shifts are zero
+        U_new, _, _, st = hmc.cycle(U, torch.Generator().manual_seed(1))
+        self.assertEqual(int(st["shifts"].abs().sum()), 0)
+        with self.assertRaises(ValueError):
+            DDHMC(G2_8, ham, tau=1.0, n_steps=1, translation="diagonal")
+
+    @staticmethod
+    def coverage(bd, positions):
+        """Number of positions s at which each link of the ORIGINAL field is active: after
+        U'(n) = U(n - s) the link at x sits at x + s."""
+        D = bd.active_links.shape[0]
+        count = torch.zeros(bd.active_links.shape, dtype=torch.long)
+        for s in positions:
+            count += torch.roll(bd.active_links, shifts=tuple(-int(v) for v in s), dims=tuple(range(1, D + 1))).long()
+        return count
+
+    def test_coverage_all_translations(self):
+        """Over all translations every link is active in exactly active_fraction x (number of
+        translations) of them (cubic blocks: the same fraction in every direction); with shifts
+        restricted to multiples of the block size it fails (the grid does not move)."""
+        for g, b in ((G2_8, 4), (Geometry(2, 12, 12, 3), 6), (Geometry(4, 8, 8, 2), 4)):
+            bd = BlockDecomposition(g, b)
+            all_s = list(itertools.product(*[range(n) for n in g.lattice]))
+            c = self.coverage(bd, all_s)
+            expect = bd.active_fraction * len(all_s)
+            self.assertAlmostEqual(expect, round(expect), places=9)
+            self.assertTrue(bool((c == round(expect)).all()), msg=f"{g.lattice} {b}")
+            grid = [s for s in all_s if all(v % bd.block_size[mu] == 0 for mu, v in enumerate(s))]
+            cg = self.coverage(bd, grid)
+            self.assertFalse(bool((cg == cg.reshape(-1)[0]).all()))
+            # a fixed diagonal step (1, ..., 1) over b cycles is not uniform either
+            diag = [tuple([k] * g.D) for k in range(bd.block_size[0])]
+            cd = self.coverage(bd, diag)
+            self.assertFalse(bool((cd == cd.reshape(-1)[0]).all()))
+
+    def test_luscher_translation(self):
+        """translation="luscher": one random vector, then the block-relative offsets; after a full
+        period of prod(b) cycles every link has been active the same number of times."""
+        B = 3
+        ham, hmc = self.make(translation="luscher")
+        self.assertEqual(hmc.n_regular, 15)
+        gen = torch.Generator().manual_seed(83)
+        period = hmc.n_regular + 1
+        pos = torch.zeros(B, 2, dtype=torch.long)
+        positions = [[] for _ in range(B)]
+        firsts = []
+        for k in range(2 * period):
+            s = hmc.next_shifts(B, gen)
+            if k % period == 0:
+                pos = s.clone()
+                firsts.append(s.clone())
+            else:
+                pos = pos + s
+            for b in range(B):
+                positions[b].append(tuple(pos[b].tolist()))
+        self.assertFalse(torch.equal(firsts[0], firsts[1]))  # a new random vector every period
+        expect = self.bd.active_fraction * period
+        for b in range(B):
+            for half in (positions[b][:period], positions[b][period:]):
+                c = self.coverage(self.bd, half)
+                self.assertTrue(bool((c == round(expect)).all()))
+        # a shorter period (n_regular = 3) is accepted and restarts after 4 cycles
+        _, h2 = self.make(translation="luscher", n_regular=3)
+        seq = [h2.next_shifts(1, gen) for _ in range(5)]
+        self.assertEqual([tuple(x[0].tolist()) for x in seq[1:4]], [(1, 0), (1, 0), (1, 0)])
+        # the cycle applies the sequence
+        U = SUN_identity(G2_8.link_shape(1)[:-1], dtype=torch.cdouble)
+        _, h3 = self.make(translation="luscher")
+        U1, acc, _, st = h3.cycle(U, gen)
+        self.check_cycle_output(U, U1, acc, st)
 
 
 class DDHMCExactComparisonTest(unittest.TestCase):

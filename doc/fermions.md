@@ -49,7 +49,7 @@ at 4^4, β = 1.0, κ = 0.1 and at 8^4, β = 5.6, κ = 0.153 (§5b).
 
 **Not done.**
 
-- DD-HMC.
+- DD-HMC in the drivers and the fast path (the algorithm itself is in `ddhmc.py`, §5c).
 - Staggered SNF with layers (in progress).
 - O-REX and NEO-REX with fermions (out of this plan).
 - The 8^4, β = 5.6, κ = 0.1545 point (openQCD reference 0.5687(3) available) and the
@@ -552,6 +552,65 @@ sample indices; `"warn"` warns once per kind and term; `"ignore"` only counts
 silently. `main_hmc.py --on-unconverged` sets it; `max_residual` in observables.csv records the
 largest residual per trajectory.
 
+## 5c. DD-HMC (`ddhmc.py`, first stage)
+
+Lüscher's domain-decomposition HMC (hep-lat/0409106) for N_f = 2 Wilson fermions. The lattice is
+cut into a chessboard of blocks (black Ω, white Ω*), with even block sizes and an even number of
+blocks per direction. Cutting the links between blocks gives the block operator
+D_bl = D_Ω ⊕ D_Ω* (Dirichlet blocks), and
+
+    det D = det D_Ω · det D_Ω* · det R,   R = P (1 − D_Ω*⁻¹ D_∂Ω* D_Ω⁻¹ D_∂Ω) P   on the boundary set,
+    S = φ†(D̂_bl† D̂_bl)⁻¹φ (even-odd in the blocks) + |R⁻¹ φ_R|²,   R⁻¹ψ = P(ψ − D⁻¹ D_∂Ω ψ).
+
+Only the *active* links move in a trajectory: links inside a block with at most one end on the
+block's boundary. Momenta are zero and forces are masked elsewhere. Before every trajectory the
+field is translated: either by a uniform random vector (`translation="random"`, the default) or by
+one random vector followed by `n_regular` block-relative steps (`translation="luscher"`). The
+second option is our reading of appendix C and is not checked against eqs. (C.1)–(C.2). The
+cycle is `DDHMC.cycle` / `ddhmc_step`. Active-link fraction in 4D with cubic blocks b⁴,
+(b−1)(b−2)³/b⁴:
+
+| b | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|
+| active fraction | 0.094 | 0.247 | 0.369 | 0.531 |
+
+2^D blocks have no active links. Over all translations every link is active in exactly this
+fraction of them. A single diagonal step (1,…,1) does not give uniform coverage. The "luscher"
+option therefore runs through all prod(b) block-relative offsets in odometer order.
+
+**Naming.** The code's labels are colour-mirrored with respect to the paper. The code takes the
+Schur complement on Ω*, and its "∂Ω*" (`exterior_boundary`) is the set of white sites with a
+black neighbour, which is the paper's ∂Ω. The determinant is the same. There are two exact
+deviations from the paper. First, φ_R uses all spin-colour components on the boundary sites
+instead of the reduced space of eq. (B.4). Second, the block heat bath is φ = D̂†η, following the
+repo convention.
+
+**Validation** (`test_fermions_ddhmc.py`, CPU, complex128; fast suite under a minute):
+- geometry and masks;
+- the dense factorisation det D = det D_Ω det D_Ω* det R (modulus and phase), on 2D 4×4 and
+  8×8 with SU(3) and SU(2), for time_sign = ∓1, and on 4^4 behind `NEOQCD_SLOW`;
+- R⁻¹ checked against the dense inverse;
+- stochastic determinant ratios for both terms;
+- forces checked against finite differences (2D and 4D 8^4 SU(2)) and against autograd on every
+  active link (Schur term, block term on the full lattice and even-odd);
+- per-chain κ;
+- reversibility, frozen inactive links and dH ∝ ε² (2D, plus one 4D 8^4 SU(2) trajectory);
+- the Metropolis step: the replayed accept decision, with rejected chains bitwise unchanged;
+- `cycle` / `ddhmc_step`: links stay in SU(N), the translation is applied before the trajectory,
+  and the stats keys (with `plaquette`) are present;
+- translation coverage;
+- behind `NEOQCD_SLOW`, DD-HMC against plain HMC and the exact-determinant Metropolis on 2D 8×8,
+  κ = 0.22.
+
+**Limits.**
+- The block solves use a global CG on the block operator, not block-local solvers.
+- The Schur solves have no chronological guess.
+- There is no Schwarz preconditioner.
+- DD-HMC is not wired into the drivers or into the fast path.
+- There is no defect. A translation is a symmetry only without a boundary-condition defect.
+  `DDHMCHamiltonian` takes no `plaquette_weights`, and `DDHMC.cycle` raises if the gauge term
+  carries some. `translation=None` is allowed, but the fixed grid alone is not ergodic.
+
 ## 6. Known limitations and TODO
 
 - **Exact comparison and determinant normalisation.** The HMC against `ExactMetropolis` test
@@ -622,5 +681,5 @@ largest residual per trajectory.
   3. Clover is implemented (`clover.py`); when to use it in production is open.
   4. Whether to run the 12^3×24, κ = 0.156 check (about 1 A100 day), after the phase-1 cost
      measurement.
-  5. Further work: Hasenbusch on larger lattices, DD-HMC, Grid reference runs, and the
+  5. Further work: Hasenbusch on larger lattices, DD-HMC in production (§5c), Grid reference runs, and the
      convention-alignment checklist (κ, plaquette normalisation, τ_int).
