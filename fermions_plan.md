@@ -373,3 +373,29 @@ Per renderli significativi: (a) SNF: protocollo più duro (meno passi o Δκ pi�
 Ordine proposto: kernel fuso e strato veloce per gli altri operatori; rete residual completa; DD-HMC; training con REX; flusso sugli pseudofermioni. Per l'ultimo, prima misurare quanto pesa il rumore di φ nella dissipazione: nel pilota in κ un salto singolo a φ fisso ha ESS 0.48 contro 0.97 con otto passi, quindi la domanda è se un flusso su φ batte "più blocchi stocastici" a parità di solve.
 
 Note sul training SNF (14 novembre): lo stimatore è blockwise (ingressi degli strati staccati, un solve per strato, gradiente di S_pf dalla forza), come `blockwise_training_forward`. Lo Jacobiano dello strato è solo quello di gauge: φ resta fermo e la parte fermionica entra nel lavoro come S_pf(U', φ) - S_pf(U, φ). Il pilota SNF era rumore fin dal primo passo perché lr = ρ iniziale = 1e-3 (il primo passo di Adam sposta ogni parametro di ~lr): usare `--layers smearing_signed --rho-init 0 --lr 1e-4 --lr-warmup k`.
+
+## Chiusura del 14 novembre 2026 (mattina)
+
+Fatto in questa sessione, tutto su `fermions` (pushato) salvo dove indicato:
+- **Metodo Gamma** (`obs.py`, codice di pura gauge): errore di lunghezza di una fetta in `_compute_drho` corretto sul branch separato `fix-gamma-drho` (commit 8f83515, worktree `../neoqcd-fix-gamma`), NON pushato e NON unito a main: decide l'utente.
+- **Strato veloce** esteso ad azione parametrica, NE-MCMC, SNF, REX; varianti veloci per staggered e Hasenbusch (`fast_terms.py`).
+- **Kernel fuso CUDA** (`fused.py`, nvcc + ctypes, nessuna installazione): 3.5e8 siti/s in doppia e 7e8 in singola su A100; solve a 16^4 batch 16 in 0.22 s (0.14 in precisione mista) contro 13.3 s del codice iniziale. HMC a 8^4 validato con il kernel fuso: P = 0.56637(20) (openQCD 0.5661(5)), 0.20 s per traiettoria per replica (5.15 all'inizio, 0.64 con lo strato veloce). I solve sono ora il 44% della traiettoria: il prossimo bersaglio sono forza di gauge, forza fermionica e aggiornamento dei link.
+- **SNF**: strato stout con segno (partenza esatta dall'identità), riscaldamento del learning rate, rete residual completa (statica e iper-rete, convoluzioni a link congelati) con condizionamento indipendente dal protocollo.
+- **DD-HMC** (`ddhmc.py`): completo su reticoli piccoli, confutato e rifinito; non ancora nei driver né nello strato veloce; lo schema di traslazione "luscher" va confrontato con le eq. C.1-C.2 del paper.
+
+Non ancora confutati da un revisore indipendente: strato veloce esteso (azione/SNF/REX), `fast_terms.py`, `fused.py` e la sua integrazione nel driver, rete residual, strato con segno. Le varianti veloci di staggered e Hasenbusch e lo strato veloce in SNF/REX non sono mai girati su GPU.
+
+### Prossima sessione, in ordine
+1. Confutazione Fable dei moduli elencati sopra.
+2. Kernel fuso per il resto della traiettoria (forze e aggiornamento dei link) e per staggered; kernel fuso in `QCDAction`/SNF/REX.
+3. Run veri, in produzione: training SNF (strato con segno o residual, protocollo più duro del pilota), REX con scala ottima e più gradini, 16^4 con il punto `w16`.
+4. Training dei flussi con REX; flusso sugli pseudofermioni.
+
+### Fase di pulizia (a codice fermo)
+I file separati sono serviti a far lavorare più agenti in parallelo; vanno riuniti in commit di soli spostamenti e accorpamenti, con la suite come rete di sicurezza (stessi numeri prima e dopo):
+- un solo operatore per tipo (oggi `dirac.py`, `fast.py`, `fused.py`, `fast_terms.py`, `staggered.py`), con il motore come opzione;
+- una base comune per i termini pseudofermionici (cache, refresh, controllo di convergenza duplicati tra Wilson, staggered, RHMC, Hasenbusch, clover e le loro varianti veloci e parametriche);
+- le copie fatte per non toccare file altrui (formula della forza in `snf_layers.py`, aritmetica dell'azione in `rex.py`);
+- gli argomenti, i checkpoint e i riepiloghi comuni ai driver, oggi condivisi con import incrociati tra script;
+- helper ed ensemble dei test, ricostruiti in più file;
+- infine la ristrutturazione grande: sottopacchetti per puro gauge e parti comuni, e sparisce `_gauge.py`.
