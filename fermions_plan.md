@@ -330,3 +330,21 @@ Decisione del 13 novembre: CUDA graph e kernel Triton entrano nel piano, ma solo
 
 1. **DD-HMC** (Lüscher 2005): da fare, non più opzionale. Blocchi con bc di Dirichlet, link attivi, complemento di Schur; blocco attivo sulla regione del difetto per avere un aggiornamento locale anche con i fermioni. Viene dopo la validazione e le ottimizzazioni.
 2. **Bordi aperti con i fermioni: sono quelli di Bonanno, già implementati** (precisazione dell'utente, 13 novembre). Il difetto agisce solo sull'azione di gauge, i fermioni restano (anti)periodici, lo swap e il lavoro in bc non costano solve. Nessun operatore di Dirac con bordo aperto è previsto. Resta da fare solo l'uso su reticoli veri: difetto di taglia L_d come nel paper di pura gauge, scala ottima, e il driver multi-GPU con un gradino per rank.
+
+## Aggiornamento del 14 novembre 2026: HMC validato contro openQCD
+
+openQCD 2.4.3 installato su Leonardo in `/leonardo_work/INF26_sft/ecellini/openqcd_ref/` (Wilson N_f = 2, c_sw = 0, bc type 3, quark antiperiodici nel tempo; plaquette openQCD = 3 x la nostra). Nostro HMC: operatore veloce su metà reticolo (`--fast`, doppia precisione), A100.
+
+| Punto | openQCD | neoqcd | Differenza |
+|---|---|---|---|
+| 4^4, β = 1.0, κ = 0.1 | 0.060765(28) (66k traiettorie) | 0.06091(19) riferimento; 0.06084(19) veloce | -0.75σ; -0.4σ |
+| 8^4, β = 5.6, κ = 0.153 | 0.5661(5) (2.5k traiettorie) | 0.56609(29) (traiettorie 121-342, 16 repliche) | -0.02σ |
+| 8^4, β = 5.6, κ = 0.1545 | 0.5687(3) | non ancora fatto | |
+
+Note: a 8^4 da partenza fredda servono circa 115 traiettorie di termalizzazione; τ_int(P) ≈ 12-26 traiettorie in entrambi i codici, quindi l'errore va preso dalla dispersione delle repliche, non dal binning. Sul 4^4 anche <log det> esatto: 0.9295(50) riferimento, 0.9248(50) veloce.
+
+Prestazioni misurate (A100, complex128): operatore normale di riferimento 3.1e6 siti/s; metà reticolo con prodotto di colore a broadcast 2-2.8e7 siti/s; solve completo 6-9 volte più veloce; HMC a 8^4 7.9 volte più veloce per replica (0.65 s per traiettoria per replica, 144 iterazioni CG per solve). complex64 dà 1.5-1.65x, la precisione mista solo il 10-20%. Ora domina la banda di memoria del termine di hopping: è il bersaglio del kernel fuso (fase P, punto 3).
+
+Stato dei moduli dal 7 novembre: Hasenbusch, staggered in azione/SNF, RHMC (anche a masse leggere), clover (convenzione openQCD di default) scritti, confutati e rifiniti; REX per reticoli veri (difetto L_d, scala ottima, driver multi-GPU) scritto, non ancora confutato né girato su GPU; strato veloce scritto e validato dai numeri sopra, non ancora confutato.
+
+Prossimi passi: (1) confutazione dello strato veloce e del REX esteso; (2) estendere lo strato veloce ad azione/SNF/REX (oggi solo `main_hmc`); (3) pilota REX a 4 GPU e pilota NE-MCMC/SNF su 4^4 nella coda di debug; (4) punto κ = 0.1545 e completamento dell'8^4 in produzione; (5) kernel fuso; (6) DD-HMC.
