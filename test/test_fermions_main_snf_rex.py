@@ -1,8 +1,10 @@
 """End-to-end tests of main/main_snf_fermions.py and main/main_rex_fermions.py on 2D 4 x 4 SU(3)
 (a handful of samples/steps; checks that the outputs exist and parse, not physics)."""
 
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import math
 import sys
@@ -183,11 +185,14 @@ class MainREXFermionsTest(unittest.TestCase):
         self.assertEqual(len(rows), 10 * 3)
         self.assertEqual(list(rows[0].keys()), list(REX.OBS_FIELDS))
         with np.load(full / "replica_history.npz") as h:
-            self.assertEqual(h["labels"].shape, (10, 3, 2))
-            self.assertEqual(h["plaquette"].shape, (10, 3, 2))
-            for t in range(10):  # every chain carries each rung once
+            # the arrays main/optimal_ladder.py reads hold the measured steps only, --therm apart
+            for name in REX.HISTORY_NAMES:
+                self.assertEqual(h[name].shape, (8, 3, 2), name)
+                self.assertEqual(h["therm_" + name].shape, (2, 3, 2), name)
+            self.assertEqual(int(h["thermal_steps"]), 2)
+            for t in range(8):  # every chain carries each rung once
                 np.testing.assert_array_equal(np.sort(h["labels"][t], axis=0), np.arange(3)[:, None].repeat(2, 1))
-            labels_full, plaq_full = h["labels"].copy(), h["plaquette"].copy()
+            hist_full = {k: h[k].copy() for k in h.files}
         meta = json.loads((full / "run_meta.json").read_text())
         s = meta["summary"]
         self.assertTrue(meta["finished"])
@@ -197,18 +202,115 @@ class MainREXFermionsTest(unittest.TestCase):
         self.assertIn("plaquette_bottom", s["history"])
         self.assertGreater(s["solves_per_step"], 0)
 
-        # interrupted run: 6 steps (checkpoint at 4, rows up to 6), then resume to 10
+        # interrupted run: crash in step 7 (checkpoint at 4, rows and history up to step 6), then
+        # resume to 10 from step 4: the history past the checkpoint is truncated and recomputed
         part = self.tmp / "part"
-        REX.main(common + ["--steps", "4", "--checkpoint-every", "4", "--out", str(part)])
-        with open(part / "observables.csv", "a") as handle:  # a row past the checkpoint, dropped on resume
-            handle.write("6,0,0,0.0,0.5,1.0,0,1,1.0,1,1,0.1\n")
+        part.mkdir()
+        (part / "notes.txt").write_text("not the run's")  # a foreign file: neither blocks nor gets deleted
+        original_step = REX.FermionREX.step
+        calls = {"n": 0}
+
+        def crashing(rex, generator=None):
+            calls["n"] += 1
+            if calls["n"] == 8:
+                REX.save_history(part / "replica_history.npz", rex, 2)  # history past the checkpoint on disk
+                raise RuntimeError("simulated kill")
+            return original_step(rex, generator)
+        REX.FermionREX.step = crashing
+        try:
+            with self.assertRaises(RuntimeError):
+                REX.main(common + ["--steps", "8", "--checkpoint-every", "4", "--out", str(part)])
+        finally:
+            REX.FermionREX.step = original_step
+        self.assertEqual(torch.load(part / "rex_state.pt")["n_steps_done"], 4)
+        with np.load(part / "replica_history.npz") as h:
+            self.assertEqual(h["labels"].shape[0], 5)  # 7 steps on disk, the checkpoint holds 4
+        self.assertEqual(int(read_observables(part / "observables.csv")["step"].max()), 6)
         REX.main(common + ["--steps", "8", "--checkpoint-every", "4", "--out", str(part), "--resume"])
         with np.load(part / "replica_history.npz") as h:
-            np.testing.assert_array_equal(h["labels"], labels_full)
-            np.testing.assert_allclose(h["plaquette"], plaq_full, rtol=0, atol=1e-12)
+            self.assertEqual(sorted(h.files), sorted(hist_full))
+            for name in h.files:
+                np.testing.assert_allclose(h[name], hist_full[name], rtol=0, atol=1e-12, err_msg=name)
         a, b = read_observables(full / "observables.csv"), read_observables(part / "observables.csv")
         np.testing.assert_allclose(a["plaquette"], b["plaquette"], rtol=0, atol=1e-12)
         np.testing.assert_array_equal(a["solves"], b["solves"])
+        self.assertEqual((part / "notes.txt").read_text(), "not the run's")
+        # a finished run is refused without --resume / --overwrite; --overwrite keeps foreign files
+        with self.assertRaises(SystemExit):
+            REX.main(common + ["--steps", "8", "--out", str(part)])
+        REX.main(common + ["--steps", "1", "--out", str(part), "--overwrite"])
+        self.assertEqual(len(_rows(part / "observables.csv")), 3 * 3)
+        self.assertTrue((part / "notes.txt").exists())
+
+    def test_partial_start_restarts(self):
+        """A run killed before its first checkpoint leaves rows but no checkpoint: the next start
+        (with or without --resume) deletes the run's partial files and starts from scratch."""
+        common = LATTICE + ["--ladder", "0,0.5,1", "--defect-shape", "line", "--defect-size", "2",
+                            "--n-chains", "1", "--therm", "1", "--seed", "3", "--steps", "2"]
+        ref, out = self.tmp / "ref", self.tmp / "out"
+        REX.main(common + ["--out", str(ref)])
+        out.mkdir()
+        (out / "foreign.dat").write_text("x")
+        original_step = REX.FermionREX.step
+        calls = {"n": 0}
+
+        def crashing(rex, generator=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated kill")
+            return original_step(rex, generator)
+        REX.FermionREX.step = crashing
+        try:
+            with self.assertRaises(RuntimeError):
+                REX.main(common + ["--out", str(out)])
+        finally:
+            REX.FermionREX.step = original_step
+        self.assertTrue((out / "observables.csv").exists() and not (out / "rex_state.pt").exists())
+        REX.main(common + ["--out", str(out), "--resume"])
+        a, b = read_observables(ref / "observables.csv"), read_observables(out / "observables.csv")
+        np.testing.assert_array_equal(a["plaquette"], b["plaquette"])
+        self.assertEqual((out / "foreign.dat").read_text(), "x")
+
+    def test_summary_fallback_keeps_swap_block(self):
+        """A failing Gamma analysis (summarize_history) keeps the swap and replica_history blocks."""
+        import neoqcd.fermions.rex as rexmod
+        out = self.tmp / "fallback"
+        original = rexmod.summarize_history
+
+        def failing(*args, **kwargs):
+            raise FloatingPointError("injected")
+        rexmod.summarize_history = failing
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                REX.main(LATTICE + ["--ladder", "0,0.5,1", "--defect-shape", "line", "--defect-size", "2",
+                                    "--n-chains", "1", "--therm", "1", "--steps", "3", "--seed", "2",
+                                    "--out", str(out)])
+        finally:
+            rexmod.summarize_history = original
+        self.assertIn("history summary failed", err.getvalue())
+        meta = json.loads((out / "run_meta.json").read_text())
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["swap"]["link_parameter_left"], [0.0, 0.5])
+        self.assertEqual(sum(meta["swap"]["link_proposed"]), 3)
+        self.assertIn("FloatingPointError", meta["replica_history"]["error"])
+        self.assertEqual(meta["replica_history"]["path"], str(out / "replica_history.npz"))
+        self.assertGreater(meta["summary"]["solves_per_step"], 0)
+
+    def test_ladder_range_and_top_warning(self):
+        base = LATTICE + ["--defect-shape", "line", "--defect-size", "2"]
+        for bad in ("0,0.5,1.2", "-0.1,0.5,1"):
+            with self.assertRaises(SystemExit) as ctx:
+                REX.parse_args(base + [f"--ladder={bad}"])
+            self.assertIn("[0, 1]", str(ctx.exception))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            args = REX.parse_args(base + ["--ladder", "0,0.5,0.9"])
+        self.assertEqual(args.ladder_values, [0.0, 0.5, 0.9])
+        self.assertIn("no periodic rung", err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            REX.parse_args(base + ["--ladder", "0,0.5,1"])
+        self.assertEqual(err.getvalue(), "")
+        with self.assertRaises(SystemExit):
+            REX.parse_args(base + ["--ladder", "0,0.5,0.9", "--periodic-translation"])
 
     def test_staggered(self):
         out = self.tmp / "stag"
@@ -222,7 +324,8 @@ class MainREXFermionsTest(unittest.TestCase):
         cols = read_observables(out / "observables.csv")
         self.assertTrue(np.all(np.isfinite(cols["plaquette"])))
         with np.load(out / "replica_history.npz") as h:
-            self.assertEqual(h["labels"].shape, (4, 3, 2))
+            self.assertEqual(h["labels"].shape, (3, 3, 2))  # measured steps only
+            self.assertEqual(h["therm_labels"].shape, (1, 3, 2))
         meta = json.loads((out / "run_meta.json").read_text())
         self.assertTrue(meta["finished"])
         self.assertEqual(meta["parameters"]["fermions"], "staggered")
@@ -277,7 +380,8 @@ class REXDefectAndLadderTest(unittest.TestCase):
         self.assertEqual(sum(meta["swap"]["link_proposed"]), steps * 3)
         self.assertEqual(len(meta["replica_history"]["defect_action"]["variance"]), 3)
         # the functions of neoqcd.ladder, through the _gauge re-exports
-        moments = rung_moments(labels, sd, 3, discard_fraction=therm / (therm + steps))
+        self.assertEqual(labels.shape[0], steps)  # measured steps only: no --therm data reaches the tool
+        moments = rung_moments(labels, sd, 3, discard_fraction=0.0)
         var = np.asarray(moments["variance"])
         self.assertTrue(np.all(var > 0))
         lam = thermodynamic_length(c, var)

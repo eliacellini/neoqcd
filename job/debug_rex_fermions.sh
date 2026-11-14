@@ -22,7 +22,8 @@
 # Start: cold, or the NE-MCMC pool of job/debug_snf_fermions.sh at kappa = 0.153 if it exists
 # (equilibrium at bc = 1; the open rungs thermalise during --therm).
 # Outputs in output/rex_fermions/<name>/ (observables.csv, replica_history.npz, run_meta.json,
-# checkpoint.*, rex_state.pt). An existing checkpoint is resumed (--resume).
+# checkpoint.*, rex_state.pt). An existing checkpoint is resumed (--resume); a job killed before
+# its first checkpoint restarts from scratch (the driver deletes its own partial files).
 # Usage: sbatch job/debug_rex_fermions.sh [extra flags for main/main_rex_fermions.py]
 
 set -euo pipefail

@@ -10,7 +10,8 @@ the gauge-only `QCDAction.action_difference` (no solve), `pt.step` (rule "exact"
 optional translation of the bc = 1 configurations (--periodic-translation).
 
 Thermalisation as in main_pt_obc.py: --therm (alias --thermal-steps) trajectories at fixed labels, no
-swaps, no translation, not in replica_history.npz (rows flagged therm = 1 in observables.csv).
+swaps, no translation, not in replica_history.npz (rows flagged therm = 1 in observables.csv). (In
+main_rex_fermions.py --therm steps are REX steps with swaps, kept in therm_* arrays of its history.)
 
 Defect: `utils.Defect(D, T, L, --defect-size, --time-slice, --space-slice)` (default --defect-shape
 cube), the defect of main_pt_obc.py for L_d = --defect-size; --defect-shape line is the fermion-only
@@ -19,15 +20,19 @@ the JSON file of main/optimal_ladder.py) or evenly spaced in [--bc-min, --bc-max
 `distributedPT.ladder_values` as main_pt_obc.py).
 
 Devices: --device cpu (Gloo), or cuda / auto: rank with LOCAL_RANK = l uses cuda:l (NCCL) with an
-explicit index (torch 2.0 cannot set_device("cuda") without one); if each rank sees one GPU only
-(device_count() == 1) it uses cuda:0. --device cuda:K forces index K. Launch with torchrun
-(job/debug_rex_fermions_distributed.sh) or any env:// launcher (RANK, WORLD_SIZE, MASTER_ADDR,
-MASTER_PORT, LOCAL_RANK).
+explicit index (torch 2.0 cannot set_device("cuda") without one). A LOCAL_RANK beyond the visible
+GPUs is an error, and so is --device cuda:K with more than one local rank (every rank on GPU K),
+unless --allow-shared-gpu (tests and debugging: ranks then share GPUs, cuda:LOCAL_RANK mod count).
+A launcher that binds one GPU per task (each rank sees device_count() == 1) must set LOCAL_RANK=0
+per task or pass --allow-shared-gpu. Launch with torchrun (job/debug_rex_fermions_distributed.sh)
+or any env:// launcher (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT, LOCAL_RANK).
 
-Generators: on each rank a run generator on its device, seeded with --seed + rank (pseudofermions,
-momenta, Metropolis, translation). The swap uniforms of rank 0 come from `torch.rand` on the global
-generator of pt.device inside `ParallelTempering`; they are drawn from a private stream
-(`rex.GlobalRNGStream`, seed --seed + SWAP_SEED_OFFSET) so that a resumed run repeats them.
+Generators: on each rank a run generator on its device (pseudofermions, momenta, Metropolis,
+translation). The swap uniforms of rank 0 come from `torch.rand` on the global generator of
+pt.device inside `ParallelTempering`; they are drawn from a private stream (`rex.GlobalRNGStream`)
+so that a resumed run repeats them. Seeds `stream_seeds(--seed, rank)` = `rex.derived_seed(seed,
+rank, stream)` (SeedSequence): runs with seeds s and s + 1 share no stream on any pair of ranks
+(the pure-gauge seed + rank does). The generator states are checkpointed, so resumes are unaffected.
 
 Output directory (--out, alias --output-dir; default output/rex_fermions_distributed/<auto name>):
     observables.csv     (rank 0) one row per (step, rung), the fields of main_rex_fermions.py
@@ -41,31 +46,58 @@ Output directory (--out, alias --output-dir; default output/rex_fermions_distrib
                         trajectory_labels, exp_minus_dH (same shape); parameter_ladder; swap_every;
                         thermal_steps. The keys and layout of main_pt_obc.py: main/optimal_ladder.py
                         reads the directory unchanged. Rewritten every --log-every steps and at
-                        every checkpoint;
+                        every checkpoint (it may hold steps past the last committed checkpoint);
     run_meta.json       (rank 0) algorithm, backend, world_size, parameters, the "swap" and
                         "replica_history" blocks of main_pt_obc.py (round trips, flux, plaquette tau_int,
                         defect-action moments), per-rung plaquette and cost per step and per round trip;
-    rankNNN/checkpoint.pt/.json   links and run generator of rank NNN (`fermions.io.save_state`);
-    rankNNN/rex_state.pt          step count, PT state (`pt._pt_step`, rank 0's parameter matrix,
+    checkpoint_step.json          (rank 0) the committed checkpoint: {"step", "slot", "world_size"};
+    rankNNN/checkpoint_G.pt/.json links and run generator of rank NNN (`fermions.io.save_state`),
+                                  slot G = 0 or 1;
+    rankNNN/rex_state_G.pt        step count, PT state (`pt._pt_step`, rank 0's parameter matrix,
                                   local parameters), swap-stream state, swap counters (rank 0).
+
+Checkpoints are two-generation: every rank writes its files of step n into the slot that is not
+committed (each file atomically), all ranks confirm (collective), then rank 0 saves the history and
+commits by atomically rewriting checkpoint_step.json to (n, new slot). A kill at any point leaves the
+marker on a complete set of files of one step on every rank; the previous generation stays intact
+until the next commit overwrites it.
 
 `ParallelTempering` exposes no state_dict (main_pt_obc.py has no resume); its state is the
 parameter matrix on rank 0, the step counter `_pt_step` (alternating parity) and the scattered local
 parameters, restored here by setting the first two and calling `_scatter_parameters()`.
 
-Resume: --resume restores every rank from its rankNNN files (all ranks must hold the same step),
-truncates observables.csv and the history to the checkpoint and continues; the continuation repeats
-the uninterrupted run with the same seed. --max-run-minutes stops (with a checkpoint) before the step
-that would end past that time, as in main_pt_obc.py.
+Start and resume (decided on rank 0, shared by all ranks). The run owns only the files named above
+(and the temporary files of their atomic writes); anything else in --out is never read, blocks
+nothing and is never deleted.
+  - --resume with a committed checkpoint: every rank restores the committed slot, observables.csv
+    and the history are truncated to that step, the run continues; the continuation repeats the
+    uninterrupted run with the same seed;
+  - a committed checkpoint without --resume: refused, unless --overwrite (then the run's own files
+    are deleted and the run starts from scratch);
+  - no committed checkpoint but files of this run (a job killed before its first checkpoint): they
+    hold nothing resumable; they are deleted, with a log line, and the run starts from scratch
+    (with or without --resume), so a resubmitted job never gets stuck;
+  - nothing: fresh start (--resume logs that there was nothing to resume).
+  - rankNNN/checkpoint.json of the older single-generation layout and no marker: refused unless
+    --overwrite (that layout cannot be resumed; its files count as the run's own).
+--max-run-minutes stops (with a checkpoint) before the step that would end past that time, as in
+main_pt_obc.py.
+
+Failures: checks and rank-0-only work (directory scan, history, CSV, commit) go through
+`Collective`: a failure on one rank becomes a SystemExit on every rank, so no rank is left blocked
+in a collective until the job's time limit (also under a plain `srun -n` launcher).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -94,7 +126,7 @@ from main_snf_fermions import (  # noqa: E402
 )
 
 from neoqcd.distributedPT import ParallelTempering, PTConfig  # noqa: E402
-from neoqcd.fermions._gauge import mean_plaquette, plaquette_fields, rung_indices, summarize_history  # noqa: E402
+from neoqcd.fermions._gauge import mean_plaquette, plaquette_fields, rung_indices, summarize_history  # noqa: E402,F401
 from neoqcd.fermions.action import QCDAction  # noqa: E402
 from neoqcd.fermions.io import (  # noqa: E402
     ObservableWriter,
@@ -106,11 +138,24 @@ from neoqcd.fermions.io import (  # noqa: E402
     save_state,
 )
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
-from neoqcd.fermions.rex import FermionREXTarget, GlobalRNGStream, defect_action, distributed_rex_step  # noqa: E402
+from neoqcd.fermions.rex import (  # noqa: E402
+    STREAM_GLOBAL,
+    STREAM_RUN,
+    STREAM_SWAP,
+    FermionREXTarget,
+    GlobalRNGStream,
+    derived_seed,
+    distributed_rex_step,
+    step_observables,
+)
 
-STATE_NAME = "checkpoint"
-REX_STATE = "rex_state.pt"
-SWAP_SEED_OFFSET = 1_000_003
+MARKER = "checkpoint_step.json"
+TOP_FILES = ("observables.csv", "replica_history.npz", "run_meta.json", MARKER)
+SLOTS = (0, 1)
+RANK_FILES = tuple(f"{stem}_{g}{ext}" for g in SLOTS
+                   for stem, ext in (("checkpoint", ".pt"), ("checkpoint", ".json"), ("rex_state", ".pt")))
+LEGACY_RANK_FILES = ("checkpoint.pt", "checkpoint.json", "rex_state.pt")  # single-generation layout (no resume)
+RANK_DIR = re.compile(r"rank\d{3}")
 N_PACK = 4  # per-chain values gathered each step: plaquette, defect action, exp(-dH), HMC accepted
 
 
@@ -137,6 +182,9 @@ def parse_args(argv=None):
                    help="Stop before the step that would end after this many minutes (1.5 x mean step "
                         "time), with a checkpoint; 0 = off.")
     p.add_argument("--out", "--output-dir", dest="out", type=str, default=None)
+    p.add_argument("--allow-shared-gpu", action="store_true",
+                   help="Let ranks share a GPU (LOCAL_RANK beyond the visible GPUs, or --device cuda:K with "
+                        "several local ranks); tests and debugging only.")
     args = p.parse_args(argv)
     validate_common(args)
     if args.device not in ("auto", "cpu", "cuda"):
@@ -170,22 +218,93 @@ def physics_key(args, ladder, world_size):
     }
 
 
+def stream_seeds(seed, rank):
+    """Seeds of the run generator, the global generator and the swap stream of `rank` (module doc)."""
+    return {"run": derived_seed(seed, rank, STREAM_RUN), "global": derived_seed(seed, rank, STREAM_GLOBAL),
+            "swap": derived_seed(seed, rank, STREAM_SWAP)}
+
+
+# ---- the run's own files ------------------------------------------------------------------------
+def _own_name(name, known):
+    """True for a known file name or a leftover temporary file of its atomic write (`io._atomic_write`)."""
+    if name in known:
+        return True
+    return any(name.startswith(f".{k}.") and name.endswith(".tmp") for k in known)
+
+
+def own_files(out):
+    """Paths (relative to out) of the files this driver writes that exist in `out` (module doc)."""
+    out = Path(out)
+    if not out.is_dir():
+        return []
+    found = []
+    for path in sorted(out.iterdir()):
+        if path.is_file() and _own_name(path.name, TOP_FILES):
+            found.append(path.name)
+        elif path.is_dir() and RANK_DIR.fullmatch(path.name):
+            found += [f"{path.name}/{q.name}" for q in sorted(path.iterdir())
+                      if q.is_file() and _own_name(q.name, RANK_FILES + LEGACY_RANK_FILES)]
+    return found
+
+
+def remove_own_files(out, names):
+    """Delete the listed own files, then the rankNNN directories left empty; nothing else."""
+    out = Path(out)
+    for name in names:
+        (out / name).unlink()
+    for name in sorted({n.split("/")[0] for n in names if "/" in n}):
+        try:
+            (out / name).rmdir()
+        except OSError:  # not empty: holds files that are not the run's
+            pass
+
+
+def read_marker(out):
+    """The committed checkpoint {"step", "slot", "world_size"} of `out`, or None."""
+    path = Path(out) / MARKER
+    if not path.exists():
+        return None
+    marker = json.loads(path.read_text())
+    if int(marker["slot"]) not in SLOTS:
+        raise ValueError(f"{path}: bad slot {marker['slot']}")
+    return marker
+
+
+def rank_paths(out, rank, slot):
+    """(checkpoint prefix, rex_state path) of `rank` in `slot`."""
+    rank_dir = Path(out) / f"rank{rank:03d}"
+    return rank_dir / f"checkpoint_{slot}", rank_dir / f"rex_state_{slot}.pt"
+
+
 # ---- runtime ------------------------------------------------------------------------------------
-def choose_rank_device(spec):
-    """(device, backend) of this rank (module doc): Gloo on CPU, NCCL on cuda:<explicit index>."""
+def choose_rank_device(spec, allow_shared=False):
+    """(device, backend) of this rank (module doc): Gloo on CPU, NCCL on cuda:<explicit index>.
+    A rank without a GPU of its own is an error unless `allow_shared`."""
     if spec == "cpu" or (spec == "auto" and not torch.cuda.is_available()):
         return torch.device("cpu"), "gloo"
     if not torch.cuda.is_available():
         raise SystemExit(f"--device {spec} but CUDA is not available")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1")))
+    count = torch.cuda.device_count()
     if spec in ("cuda", "auto"):
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        count = torch.cuda.device_count()
-        index = 0 if count == 1 else local_rank
-        if not 0 <= index < count:
-            raise SystemExit(f"LOCAL_RANK={local_rank} but {count} CUDA devices are visible")
+        if local_rank < count:
+            index = local_rank
+        elif allow_shared:
+            index = local_rank % count
+            print(f"WARNING: LOCAL_RANK={local_rank} shares cuda:{index} ({count} GPUs visible, --allow-shared-gpu)",
+                  file=sys.stderr, flush=True)
+        else:
+            raise SystemExit(f"LOCAL_RANK={local_rank} but only {count} CUDA device(s) are visible: one GPU per "
+                             f"rank is required (--allow-shared-gpu lets ranks share GPUs, tests/debug only)")
         device = torch.device("cuda", index)
     else:
         device = torch.device(spec)
+        if device.index >= count:
+            raise SystemExit(f"--device {spec} but only {count} CUDA device(s) are visible")
+        if local_world > 1 and not allow_shared:
+            raise SystemExit(f"--device {spec} would put all {local_world} local ranks on one GPU; use --device cuda "
+                             f"(cuda:LOCAL_RANK) or pass --allow-shared-gpu (tests/debug only)")
     torch.cuda.set_device(device)
     return device, "nccl"
 
@@ -232,6 +351,26 @@ class Collective:
         dist.broadcast_object_list(box, src=0)
         return box[0]
 
+    def rank0(self, fn, what):
+        """Run `fn()` on rank 0 only; its success is broadcast and a failure (exception or SystemExit)
+        becomes a SystemExit on every rank. Returns fn's value on rank 0, None elsewhere."""
+        result, ok, message = None, True, ""
+        if dist.get_rank() == 0:
+            try:
+                result = fn()
+            except SystemExit as exc:
+                ok, message = False, str(exc)
+            except Exception as exc:  # noqa: BLE001 - reported, then every rank exits
+                traceback.print_exc()
+                ok, message = False, f"{what} failed on rank 0: {exc.__class__.__name__}: {exc}"
+        flag = torch.tensor([1 if ok else 0], dtype=torch.int64, device=self.device)
+        dist.broadcast(flag, src=0)
+        if not ok:
+            raise SystemExit(message)
+        if int(flag.item()) == 0:
+            raise SystemExit(f"stopped: {what} failed on rank 0 (see its message)")
+        return result
+
 
 # ---- history and summaries (rank 0) -------------------------------------------------------------
 class History:
@@ -268,6 +407,7 @@ class History:
         _atomic_write(path, write)
 
     def load(self, path, n_steps):
+        """The first n_steps measured steps of the file (a longer history is truncated)."""
         with np.load(path) as h:
             if h["labels"].shape[0] < n_steps:
                 raise SystemExit(f"--resume: {path} holds {h['labels'].shape[0]} steps, the checkpoint {n_steps}")
@@ -316,7 +456,7 @@ def _per_rung(values, labels, n_rungs):
 # ---- the run ------------------------------------------------------------------------------------
 def main(argv=None):
     args = parse_args(argv)
-    device, backend = choose_rank_device(args.device)
+    device, backend = choose_rank_device(args.device, args.allow_shared_gpu)
     own_group = init_process_group(backend, device)
     try:
         return run(args, argv, device, backend)
@@ -336,7 +476,7 @@ def run(args, argv, device, backend):
     n_links = world - 1
 
     explicit = args.ladder is not None
-    ladder = resolve_ladder(args, world)
+    ladder = resolve_ladder(args, world, warn=rank == 0)
     cfg = PTConfig(batch_size=C, parameter_min=ladder[0], parameter_max=ladder[-1], parameter_name="bc",
                    parameter_dtype=torch.float64, swap_parity=args.swap_parity, acceptance_rule="exact",
                    parameter_ladder=ladder if explicit else None)
@@ -347,52 +487,69 @@ def run(args, argv, device, backend):
     out = Path(args.out) if args.out else ROOT / "output" / "rex_fermions_distributed" / default_name(args, world)
     rank_dir = out / f"rank{rank:03d}"
     csv_path, meta_path, hist_path = out / "observables.csv", out / "run_meta.json", out / "replica_history.npz"
-    state_prefix, rex_state_path = rank_dir / STATE_NAME, rank_dir / REX_STATE
+    marker_path = out / MARKER
     key = clean_json(physics_key(args, ladder, world))
     fpar = args.kappa if args.fermions == "wilson" else args.mass
     defect_mask = build_defect_mask(args, geometry).to(device)
 
-    torch.manual_seed(int(args.seed) + rank)
+    seeds = stream_seeds(args.seed, rank)
+    torch.manual_seed(seeds["global"])
     generator = torch.Generator(device=device)
-    generator.manual_seed(int(args.seed) + rank)
-    swap_rng = GlobalRNGStream(device, int(args.seed) + SWAP_SEED_OFFSET)
+    generator.manual_seed(seeds["run"])
+    swap_rng = GlobalRNGStream(device, seeds["swap"])
 
-    # ---- start or resume (decisions shared by every rank) --------------------------------------
-    previous = []
-    if rank == 0 and out.exists():
-        previous = sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())
-    previous = comm.from_rank0(previous)
-    if args.resume:
-        ok = state_prefix.with_suffix(".json").exists() and rex_state_path.exists()
-        comm.all_ok(ok, f"--resume: no checkpoint in {rank_dir}")
-    elif previous:
-        comm.all_ok(args.overwrite, f"{out} holds a previous run ({previous[:6]}...): use --resume or --overwrite")
-        dist.barrier()
-        if rank == 0:
-            for name in previous:
-                (out / name).unlink()
-        dist.barrier()
+    def log0(message):
+        if rank == 0 and not args.quiet:
+            print(message, flush=True)
+
+    # ---- start or resume (decided on rank 0, shared by every rank; module doc) -------------------
+    scan = comm.rank0(lambda: (read_marker(out), own_files(out)), f"scan of {out}")
+    marker, own = comm.from_rank0(scan)
+    resume = bool(args.resume and marker is not None)
+    if marker is not None:
+        comm.all_ok(int(marker.get("world_size", world)) == world,
+                    f"{out}: checkpoint of {marker.get('world_size')} ranks, this run has {world}")
+        if not resume:
+            comm.all_ok(args.overwrite, f"{out} holds a previous run (committed checkpoint at step {marker['step']}): "
+                                        f"use --resume or --overwrite")
+            log0(f"--overwrite: deleting the previous run's files in {out} ({len(own)} files)")
+    elif any(name.split("/")[-1] in LEGACY_RANK_FILES for name in own):
+        comm.all_ok(args.overwrite, f"{out} holds a checkpoint of the older single-generation layout "
+                                    f"(rankNNN/checkpoint.json), which cannot be resumed: use --overwrite or another --out")
+        log0(f"--overwrite: deleting the previous run's files in {out} ({len(own)} files)")
+    elif own:
+        log0(f"{out}: no committed checkpoint, only the partial files of an interrupted start ({own[:6]}...): "
+             f"deleted, starting from scratch")
+    elif args.resume:
+        log0(f"--resume: no checkpoint in {out}, starting from scratch")
+    if not resume and own:
+        comm.rank0(lambda: remove_own_files(out, own), f"removal of the previous files in {out}")
     rank_dir.mkdir(parents=True, exist_ok=True)
 
     link_accepted = [0] * n_links
     link_proposed = [0] * n_links
     swap_attempts = 0
+    committed_slot = SLOTS[1]  # the first checkpoint goes to slot 0
     history = History(world, C) if rank == 0 else None
-    if args.resume:
-        U, meta, rng_state = load_state(state_prefix, device=device)
-        rex_state = torch.load(rex_state_path, map_location="cpu")
+    if resume:
+        committed_slot, n_done = int(marker["slot"]), int(marker["step"])
+        state_prefix, rex_state_path = rank_paths(out, rank, committed_slot)
+        try:
+            U, meta, rng_state = load_state(state_prefix, device=device)
+            rex_state = torch.load(rex_state_path, map_location="cpu")
+            ok, message = True, ""
+        except (OSError, KeyError, RuntimeError, ValueError) as exc:
+            ok, message = False, f"--resume: rank {rank} cannot read slot {committed_slot}: {exc.__class__.__name__}: {exc}"
+        comm.all_ok(ok, message)
         extra = meta["extra"]
         comm.all_ok(extra.get("physics") == key and extra.get("rank") == rank,
                     f"--resume: checkpoint of rank {extra.get('rank')} with parameters {extra.get('physics')} "
                     f"differs from rank {rank} with {key}")
         comm.all_ok(meta["rng"]["device"].split(":")[0] == device.type,
                     f"--resume: checkpoint RNG is for {meta['rng']['device']}, run on {device}")
-        n_done = int(rex_state["n_steps_done"])
-        comm.all_ok(n_done == int(meta["trajectory"]), f"--resume: {rank_dir} checkpoint.* and {REX_STATE} differ")
-        steps = torch.tensor([n_done, -n_done], dtype=torch.int64, device=device)
-        dist.all_reduce(steps, op=dist.ReduceOp.MAX)
-        comm.all_ok(int(steps[0]) == n_done and -int(steps[1]) == n_done,
-                    f"--resume: the ranks hold checkpoints of different steps (rank {rank}: {n_done})")
+        comm.all_ok(int(rex_state["n_steps_done"]) == n_done and int(meta["trajectory"]) == n_done,
+                    f"--resume: rank {rank} slot {committed_slot} holds step {int(rex_state['n_steps_done'])} / "
+                    f"{int(meta['trajectory'])}, the committed checkpoint is step {n_done}")
         restore_generator(generator, rng_state)
         swap_rng.set_state(rex_state["swap_rng"])
         pt._pt_step = int(rex_state["pt_step"])
@@ -406,7 +563,7 @@ def run(args, argv, device, backend):
             link_accepted = [int(v) for v in rex_state["link_accepted"]]
             link_proposed = [int(v) for v in rex_state["link_proposed"]]
             swap_attempts = int(rex_state["swap_attempts"])
-            history.load(hist_path, max(n_done - args.therm, 0))
+        comm.rank0(lambda: history.load(hist_path, max(n_done - args.therm, 0)), f"loading {hist_path}")
     else:
         n_done = 0
         if args.start_config is None:
@@ -421,11 +578,13 @@ def run(args, argv, device, backend):
                     **action_kwargs(args), **fermion_kwargs(args))
     target = FermionREXTarget(qcd, tau=args.tau, n_steps=args.n_steps, integrator=args.integrator_levels)
     fermion = qcd.fermion
-    writer = None
-    if rank == 0:
-        writer = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
-        if args.resume:
-            writer.truncate(n_done)
+
+    def open_writer():
+        w = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
+        if resume:
+            w.truncate(n_done)
+        return w
+    writer = comm.rank0(open_writer, f"opening {csv_path}")
 
     total = args.therm + args.steps
     info = run_info("main/main_rex_fermions_distributed.py", argv, device)
@@ -454,6 +613,10 @@ def run(args, argv, device, backend):
         return meta
 
     def checkpoint(final=False):
+        """Two-generation checkpoint (module doc): write the free slot on every rank, confirm, commit."""
+        nonlocal committed_slot
+        slot = SLOTS[1 - SLOTS.index(committed_slot)]
+        prefix, rex_path = rank_paths(out, rank, slot)
         state = {"n_steps_done": n_done, "pt_step": int(pt._pt_step),
                  "local_parameters": pt.local_parameters.to(torch.float64).cpu().clone(),
                  "swap_rng": swap_rng.get_state()}
@@ -461,19 +624,29 @@ def run(args, argv, device, backend):
             state.update(parameter_matrix=pt.parameter_matrix.to(torch.float64).cpu().clone(),
                          link_accepted=list(link_accepted), link_proposed=list(link_proposed),
                          swap_attempts=swap_attempts)
-        _atomic_write(rex_state_path, lambda tmp: torch.save(state, tmp))
-        save_state(state_prefix, U, geometry=geometry, beta=args.beta, trajectory=n_done,
-                   time_sign=args.time_sign, generator=generator, **state_couplings(args, fpar),
-                   extra={"physics": key, "rank": rank, "world_size": world, "source": source,
-                          "seed": args.seed, "final": bool(final)})
+        ok, message = True, ""
+        try:
+            _atomic_write(rex_path, lambda tmp: torch.save(state, tmp))
+            save_state(prefix, U, geometry=geometry, beta=args.beta, trajectory=n_done,
+                       time_sign=args.time_sign, generator=generator, **state_couplings(args, fpar),
+                       extra={"physics": key, "rank": rank, "world_size": world, "source": source,
+                              "seed": args.seed, "final": bool(final), "slot": slot})
+        except Exception as exc:  # noqa: BLE001 - every rank must leave together (no commit)
+            traceback.print_exc()
+            ok, message = False, f"checkpoint of step {n_done}: rank {rank} failed ({exc.__class__.__name__}: {exc})"
+        comm.all_ok(ok, message)  # every rank holds step n_done in `slot`
+
+        def commit():
+            history.save(hist_path, ladder, args.therm)  # before the marker: the history covers the commit
+            atomic_json_save({"step": n_done, "slot": slot, "world_size": world}, marker_path)
+        comm.rank0(commit, f"commit of the checkpoint of step {n_done}")
+        committed_slot = slot
         meta = None
         if rank == 0:
-            history.save(hist_path, ladder, args.therm)
             try:
                 meta = write_meta(final)
-            except Exception as exc:  # never skip the barrier below on rank 0 alone
+            except Exception as exc:  # noqa: BLE001 - statistics never stop the run
                 print(f"WARNING: run_meta failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
-        dist.barrier()
         return meta
 
     if rank == 0 and not args.quiet:
@@ -481,7 +654,7 @@ def run(args, argv, device, backend):
         print(f"backend={backend} world_size={world} device={device} REX {fdesc} ladder {ladder} x {C} chains, "
               f"lattice {geometry.lattice} SU({args.N}) beta={args.beta}, defect {args.defect_shape} "
               f"L_d={args.defect_size} ({int(defect_mask[1].sum())} links) -> {out}"
-              + (f" (resumed at step {n_done})" if args.resume else ""), flush=True)
+              + (f" (resumed at step {n_done})" if resume else ""), flush=True)
 
     loop_t0 = time.time()
     session_start = n_done
@@ -514,9 +687,11 @@ def run(args, argv, device, backend):
                                                        swap_rng=swap_rng)
         _sync(device)
         wall = time.perf_counter() - t0
-        plaq = mean_plaquette(plaquette_fields(U, geometry.D), geometry.N).to(torch.float64).reshape(-1)
-        s_d = (torch.zeros(C, dtype=torch.float64) if thermal
-               else defect_action(qcd, U, pt.local_parameters.to(torch.float64).cpu()))
+        if thermal:
+            plaq = mean_plaquette(plaquette_fields(U, geometry.D), geometry.N).to(torch.float64).reshape(-1)
+            s_d = torch.zeros(C, dtype=torch.float64)
+        else:  # one set of plaquette fields for both (rex.step_observables)
+            plaq, s_d = step_observables(qcd, U, pt.local_parameters.to(torch.float64).cpu())
         pack = torch.cat([plaq.cpu(), s_d.cpu().reshape(-1),
                           hmc_stats["exp_minus_dH"].to(torch.float64).cpu().reshape(-1),
                           hmc_stats["accepted"].to(torch.float64).cpu().reshape(-1),
@@ -526,7 +701,8 @@ def run(args, argv, device, backend):
         dist.gather(pack, gather_list=gathered, dst=0)
         n_done += 1
 
-        if rank == 0:
+        def record():
+            nonlocal link_accepted, link_proposed, swap_attempts
             g = torch.stack(gathered, dim=0).cpu().numpy()  # (world, N_PACK * C + 3)
             per_chain = g[:, :N_PACK * C].reshape(world, N_PACK, C)
             plaq_w, sd_w, x_w, acc_w = (per_chain[:, i] for i in range(N_PACK))
@@ -556,6 +732,7 @@ def run(args, argv, device, backend):
                           f"solves {int(solves)} {wall_max:.2f} s", flush=True)
                 if len(history):
                     history.save(hist_path, ladder, args.therm)
+        comm.rank0(record, f"output of step {step}")
         if args.checkpoint_every and n_done % args.checkpoint_every == 0 and n_done < total:
             checkpoint()
 

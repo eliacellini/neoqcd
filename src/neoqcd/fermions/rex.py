@@ -61,10 +61,20 @@ store it as the `defect_action` array of replica_history.npz.
 
 Swap uniforms of the distributed step: `ParallelTempering` draws them on rank 0 from the global
 generator of pt.device; `GlobalRNGStream` turns that into a private, checkpointable stream.
+
+Seeds: `derived_seed(seed, *keys)` maps (run seed, rank, stream tag) to an independent 63-bit seed
+through `numpy.random.SeedSequence`, so runs with seeds s and s + 1 share no stream on any rank
+(the pure-gauge rule seed + rank makes seed s, rank 1 equal to seed s + 1, rank 0).
+
+Cost: the plaquette fields Re tr U_p are computed once per configuration set and reused by the
+swap table (every ladder column), the defect action and the mean plaquette
+(`bc_action_difference`, `swap_action_difference(plaquettes=...)`, `step_observables`); the
+arithmetic is that of `QCDAction.action_difference`, so the numbers are bitwise the same.
 """
 
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 from neoqcd.fermions._gauge import (
@@ -74,11 +84,26 @@ from neoqcd.fermions._gauge import (
     summarize_history,
     translate_periodic_replica,
 )
-from neoqcd.fermions.action import QCDAction
+from neoqcd.fermions.action import QCDAction, bc_plaquette_weights
 from neoqcd.fermions.hmc import HMC
 
 __all__ = ["FermionREXTarget", "FermionREX", "distributed_rex_step", "swap_action_difference", "defect_action",
-           "GlobalRNGStream"]
+           "GlobalRNGStream", "derived_seed", "bc_action_difference", "step_observables"]
+
+STREAM_RUN, STREAM_GLOBAL, STREAM_SWAP = 0, 1, 2  # stream tags of `derived_seed`
+
+
+def derived_seed(seed, *keys):
+    """A 63-bit seed for the stream (seed, *keys), e.g. (seed, rank, STREAM_RUN) (module doc).
+
+    Distinct key tuples give statistically independent seeds (`numpy.random.SeedSequence`); in
+    particular (s, r) and (s + 1, r') never coincide, unlike seed + rank.
+    """
+    entropy = [int(seed)] + [int(k) for k in keys]
+    if any(v < 0 for v in entropy):
+        raise ValueError(f"derived_seed needs non-negative integers, got {entropy}")
+    state = np.random.SeedSequence(entropy).generate_state(1, dtype=np.uint64)[0]
+    return int(state) >> 1
 
 
 def _check_name(parameter_name):
@@ -95,36 +120,77 @@ def _as_ladder(ladder):
     return ladder
 
 
-def swap_action_difference(qcd, U, parameters, ladder):
+def bc_action_difference(qcd, U, p_old, p_new, plaquettes=None):
+    """`qcd.action_difference(U, p_old, p_new)` for parameter_name "bc", with the plaquette fields
+    `plaquettes` (= `plaquette_fields(U, D)`) given or computed here. Same arithmetic, same order
+    as `QCDAction.action_difference` (bitwise equal result); no solve."""
+    if qcd.parameter_name != "bc":
+        raise ValueError(f"bc_action_difference needs a QCDAction with parameter_name 'bc', got {qcd.parameter_name!r}")
+    D, N = qcd.geometry.D, qcd.geometry.N
+    if plaquettes is None:
+        plaquettes = plaquette_fields(U, D)
+    w_old = bc_plaquette_weights(qcd.defect_mask, p_old, D)
+    w_new = bc_plaquette_weights(qcd.defect_mask, p_new, D)
+    planes = ((mu, nu) for nu in range(1, D) for mu in range(nu))
+    total = None
+    for (mu, nu), retr in zip(planes, plaquettes):
+        dw = (w_old[(mu, nu)] - w_new[(mu, nu)]).to(device=retr.device, dtype=retr.dtype)
+        term = dw * retr
+        total = term if total is None else total + term
+    total = total.sum(tuple(range(1, total.dim())))
+    beta = qcd.beta
+    if torch.is_tensor(beta):
+        beta = beta.to(device=U.device)
+    return beta * total / float(N)
+
+
+def swap_action_difference(qcd, U, parameters, ladder, plaquettes=None):
     """(B, n_rungs) table S(U_b; ladder[k]) - S(U_b; parameters[b]) from the gauge-only bc jump.
 
     `qcd` is a `QCDAction(parameter_name="bc")`; no solve (module doc). Column k at
-    ladder[k] == parameters[b] is exactly zero.
+    ladder[k] == parameters[b] is exactly zero. The plaquette fields of U are computed once for all
+    columns (or taken from `plaquettes`).
     """
     B = U.shape[0]
     parameters = torch.as_tensor(parameters, dtype=torch.float64).reshape(-1)
     if parameters.numel() == 1:
         parameters = parameters.expand(B)
-    columns = [qcd.action_difference(U, parameters, torch.full((B,), float(v), dtype=torch.float64))
+    if plaquettes is None:
+        plaquettes = plaquette_fields(U, qcd.geometry.D)
+    ladder = torch.as_tensor(ladder, dtype=torch.float64).reshape(-1)
+    columns = [bc_action_difference(qcd, U, parameters, torch.full((B,), float(v), dtype=torch.float64),
+                                    plaquettes=plaquettes)
                for v in ladder.tolist()]
     return torch.stack(columns, dim=1).to(torch.float64)
 
 
-def defect_action(qcd, U, parameters, step=0.125):
+def step_observables(qcd, U, parameters, plaquettes=None):
+    """(mean plaquette, S_D) per configuration, both (B,) float64, from one set of plaquette fields
+    (computed here unless given): `mean_plaquette` and `defect_action` at `parameters`."""
+    if plaquettes is None:
+        plaquettes = plaquette_fields(U, qcd.geometry.D)
+    plaq = mean_plaquette(plaquettes, qcd.geometry.N).to(torch.float64).reshape(-1)
+    return plaq, defect_action(qcd, U, parameters, plaquettes=plaquettes)
+
+
+def defect_action(qcd, U, parameters, step=0.125, plaquettes=None):
     """S_D = dS/dc per configuration at its own bc, (B,) float64: the metric of the optimal ladder.
 
     Same five-point formula as `mcmc.DefectMCMCAdapter.defect_action`, on the gauge-only
     `QCDAction.action_difference` (bc parameter): each plaquette weight is a product of four
     couplings linear in bc, a polynomial of degree <= 4, so the formula is exact for any `step`.
     With the gauge-only defect dS/dc = dS_g/dc (S_pf does not depend on bc): no solve.
+    `plaquettes`: the plaquette fields of U if already computed (module doc).
     """
     B = U.shape[0]
     p = torch.as_tensor(parameters, dtype=torch.float64).reshape(-1).cpu()
     if p.numel() == 1:
         p = p.expand(B)
     h = float(step)
-    near = qcd.action_difference(U, p - h, p + h)
-    far = qcd.action_difference(U, p - 2.0 * h, p + 2.0 * h)
+    if plaquettes is None:
+        plaquettes = plaquette_fields(U, qcd.geometry.D)
+    near = bc_action_difference(qcd, U, p - h, p + h, plaquettes=plaquettes)
+    far = bc_action_difference(qcd, U, p - 2.0 * h, p + 2.0 * h, plaquettes=plaquettes)
     return ((8.0 * near - far) / (12.0 * h)).to(torch.float64)
 
 
@@ -227,7 +293,7 @@ class FermionREXTarget:
         _check_name(parameter_name)
         return self.qcd.action_difference(U, parameter_old, parameter_new)
 
-    def action_table(self, U, ladder, parameter=None):
+    def action_table(self, U, ladder, parameter=None, plaquettes=None):
         """S(U_b; ladder[k]) - S(U_b; bc_b), (B, n_rungs) float64, bc_b the current (or given) bc.
 
         `ParallelTempering._attempt_swaps_exact_actions` only uses differences of a row (module
@@ -235,7 +301,7 @@ class FermionREXTarget:
         """
         ladder = torch.as_tensor(ladder, dtype=torch.float64).reshape(-1).cpu()
         current = self.qcd.parameter if parameter is None else parameter
-        return swap_action_difference(self.qcd, U, current, ladder)
+        return swap_action_difference(self.qcd, U, current, ladder, plaquettes=plaquettes)
 
     def hmc(self):
         """`hmc.HMC` on the joint Hamiltonian at the current bc (cheap to build)."""
@@ -409,7 +475,8 @@ class FermionREX:
         traj_labels = self.labels.clone()
         self.target.set_parameter(self.parameters())
         U, accepted, dH, hmc_stats = self.target.trajectory(self.U, generator)
-        table = swap_action_difference(self.qcd, U, self.parameters(), self.ladder).cpu()
+        plaquettes = plaquette_fields(U, self.geometry.D)  # once per step (twice with translation)
+        table = swap_action_difference(self.qcd, U, self.parameters(), self.ladder, plaquettes=plaquettes).cpu()
         acc = torch.zeros(self.n_rungs - 1, dtype=torch.long)
         prop = torch.zeros(self.n_rungs - 1, dtype=torch.long)
         delta = {}
@@ -421,15 +488,16 @@ class FermionREX:
         self.target.set_parameter(self.parameters())
         if self.periodic_translation:
             U = translate_periodic_replica(U, self.parameters(), 1.0, self.geometry.D, generator)
+            plaquettes = plaquette_fields(U, self.geometry.D)
         self.U = U
         self.n_steps_done += 1
         self.link_accepted += acc
         self.link_proposed += prop
 
         shape = (self.n_rungs, self.n_chains)
-        plaq = mean_plaquette(plaquette_fields(U, self.geometry.D), self.geometry.N).to(torch.float64).view(shape)
+        plaq, sd = step_observables(self.qcd, U, self.parameters(), plaquettes=plaquettes)
+        plaq, sd = plaq.view(shape), sd.view(shape)
         x = hmc_stats["exp_minus_dH"].to(torch.float64).view(shape)
-        sd = defect_action(self.qcd, U, self.parameters()).view(shape)
         self.defect_action_history.append(sd.cpu().clone())
         self.labels_history.append(self.labels.clone())
         self.trajectory_labels_history.append(traj_labels)

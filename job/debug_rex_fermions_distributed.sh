@@ -23,9 +23,11 @@
 # swaps, periodic translation of the bc = 1 replica; 20 thermalisation trajectories without swaps,
 # then 100 REX steps. Cold start.
 # Outputs in output/rex_fermions_distributed/<name>/ (observables.csv, replica_history.npz,
-# run_meta.json, rankNNN/checkpoint.*, rankNNN/rex_state.pt). An existing checkpoint is resumed
-# (--resume), so resubmitting extends a run stopped by --max-run-minutes; to restart from scratch
-# remove the directory first. The next ladder: python main/optimal_ladder.py <out> --output ladder.json.
+# run_meta.json, checkpoint_step.json, rankNNN/checkpoint_{0,1}.*, rankNNN/rex_state_{0,1}.pt).
+# A committed checkpoint (checkpoint_step.json) is resumed (--resume), so resubmitting extends a run
+# stopped by --max-run-minutes or killed; a job killed before its first checkpoint leaves no marker
+# and the driver restarts from scratch. To restart a run with a checkpoint pass --overwrite (deletes
+# only the run's own files). The next ladder: python main/optimal_ladder.py <out> --output ladder.json.
 # Usage: sbatch job/debug_rex_fermions_distributed.sh [extra flags for main/main_rex_fermions_distributed.py]
 
 set -euo pipefail
@@ -51,7 +53,7 @@ SEED="${SEED:-1234}"
 OUT="${OUT:-output/rex_fermions_distributed/rexd_r${NPROC}_c4_cube2_b5.6_k0.153_4x4p3}"
 
 extra=()
-if [[ -f "${OUT}/rank000/checkpoint.json" ]]; then
+if [[ -f "${OUT}/checkpoint_step.json" ]]; then
   extra+=(--resume)
 fi
 if [[ -n "${LADDER:-}" ]]; then

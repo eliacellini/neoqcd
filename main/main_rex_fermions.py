@@ -16,37 +16,55 @@ Ladder: --ladder (aliases --ladder-file, --parameter-ladder) takes a comma-separ
 file written by main/optimal_ladder.py, parsed and validated by `neoqcd.ladder` as in main_pt_obc.py;
 or --n-rep values evenly spaced in [--bc-min, --bc-max].
 
+Ladder values must lie in [0, 1]; a top rung below 1 (no periodic rung) is allowed but logged as
+a warning (only --periodic-translation requires bc = 1 on top).
+
+Thermalisation: --therm here means REX steps WITH swaps (and translation), the same update as the
+measured steps: the open rungs equilibrate faster when configurations can move along the ladder,
+and it keeps the single-batch FermionREX step unchanged. In main_rex_fermions_distributed.py
+--therm means trajectories at fixed labels (no swaps), as in main_pt_obc.py. In both drivers the
+thermalisation steps are flagged therm = 1 in observables.csv and are NOT in the arrays of
+replica_history.npz that main/optimal_ladder.py reads (labels, plaquette, defect_action,
+trajectory_labels, exp_minus_dH hold the measured steps only); here they are kept apart in
+`therm_labels`, `therm_plaquette`, `therm_defect_action`, `therm_trajectory_labels`,
+`therm_exp_minus_dH` (`thermal_steps` = their number).
+
 Optimal ladder: replica_history.npz holds `defect_action` (S_D = dS/dc of each slot's configuration
 at its bc, `rex.defect_action`) and `parameter_ladder`, and run_meta.json the "swap" block of
 main_pt_obc.py, so main/optimal_ladder.py reads this directory unchanged (--metric variance or
-acceptance). Unlike main_pt_obc.py, the history here includes the --therm steps (flagged by
-`therm` in the file): pass optimal_ladder.py a --discard of at least therm / (therm + steps).
+acceptance), measured steps only (its --discard then drops a fraction of those).
 
 Output directory (--out, default output/rex_fermions/<auto name>):
     observables.csv     one row per (step, rung) (OBS_FIELDS): rung-averaged plaquette (mean over
                         chains of the configuration carrying the rung after the step), <exp(-dH)>
                         of the trajectories run at that rung, swap attempts/acceptances of the
                         pair (rung, rung + 1) in this step, cost of the step;
-    replica_history.npz labels (steps, n_rungs, n_chains): rung carried by each slot after the
-                        swaps; plaquette (same shape): plaquette of each slot's configuration;
-                        defect_action (same shape): S_D = dS/dc at the slot's bc after the step;
-                        trajectory_labels, exp_minus_dH; ladder = parameter_ladder; swap_every (1);
-                        therm (number of leading thermalisation steps). Layout of
-                        `neoqcd.replica_history` (world_size -> slot, B -> chain);
+    replica_history.npz measured steps only: labels (steps, n_rungs, n_chains): rung carried by
+                        each slot after the swaps; plaquette (same shape): plaquette of each slot's
+                        configuration; defect_action (same shape): S_D = dS/dc at the slot's bc
+                        after the step; trajectory_labels, exp_minus_dH; ladder = parameter_ladder;
+                        swap_every (1); thermal_steps; the thermalisation steps in therm_<name>
+                        (above). Layout of `neoqcd.replica_history` (world_size -> slot, B -> chain);
     run_meta.json       algorithm, parameters, "swap" and "replica_history" blocks in the layout of
                         main_pt_obc.py (steps after --therm), and the summary: `FermionREX.summarize()`
                         (round trips, mean round-trip time, flux, plaquette tau_int on the bottom
                         and top rungs), swap acceptance per pair, plaquette per rung, HMC
                         acceptance, solves / CG iterations / seconds per step;
     checkpoint.pt/.json links + run generator (`neoqcd.fermions.io.save_state`);
-    rex_state.pt        labels, step count, swap counters, swap-generator state.
+    rex_state.pt        labels, step count, swap counters, swap-generator state (atomic write).
 
 Two generators: the run generator (on the device: pseudofermions, momenta, Metropolis, translation)
-and a CPU generator for the swap uniforms (seed + 1), passed to `FermionREX(swap_generator=...)`
-(which keeps labels, swaps and history on the CPU, so the driver also runs on CUDA).
+and a CPU generator for the swap uniforms, passed to `FermionREX(swap_generator=...)` (which keeps
+labels, swaps and history on the CPU, so the driver also runs on CUDA). Seeds
+`rex.derived_seed(--seed, 0, stream)` (run, global and swap streams; SeedSequence, so seeds s and
+s + 1 share no stream; the generator states are checkpointed, so a resume is unaffected).
 
 Resume: --resume restores links, labels, counters, both generators and the history (truncated to
 the checkpoint) and continues; the continuation repeats an uninterrupted run with the same seed.
+Only the files listed above are the run's: a previous checkpoint is refused without --resume or
+--overwrite; observables/history/meta without any checkpoint (a job killed before its first
+checkpoint) are deleted with a log line and the run starts from scratch, with or without --resume;
+other files in --out are never touched.
 """
 
 from __future__ import annotations
@@ -91,7 +109,7 @@ from neoqcd.fermions.io import (  # noqa: E402
 )
 from neoqcd.fermions._gauge import parse_ladder, validate_ladder  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
-from neoqcd.fermions.rex import FermionREX  # noqa: E402
+from neoqcd.fermions.rex import STREAM_GLOBAL, STREAM_RUN, STREAM_SWAP, FermionREX, derived_seed  # noqa: E402
 
 OBS_FIELDS = (
     "step",           # REX step (0-based, thermalisation included)
@@ -109,6 +127,7 @@ OBS_FIELDS = (
 )
 
 STATE_NAME = "checkpoint"
+HISTORY_NAMES = ("labels", "plaquette", "trajectory_labels", "exp_minus_dH", "defect_action")
 
 
 def parse_args(argv=None):
@@ -156,11 +175,12 @@ def add_rex_args(p):
                    help="Alias of --defect-space-slice (main_pt_obc.py name).")
 
 
-def resolve_ladder(args, n_rep):
+def resolve_ladder(args, n_rep, warn=True):
     """The ladder as a list of floats: --ladder (parsed and validated as main_pt_obc.py does,
     `parse_ladder` + `validate_ladder` with n_rep rungs if n_rep is given), or n_rep values evenly
     spaced in [--bc-min, --bc-max] (`np.linspace`; `distributedPT.ladder_values` gives the same
-    numbers up to rounding of the last bit)."""
+    numbers up to rounding of the last bit). Values outside [0, 1] are rejected; a top rung other
+    than 1 (no periodic rung) is logged as a warning on stderr if `warn`."""
     try:
         if args.ladder is not None:
             lad = validate_ladder(parse_ladder(args.ladder), n_rep)
@@ -170,8 +190,12 @@ def resolve_ladder(args, n_rep):
             lad = validate_ladder([float(v) for v in np.linspace(args.bc_min, args.bc_max, int(n_rep))])
     except (ValueError, KeyError, OSError) as exc:
         raise SystemExit(f"--ladder: {exc}")
+    if lad[0] < 0.0 or lad[-1] > 1.0:
+        raise SystemExit(f"--ladder: bc values must lie in [0, 1], got {lad}")
     if args.periodic_translation and lad[-1] != 1.0:
         raise SystemExit("--periodic-translation needs bc = 1 on the top rung")
+    if lad[-1] != 1.0 and warn:
+        print(f"WARNING: top rung bc = {lad[-1]} != 1: no periodic rung in the ladder", file=sys.stderr, flush=True)
     return lad
 
 
@@ -216,32 +240,53 @@ def physics_key(args):
     }
 
 
+_HISTORY_ATTRS = {"labels": "labels_history", "plaquette": "plaquette_history",
+                  "trajectory_labels": "trajectory_labels_history", "exp_minus_dH": "exp_minus_dH_history",
+                  "defect_action": "defect_action_history"}
+
+
+def _stack(rows, shape, dtype):
+    return torch.stack(rows, dim=0).cpu().numpy() if rows else np.zeros((0,) + tuple(shape), dtype=dtype)
+
+
 def save_history(path, rex, therm):
-    empty = np.zeros((0,) + tuple(rex.labels.shape))
-    labels, plaq, tlabels, emdH = rex.history_arrays() if rex.labels_history else (empty,) * 4
-    sd = rex.defect_action_array() if rex.defect_action_history else empty
+    """replica_history.npz: measured steps (after --therm) in the arrays main/optimal_ladder.py
+    reads, the thermalisation steps in therm_<name> (module doc)."""
+    therm = int(therm)
+    shape = tuple(rex.labels.shape)
+    arrays = {}
+    for name, attr in _HISTORY_ATTRS.items():
+        rows = getattr(rex, attr)
+        dtype = np.int64 if "labels" in name else np.float64
+        arrays[name] = _stack(rows[therm:], shape, dtype)
+        arrays["therm_" + name] = _stack(rows[:therm], shape, dtype)
 
     def write(tmp):
         with open(tmp, "wb") as handle:
-            np.savez(handle, labels=labels, plaquette=plaq, trajectory_labels=tlabels, exp_minus_dH=emdH,
-                     defect_action=sd, ladder=rex.ladder.numpy(), parameter_ladder=rex.ladder.numpy(),
-                     swap_every=np.asarray(1), therm=np.asarray(int(therm)))
+            np.savez(handle, **arrays, ladder=rex.ladder.numpy(), parameter_ladder=rex.ladder.numpy(),
+                     swap_every=np.asarray(1), thermal_steps=np.asarray(therm))
     _atomic_write(path, write)
 
 
-def load_history(path, rex, n_steps):
+def load_history(path, rex, n_steps, therm):
+    """The first n_steps steps (thermalisation included) back into `rex`, truncating the file's
+    longer history. Files of the older layout (all steps in the main arrays, key `therm`) load too."""
+    n_steps, therm = int(n_steps), int(therm)
     with np.load(path) as h:
-        if h["labels"].shape[0] < n_steps:
-            raise SystemExit(f"--resume: {path} holds {h['labels'].shape[0]} steps, the checkpoint {n_steps}")
-        names = [("labels", "labels_history"), ("plaquette", "plaquette_history"),
-                 ("trajectory_labels", "trajectory_labels_history"), ("exp_minus_dH", "exp_minus_dH_history")]
-        if "defect_action" in h.files:  # absent in files written before the optimal-ladder outputs
-            names.append(("defect_action", "defect_action_history"))
-        for name, attr in names:
-            setattr(rex, attr, [torch.from_numpy(np.array(x)) for x in h[name][:n_steps]])
-        if "defect_action" not in h.files:  # unknown for the old steps: NaN, so the shapes stay aligned
-            rex.defect_action_history = [torch.full(tuple(rex.labels.shape), float("nan"), dtype=torch.float64)
-                                         for _ in range(n_steps)]
+        split = "therm_labels" in h.files
+        held = h["labels"].shape[0] + (h["therm_labels"].shape[0] if split else 0)
+        if held < n_steps:
+            raise SystemExit(f"--resume: {path} holds {held} steps, the checkpoint {n_steps}")
+        if split and int(h["thermal_steps"]) != therm:
+            raise SystemExit(f"--resume: {path} has {int(h['thermal_steps'])} thermalisation steps, --therm {therm}")
+        for name, attr in _HISTORY_ATTRS.items():
+            if name not in h.files:  # defect_action absent in files written before the optimal-ladder outputs
+                rows = [np.full(tuple(rex.labels.shape), np.nan) for _ in range(n_steps)]
+            elif split:
+                rows = list(h["therm_" + name][:min(therm, n_steps)]) + list(h[name][:max(n_steps - therm, 0)])
+            else:
+                rows = list(h[name][:n_steps])
+            setattr(rex, attr, [torch.from_numpy(np.array(x)) for x in rows])
 
 
 def summarize(rex, csv_path, therm):
@@ -251,9 +296,13 @@ def summarize(rex, csv_path, therm):
     summary["steps_measured"] = int(max(n_meas, 0))
     if n_meas <= 0:
         return summary
-    summary["history"] = rex.summarize(start=therm)
-    if "defect_action" in summary["history"]:
-        summary["history"]["defect_action"]["parameter_ladder"] = rex.ladder.tolist()
+    try:
+        summary["history"] = rex.summarize(start=therm)
+        if "defect_action" in summary["history"]:
+            summary["history"]["defect_action"]["parameter_ladder"] = rex.ladder.tolist()
+    except Exception as exc:  # noqa: BLE001 - the Gamma analysis must not drop the swap block
+        print(f"WARNING: history summary failed ({exc.__class__.__name__}: {exc})", file=sys.stderr, flush=True)
+        summary["history"] = {"error": f"{type(exc).__name__}: {exc}"}
     cols = read_observables(csv_path)
     keep = cols["therm"] == 0
     cols = {k: v[keep] for k, v in cols.items()}
@@ -292,10 +341,10 @@ def main(argv=None):
     state_prefix, rex_state_path = out / STATE_NAME, out / "rex_state.pt"
 
     generator = torch.Generator(device=device)
-    generator.manual_seed(int(args.seed))
+    generator.manual_seed(derived_seed(args.seed, 0, STREAM_RUN))
     swap_generator = torch.Generator()
-    swap_generator.manual_seed(int(args.seed) + 1)
-    torch.manual_seed(int(args.seed))
+    swap_generator.manual_seed(derived_seed(args.seed, 0, STREAM_SWAP))
+    torch.manual_seed(derived_seed(args.seed, 0, STREAM_GLOBAL))
 
     fpar = args.kappa if args.fermions == "wilson" else args.mass
     n_rungs = len(args.ladder_values)
@@ -303,9 +352,14 @@ def main(argv=None):
     defect_mask = build_defect_mask(args, geometry).to(device)
     key = clean_json(physics_key(args))
 
-    if args.resume:
+    ckpt_files = [p for p in (rex_state_path, state_prefix.with_suffix(".json"), state_prefix.with_suffix(".pt"))
+                  if p.exists()]
+    resume = bool(args.resume and ckpt_files)
+    if args.resume and not ckpt_files:
+        _log(args, f"--resume: no checkpoint in {out}, starting from scratch")
+    if resume:
         if not state_prefix.with_suffix(".json").exists() or not rex_state_path.exists():
-            raise SystemExit(f"--resume: no checkpoint in {out}")
+            raise SystemExit(f"--resume: incomplete checkpoint in {out} ({[p.name for p in ckpt_files]})")
         U, meta, rng_state = load_state(state_prefix, device=device)
         if meta["extra"].get("physics") != key:
             raise SystemExit(f"--resume: checkpoint parameters {meta['extra'].get('physics')} differ from {key}")
@@ -318,10 +372,13 @@ def main(argv=None):
         swap_generator.set_state(rex_state["swap_rng"])
         source = meta["extra"].get("source")
     else:
-        previous = [p for p in (csv_path, meta_path, hist_path, rex_state_path, state_prefix.with_suffix(".json"),
-                                state_prefix.with_suffix(".pt")) if p.exists()]
-        if previous and not args.overwrite:
+        # only the run's own files: anything else in --out is left alone
+        previous = [p for p in (csv_path, meta_path, hist_path) if p.exists()] + ckpt_files
+        if ckpt_files and not args.overwrite:
             raise SystemExit(f"{out} holds a previous run ({[p.name for p in previous]}): use --resume or --overwrite")
+        if previous and not ckpt_files:
+            _log(args, f"{out}: no checkpoint, only the partial files of an interrupted start "
+                       f"({[p.name for p in previous]}): deleted, starting from scratch")
         for p in previous:
             p.unlink()
         U, source = start_links(args, geometry, device, B, args.beta, fpar, 1.0)
@@ -333,13 +390,13 @@ def main(argv=None):
                      periodic_translation=args.periodic_translation, U=U, swap_generator=swap_generator,
                      **akw, **fermion_kwargs(args))
     writer = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
-    if args.resume:
+    if resume:
         rex.labels = rex_state["labels"].clone()
         rex.n_steps_done = int(rex_state["n_steps_done"])
         rex.link_accepted = rex_state["link_accepted"].clone()
         rex.link_proposed = rex_state["link_proposed"].clone()
         rex.target.set_parameter(rex.parameters())
-        load_history(hist_path, rex, rex.n_steps_done)
+        load_history(hist_path, rex, rex.n_steps_done, args.therm)
         writer.truncate(rex.n_steps_done)
         _log(args, f"resumed {out} at step {rex.n_steps_done}")
 
@@ -353,9 +410,10 @@ def main(argv=None):
 
     def checkpoint(final=False):
         save_history(hist_path, rex, args.therm)
-        torch.save({"labels": rex.labels.clone(), "n_steps_done": rex.n_steps_done,
-                    "link_accepted": rex.link_accepted.clone(), "link_proposed": rex.link_proposed.clone(),
-                    "swap_rng": swap_generator.get_state()}, rex_state_path)
+        state = {"labels": rex.labels.clone(), "n_steps_done": rex.n_steps_done,
+                 "link_accepted": rex.link_accepted.clone(), "link_proposed": rex.link_proposed.clone(),
+                 "swap_rng": swap_generator.get_state()}
+        _atomic_write(rex_state_path, lambda tmp: torch.save(state, tmp))
         save_state(state_prefix, rex.U, geometry=geometry, beta=args.beta,
                    trajectory=rex.n_steps_done, time_sign=args.time_sign, generator=generator,
                    **state_couplings(args, fpar),
