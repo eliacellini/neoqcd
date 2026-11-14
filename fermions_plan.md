@@ -348,3 +348,13 @@ Prestazioni misurate (A100, complex128): operatore normale di riferimento 3.1e6 
 Stato dei moduli dal 7 novembre: Hasenbusch, staggered in azione/SNF, RHMC (anche a masse leggere), clover (convenzione openQCD di default) scritti, confutati e rifiniti; REX per reticoli veri (difetto L_d, scala ottima, driver multi-GPU) scritto, non ancora confutato né girato su GPU; strato veloce scritto e validato dai numeri sopra, non ancora confutato.
 
 Prossimi passi: (1) confutazione dello strato veloce e del REX esteso; (2) estendere lo strato veloce ad azione/SNF/REX (oggi solo `main_hmc`); (3) pilota REX a 4 GPU e pilota NE-MCMC/SNF su 4^4 nella coda di debug; (4) punto κ = 0.1545 e completamento dell'8^4 in produzione; (5) kernel fuso; (6) DD-HMC.
+
+### Piloti su GPU del 14 novembre (4^4, β = 5.6, commit aa81e64)
+
+Entrambi i driver girano su A100 senza errori (primo run con NCCL del driver distribuito). Non sono ancora fisica.
+
+- **NE-MCMC, κ 0.153 → 0.1545 in 8 passi, 256 campioni:** dF = -4.9993(118), ESS 0.966, <W> = -4.982. Il protocollo è troppo facile: il flusso non ha margine.
+- **SNF, stessi parametri, 20 passi di Adam, 128 campioni:** dF = -5.147(157), compatibile a 0.9σ (conferma di Jacobiano e contabilità del lavoro su GPU), ma ESS 0.255 e dissipazione 0.90 contro 0.017: peggio del NE-MCMC. Lo strato stout parte lontano dall'identità (|log J| ≈ 130) e 20 passi a lr 1e-3 sono rumore. Da verificare: il parametro iniziale registrato vale 1.56e-4 con `--rho-init` 1e-3.
+- **REX a 4 GPU, scala [0, 1/3, 2/3, 1], L_d = 2, 100 passi:** etichette corrette, <exp(-dH)> = 1 su ogni gradino, plaquette crescente con bc (0.5506 → 0.5761), ma accettanza degli scambi 3.5% / 0.5% / 0%: nessun round trip. Servono circa 10-15 gradini (scala ottima dai dati di questo run) e migliaia di passi.
+
+Per renderli significativi: (a) SNF: protocollo più duro (meno passi o Δκ più grande, così che l'ESS del NE-MCMC scenda ben sotto 1), partenza dall'identità con lr ≤ 1e-4, training lungo in produzione; (b) REX: scala ottima, più gradini per GPU con `--allow-shared-gpu` o più nodi, run in produzione. Su 4^4 il costo è dominato dalla latenza (3.1 s per traiettoria con 4 o 16 catene): i batch grandi sono gratis.
