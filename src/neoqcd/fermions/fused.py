@@ -7,12 +7,33 @@ boundary phases, dtype handling, force) whose hop H (and H^dagger) runs through 
     kernel="cpu"   the SAME kernel source compiled for the host with the system C++ compiler
                    (single-threaded loop over the CUDA thread index): the CPU emulation path
                    that tests the kernel's index arithmetic without a GPU;
-    kernel="loop"  a pure-torch low-memory variant (runs everywhere, no compiler);
-    kernel="auto"  "cuda" on a CUDA device, "loop" elsewhere.
-A backend that cannot be built or loaded (no nvcc, no compiler, unsupported D or N) falls back to
-"loop" with one RuntimeWarning per reason; nothing here raises at import, and nothing in the
+    kernel="loop"  a pure-torch low-memory variant (runs everywhere, no compiler; slow: only for
+                   tests and as an explicit choice, never chosen automatically);
+    kernel="auto"  "cuda" on a CUDA device when the kernel builds and loads, otherwise "fast".
+The resolved kernel "fast" is the parent's own hop (`HalfLatticeWilson.hop` with its resolved
+`colour_product`: broadcast_sum on CUDA, matmul on CPU), the best non-compiled mode measured.
+A compiled backend that cannot be built or loaded (no nvcc, no compiler, unsupported D or N)
+falls back to "fast" (silently for "auto", with one RuntimeWarning per reason for an explicit
+"cuda" / "cpu"; strict=True raises instead); nothing here raises at import, and nothing in the
 package uses this module unless asked. `HalfLatticeWilson` / `EvenOddWilsonDirac` stay the ground
-truth (test/test_fermions_fused.py).
+truth (test/test_fermions_fused.py). `resolve_kernel` gives the resolution without building an
+operator (main/main_hmc.py records it).
+
+Measured (A100 64 GB, torch 2.0, CUDA 12.1; job 64456003, commit 6858689)
+--------------------------------------------------------------------------
+The library compiled with nvcc and loaded through ctypes at the first attempt; all CUDA equality
+tests passed (largest relative deviation 2.55e-16 in complex128). Normal operator D_hat^dag D_hat
+in ms, complex128 / complex64:
+    lattice  batch   broadcast_sum    fused "site"    fused "soa"
+    8^4      4       0.588 / 0.476    0.099 / 0.078   0.085 / 0.080
+    16^4     16      53.66 / 32.42    3.935 / 1.661   2.992 / 1.523
+    16^4     64      222.2 / 141.8    16.23 / 6.544   11.99 / 5.979
+The site-fastest link layout "soa" is faster by 25-35% in double precision at 16^4 and by 3-9%
+in single: it is the default. Lean CG at 16^4, B = 16: 66.15 ms per iteration (broadcast_sum)
+vs 5.41 ms (fused soa); full solve to 1e-10: 2256.6 ms (lean CG, double), 219.8 ms (fused,
+double), 139.7 ms (fused, mixed precision). Best throughput 3.5e8 site-updates/s in double,
+7.0e8 in single. The pure-torch "loop" is slower than broadcast_sum at small sizes (3.4 ms vs
+0.59 ms at 8^4 B4) and only 1.3x faster at large ones, hence "fast" as the fallback.
 
 Why a custom kernel
 -------------------
@@ -65,11 +86,12 @@ both coefficients negated, resolved on the host). The output is written once,
 odd reconstruction are fused into the second hop). Per site and hop: 2D neighbour 4-spinors and
 2D links read (the neighbour reads of the N colour threads of a site hit L1), one spinor written.
 Precision: complex128 and complex64 (double / float arithmetic, no fast-math). Instantiated for
-D in (2, 4) and N in (2, 3) (other geometries fall back to "loop").
+D in (2, 4) and N in (2, 3) (other geometries fall back to "fast").
 Link reads: with "site" a warp (about 11 sites x 3 colours) reads, per (k, a), 11 runs of 3
 complex numbers 1152 bytes apart (complex128), the rest of each run being used by the following
 (k, a) through L1; with "soa" it reads 3 runs of 11 consecutive complex numbers. Which is faster
-on the A100 is measured by main/bench_fermions.py (rows half_lattice_fused_cuda[_soa]).
+on the A100 is measured by main/bench_fermions.py (rows half_lattice_fused_cuda[_soa]): "soa"
+(numbers at the top).
 
 Pure-torch variant ("loop")
 ---------------------------
@@ -102,15 +124,18 @@ __all__ = [
     "BackendUnavailable",
     "backend_status",
     "load_backend",
+    "resolve_kernel",
     "FusedHalfLatticeWilson",
     "FusedTwoFlavourWilson",
     "FusedTwoFlavourHamiltonian",
 ]
 
 KERNELS = ("auto", "cuda", "cpu", "loop")
+RESOLVED_KERNELS = ("cuda", "cpu", "loop", "fast")  # "fast": the parent's hop (fallback)
 _SUPPORTED_D = (2, 4)
 _SUPPORTED_N = (2, 3)
 LINK_LAYOUTS = ("site", "soa")
+DEFAULT_LINK_LAYOUT = "soa"  # measured faster on the A100 (module docstring)
 _MAX_TERMS, _MAX_HALF = 8, 2
 
 KERNEL_SOURCE = r"""
@@ -495,20 +520,61 @@ def backend_status(target, device=None):
         return False, str(exc)
 
 
+def resolve_kernel(kernel, device, geometry, strict=False):
+    """(resolved, reason) of a requested kernel for links on `device` (module docstring).
+
+    resolved is one of RESOLVED_KERNELS; reason is None unless a compiled backend was requested
+    (explicitly or by "auto" on a CUDA device) and is unavailable, in which case resolved is
+    "fast". An explicit "cuda" / "cpu" that falls back warns once per reason; strict=True raises
+    BackendUnavailable instead of falling back."""
+    if kernel not in KERNELS:
+        raise ValueError(f"kernel must be one of {KERNELS}, got {kernel!r}")
+    dev = torch.device(device)
+    explicit = kernel != "auto"
+    if kernel == "auto":
+        if dev.type != "cuda":
+            return "fast", None
+        kernel = "cuda"
+    if kernel == "loop":
+        return "loop", None
+    reason = None
+    if kernel == "cuda" and dev.type != "cuda":
+        reason = f"the cuda kernel needs CUDA tensors, the links are on {dev}"
+    elif kernel == "cpu" and dev.type != "cpu":
+        reason = f"the cpu kernel needs CPU tensors, the links are on {dev}"
+    elif geometry.D not in _SUPPORTED_D or geometry.N not in _SUPPORTED_N:
+        reason = (f"the {kernel} kernel supports D in {_SUPPORTED_D}, N in {_SUPPORTED_N}; "
+                  f"got D={geometry.D}, N={geometry.N}")
+    else:
+        ok, why = backend_status(kernel, dev)
+        if not ok:
+            reason = why
+    if reason is None:
+        return kernel, None
+    if strict:
+        raise BackendUnavailable(reason)
+    if explicit:
+        _warn_once(f"neoqcd fused hop: kernel {kernel!r} unavailable ({reason}); "
+                   f"using the 'fast' operator (HalfLatticeWilson.hop)")
+    return "fast", reason
+
+
 # ---- operator ----------------------------------------------------------------------------------
 class FusedHalfLatticeWilson(HalfLatticeWilson):
     """`HalfLatticeWilson` with the hop through a fused kernel (module docstring).
 
     Extra args:
-        kernel: "auto" (default: "cuda" on a CUDA device, "loop" elsewhere), "cuda", "cpu"
-            (host build of the CUDA source, for testing) or "loop" (pure torch). A backend that is
-            not available falls back to "loop" with a RuntimeWarning (strict=True raises
-            BackendUnavailable instead). The kernel in use is the attribute `kernel`, the reason of
-            a fallback `kernel_fallback_reason` (None if none).
-        link_layout: of the compiled kernels: "site" (default) reads the parent's gathered links
-            (B, V/2, 2D, N, N) in place (no extra memory); "soa" uses a site-fastest copy
-            (B, 2D, N, N, V/2), built at the first compiled hop of each dtype (+ the memory of the
-            gathered links), so that the link reads of consecutive sites are coalesced.
+        kernel: "auto" (default: "cuda" on a CUDA device, the parent's "fast" hop elsewhere or
+            when the CUDA kernel is unavailable), "cuda", "cpu" (host build of the CUDA source,
+            for testing) or "loop" (pure torch, explicit only). An explicit compiled backend that
+            is not available falls back to "fast" with a RuntimeWarning (strict=True raises
+            BackendUnavailable instead). The kernel in use is the attribute `kernel` (one of
+            RESOLVED_KERNELS), the reason of a fallback `kernel_fallback_reason` (None if none).
+        link_layout: of the compiled kernels: "soa" (default, measured faster) uses a
+            site-fastest copy (B, 2D, N, N, V/2) of the gathered links, built at the first
+            compiled hop of each dtype (+ the memory of the gathered links), so that the link
+            reads of consecutive sites are coalesced; "site" reads the parent's gathered links
+            (B, V/2, 2D, N, N) in place (no extra memory).
         colour_product: of the parent, used by `hopping_derivative` (the force) only; "fused" is
             accepted as an alias of "auto" (so that colour_product="fused" selects this class
             through `FusedTwoFlavourWilson`).
@@ -519,7 +585,7 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
     """
 
     def __init__(self, U, kappa, geometry=None, time_sign=-1.0, dtype=None, colour_product="auto",
-                 kernel="auto", strict=False, link_layout="site"):
+                 kernel="auto", strict=False, link_layout=DEFAULT_LINK_LAYOUT):
         if kernel not in KERNELS:
             raise ValueError(f"kernel must be one of {KERNELS}, got {kernel!r}")
         if link_layout not in LINK_LAYOUTS:
@@ -530,34 +596,14 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
         self.kernel_requested = kernel
         self._backend = None
         super().__init__(U, kappa, geometry, time_sign, dtype=dtype, colour_product=colour_product)
-        self.kernel, self.kernel_fallback_reason = self._resolve_kernel(kernel, strict)
-        if self.kernel != "loop":
+        self.kernel, self.kernel_fallback_reason = resolve_kernel(kernel, self.device, self.geometry, strict)
+        if self.kernel in ("cuda", "cpu"):
             self._backend = load_backend(self.kernel, self.device)
 
-    def _resolve_kernel(self, kernel, strict):
-        dev = self.device
-        if kernel == "auto":
-            kernel = "cuda" if dev.type == "cuda" else "loop"
-        if kernel == "loop":
-            return "loop", None
-        geo = self.geometry
-        reason = None
-        if kernel == "cuda" and dev.type != "cuda":
-            reason = f"the cuda kernel needs CUDA tensors, the links are on {dev}"
-        elif kernel == "cpu" and dev.type != "cpu":
-            reason = f"the cpu kernel needs CPU tensors, the links are on {dev}"
-        elif geo.D not in _SUPPORTED_D or geo.N not in _SUPPORTED_N:
-            reason = f"the {kernel} kernel supports D in {_SUPPORTED_D}, N in {_SUPPORTED_N}; got D={geo.D}, N={geo.N}"
-        else:
-            ok, why = backend_status(kernel, dev)
-            if not ok:
-                reason = why
-        if reason is None:
-            return kernel, None
-        if strict:
-            raise BackendUnavailable(reason)
-        _warn_once(f"neoqcd fused hop: kernel {kernel!r} unavailable ({reason}); using the pure-torch 'loop' kernel")
-        return "loop", reason
+    @property
+    def compiled(self):
+        """True when the hop runs through a compiled kernel ("cuda" or "cpu")."""
+        return self._backend is not None
 
     # ---- per-dtype state ---------------------------------------------------------------------
     def _set_dtype(self, dtype):
@@ -693,22 +739,24 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
         """H (dagger: H^dagger) from the parity 1 - t field psi to parity t, by `kernel`."""
         if self.kernel == "loop":
             return self._hop_loop(psi, target_parity, dagger)
+        if self.kernel == "fast":
+            return super().hop(psi, target_parity, dagger)
         return self._hop_kernel(psi, target_parity, dagger)
 
     # ---- operator with the axpy fused --------------------------------------------------------
     def apply(self, x, dagger=False):
-        if self.kernel == "loop":
+        if not self.compiled:
             return super().apply(x, dagger)
         w = self._hop_kernel(x, 1, dagger)
         return self._hop_kernel(w, 0, dagger, scale=self._scale_neg_k2, add=x)
 
     def prepare_rhs_half(self, b_e, b_o):
-        if self.kernel == "loop":
+        if not self.compiled:
             return super().prepare_rhs_half(b_e, b_o)
         return self._hop_kernel(b_o, 0, scale=self._scale_k, add=b_e)
 
     def reconstruct_odd(self, x_e, b_o):
-        if self.kernel == "loop":
+        if not self.compiled:
             return super().reconstruct_odd(x_e, b_o)
         return self._hop_kernel(x_e, 1, scale=self._scale_k, add=b_o)
 
@@ -717,21 +765,28 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
 class FusedTwoFlavourWilson(FastTwoFlavourWilson):
     """`FastTwoFlavourWilson` with `FusedHalfLatticeWilson` operators (no change to fast.py).
 
-    Extra arg `kernel` (KERNELS, default "auto"); colour_product="fused" is accepted (the force
-    then uses colour_product "auto"). Everything else (heat bath, action, force, solvers, caches,
-    convergence policy, stats) is the parent's; the operator cache key includes the kernel.
+    Extra args `kernel` (KERNELS, default "auto"), `link_layout` (LINK_LAYOUTS, default "soa")
+    and `strict` (raise BackendUnavailable instead of falling back); colour_product="fused" is
+    accepted (the force then uses colour_product "auto"). Everything else (heat bath, action,
+    force, solvers, caches, convergence policy, stats, mixed precision through `to`) is the
+    parent's; the operator cache key includes the kernel and the link layout.
     """
 
-    def __init__(self, kappa, geometry, kernel="auto", colour_product="auto", **kwargs):
+    def __init__(self, kappa, geometry, kernel="auto", colour_product="auto", link_layout=DEFAULT_LINK_LAYOUT,
+                 strict=False, **kwargs):
         if kernel not in KERNELS:
             raise ValueError(f"kernel must be one of {KERNELS}, got {kernel!r}")
+        if link_layout not in LINK_LAYOUTS:
+            raise ValueError(f"link_layout must be one of {LINK_LAYOUTS}, got {link_layout!r}")
         self.kernel = kernel
+        self.link_layout = link_layout
+        self.strict = bool(strict)
         if colour_product == "fused":
             colour_product = "auto"
         super().__init__(kappa, geometry, colour_product=colour_product, **kwargs)
 
     def _operator_key(self):
-        return super()._operator_key() + (self.kernel,)
+        return super()._operator_key() + (self.kernel, self.link_layout)
 
     def operator(self, U):
         c = self._op_cache
@@ -739,7 +794,8 @@ class FusedTwoFlavourWilson(FastTwoFlavourWilson):
         if c is not None and c[0] is U and c[1] == U._version and self._same_key(c[2], key):
             return c[3]
         op = FusedHalfLatticeWilson(U, self.kappa, self.geometry, self.time_sign,
-                                    colour_product=self.colour_product, kernel=self.kernel)
+                                    colour_product=self.colour_product, kernel=self.kernel,
+                                    link_layout=self.link_layout, strict=self.strict)
         op._low = None
         self._op_cache = (U, U._version, key, op)
         return op

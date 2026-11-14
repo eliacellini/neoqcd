@@ -433,8 +433,64 @@ draws, action and force to the solver tolerance, computed differently:
 | complex64 operator | | 1.5-1.65× over complex128 |
 | mixed precision solve | | 10-20% over lean double |
 
-The hopping term is now memory-bandwidth bound; the fused kernel of fermions_plan.md phase P is
-the next step.
+The hopping term is now memory-bandwidth bound; the fused kernel below (fermions_plan.md phase P)
+addresses that.
+
+**Fused hop kernel** (`fused.py`, opt-in; `main_hmc.py --fast --kernel ...`).
+
+- What it is: `FusedHalfLatticeWilson` is a `HalfLatticeWilson` (same tables, links, force,
+  dtype handling) whose hop runs through one custom kernel, one CUDA thread per output (sample,
+  site, colour): the spin projection is done on the fly from the 2D neighbour 4-spinors, the
+  links are read once, the reconstruction is accumulated in registers and the output is written
+  once; the axpy of D̂ = 1 − κ² H_eo H_oe, of `prepare_rhs_half` and of `reconstruct_odd` is
+  fused into the second hop. `FusedTwoFlavourWilson` / `FusedTwoFlavourHamiltonian` are the fast
+  pseudofermion term and Hamiltonian with this operator (heat bath, action, force, solvers,
+  mixed precision unchanged).
+- Kernels: `cuda` (the compiled CUDA kernel), `cpu` (the same source built with the host C++
+  compiler and run as a loop over the CUDA thread index: tests the index arithmetic without a
+  GPU), `loop` (pure torch, explicit only), `auto` (`cuda` on a CUDA device when it builds,
+  otherwise the fast operator's own hop, resolved as `fast`: `broadcast_sum` on CUDA, `matmul` on
+  CPU). An explicit `cuda`/`cpu` that cannot be built falls back to `fast` with one
+  RuntimeWarning (strict=True raises; `main_hmc.py` treats it as an error).
+- Link layouts of the compiled kernel: `soa` (default; site index fastest, a copy of the gathered
+  links built once per configuration and dtype, coalesced link reads) and `site` (the parent's
+  gathered links read in place, no extra memory).
+- Build and cache: compiled at first use with plain nvcc (`$CUDA_HOME/bin`, `$CUDA_PATH/bin`,
+  PATH) into a shared library with an extern "C" entry point, loaded through ctypes and launched
+  on the current torch stream (no torch headers, no ninja, no build lock). Cache directory
+  `$NEOQCD_KERNEL_CACHE` (default `~/.cache/neoqcd/kernels`), one file per source hash,
+  compiler version and GPU architecture, written under a temporary name and renamed atomically
+  (concurrent jobs and killed builds are safe). The `cpu` build uses `$CXX`, c++, g++ or clang++.
+- Measured on an A100 (torch 2.0, CUDA 12.1; job 64456003, commit 6858689): the library built
+  with nvcc and loaded at the first attempt; all CUDA equality tests passed (largest relative
+  deviation 2.55e-16 in complex128). Normal operator D̂†D̂, ms, complex128 / complex64:
+
+| Lattice, batch | `broadcast_sum` | fused `site` | fused `soa` |
+|---|---|---|---|
+| 8^4, B = 4 | 0.588 / 0.476 | 0.099 / 0.078 | 0.085 / 0.080 |
+| 16^4, B = 16 | 53.66 / 32.42 | 3.935 / 1.661 | 2.992 / 1.523 |
+| 16^4, B = 64 | 222.2 / 141.8 | 16.23 / 6.544 | 11.99 / 5.979 |
+
+  `soa` is faster than `site` by 25-35% in double precision at 16^4 and by 3-9% in single.
+  At 16^4, B = 16: lean CG 66.15 ms per iteration (`broadcast_sum`) vs 5.41 ms (fused `soa`);
+  full solve to 1e-10 2256.6 ms (lean CG, double), 219.8 ms (fused, double), 139.7 ms (fused,
+  mixed precision). Best throughput 3.5e8 site updates/s in double, 7.0e8 in single. The `loop`
+  variant is slower than `broadcast_sum` at small sizes (3.4 ms vs 0.59 ms at 8^4, B = 4) and
+  only 1.3× faster at large ones, hence never chosen automatically. (The solve rows of that
+  benchmark were labelled `kernel=cuda` only; `bench_fermions.py` now labels every fused row with
+  the link layout and also times the solves with `soa`.)
+- How to enable: `main_hmc.py --fast --kernel cuda [--link-layout soa|site] [--precision
+  mixed]` (also `auto`, `cpu`, `loop`; default `off` = `FastTwoFlavourHamiltonian`). Requested and
+  resolved kernel, layout and backend status are in run_meta.json (`run.fused_kernel`), kernel and
+  layout in the resume key (older checkpoints count as `--kernel off`). In Python:
+  `FusedTwoFlavourHamiltonian(beta, kappa, geometry, kernel="cuda", link_layout="soa", ...)`.
+  `job/debug_hmc_fermions.sh` points `w4f`, `w8f` (the `w4`/`w8` validation points with the
+  kernel, `_fused` directories) and `w16` (16^4, β = 5.6, κ = 0.153, B = 16).
+- Limits: Wilson only (not staggered, not the Hasenbusch terms, not yet the SNF/REX drivers or
+  `QCDAction`); compiled for D ∈ {2, 4} and N ∈ {2, 3} (other geometries use `fast`); complex128
+  and complex64. Tested on the CPU (`cpu` and `loop` reproduce `--fast` dH to 1e-8 with the same
+  accept pattern, double and mixed) and operator-level on the A100; the first HMC validation on
+  the GPU (`w4f`, `w8f` against the table below, then `w16`) is still to be run.
 
 **Validation against openQCD 2.4.3** (Wilson N_f = 2, c_sw = 0, antiperiodic quarks; openQCD
 plaquette = 3 × ours, converted):

@@ -1,6 +1,6 @@
 """Tests of neoqcd.fermions.fused against neoqcd.fermions.fast and the even-odd reference.
 
-Kernels: "loop" (pure torch, always), "cpu" (the CUDA kernel source compiled for the host: same
+Kernels: "fast" (the parent's hop: fallback and "auto" without CUDA), "loop" (pure torch, always), "cpu" (the CUDA kernel source compiled for the host: same
 index arithmetic and thread decomposition, run as a loop over the CUDA thread index; skipped
 without a C++ compiler), "cuda" (skipped without a CUDA device or nvcc). The CUDA-only parts of
 the source (kernel, launch, device handling) are checked for syntax and semantics with clang's
@@ -208,9 +208,15 @@ class CpuEmulationKernelTest(_KernelEquality, unittest.TestCase):
 
 
 class CpuEmulationSoaKernelTest(CpuEmulationKernelTest):
-    """As CpuEmulationKernelTest with the site-fastest link layout."""
+    """As CpuEmulationKernelTest with the site-fastest link layout (the default)."""
 
     link_layout = "soa"
+
+
+class CpuEmulationSiteKernelTest(CpuEmulationKernelTest):
+    """As CpuEmulationKernelTest with the site-major link layout (still selectable)."""
+
+    link_layout = "site"
 
 
 class CudaKernelTest(_KernelEquality, unittest.TestCase):
@@ -226,6 +232,10 @@ class CudaKernelTest(_KernelEquality, unittest.TestCase):
 
 class CudaSoaKernelTest(CudaKernelTest):
     link_layout = "soa"
+
+
+class CudaSiteKernelTest(CudaKernelTest):
+    link_layout = "site"
 
 
 _CUDA_STUB = r"""
@@ -298,18 +308,33 @@ class FallbackTest(unittest.TestCase):
             op2 = FusedHalfLatticeWilson(U, 0.12, geo, kernel="cuda")
         msgs = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
         self.assertEqual(len(msgs), 1, msgs)
-        self.assertIn("'loop'", msgs[0])
+        self.assertIn("'fast'", msgs[0])
         for o in (op, op2):
-            self.assertEqual(o.kernel, "loop")
+            self.assertEqual(o.kernel, "fast")
+            self.assertFalse(o.compiled)
+            self.assertEqual(o.colour_product, "matmul")
             self.assertIsNotNone(o.kernel_fallback_reason)
             self.assertLess(rel(o.normal(x), ref.normal(x)), 1e-14)
         with self.assertRaises(BackendUnavailable):
             FusedHalfLatticeWilson(U, 0.12, geo, kernel="cuda", strict=True)
-        # auto on the CPU is the pure-torch kernel, silently
+        # auto on the CPU is the parent's best mode (matmul), silently; never the slow "loop"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            self.assertEqual(FusedHalfLatticeWilson(U, 0.12, geo).kernel, "loop")
+            op_auto = FusedHalfLatticeWilson(U, 0.12, geo)
+            self.assertEqual(op_auto.kernel, "fast")
+            self.assertEqual(op_auto.colour_product, "matmul")
+            self.assertIsNone(op_auto.kernel_fallback_reason)
+            self.assertEqual(F.resolve_kernel("auto", "cpu", geo), ("fast", None))
         self.assertEqual([w for w in caught if issubclass(w.category, RuntimeWarning)], [])
+        self.assertLess(rel(op_auto.normal(x), ref.normal(x)), 1e-14)
+        self.assertLess(rel(op_auto.to(C64).normal(x.to(C64)), ref.to(C64).normal(x.to(C64))), 1e-6)
+        # "loop" stays selectable explicitly
+        self.assertEqual(FusedHalfLatticeWilson(U, 0.12, geo, kernel="loop").kernel, "loop")
+        self.assertEqual(F.resolve_kernel("loop", "cpu", geo), ("loop", None))
+        # default link layout is "soa"; "site" selectable
+        self.assertEqual(op_auto.link_layout, "soa")
+        self.assertEqual(F.DEFAULT_LINK_LAYOUT, "soa")
+        self.assertEqual(FusedHalfLatticeWilson(U, 0.12, geo, link_layout="site").link_layout, "site")
         with self.assertRaises(ValueError):
             FusedHalfLatticeWilson(U, 0.12, geo, kernel="triton")
         with self.assertRaises(ValueError):
@@ -323,7 +348,7 @@ class FallbackTest(unittest.TestCase):
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
             op = FusedHalfLatticeWilson(U, 0.1, geo, kernel="cpu")
-        self.assertEqual(op.kernel, "loop")
+        self.assertEqual(op.kernel, "fast")
         self.assertIn("N=4", op.kernel_fallback_reason)
         self.assertLess(rel(op.normal(x), HalfLatticeWilson(U, 0.1, geo).normal(x)), 1e-14)
 
@@ -352,14 +377,14 @@ class FusedTermTest(unittest.TestCase):
         """Action and force of FusedTwoFlavourWilson equal FastTwoFlavourWilson (same draws)."""
         geo = G46
         U = links(geo, 2, 20)
-        kernels = ["loop"] + (["cpu"] if cpu_reason() is None else [])
+        kernels = ["fast", "loop"] + (["cpu"] if cpu_reason() is None else [])
         fast = FastTwoFlavourWilson(kappas(0.12, 0.13), geo, solver_tol=1e-12, action_tol=1e-13)
         fast.refresh(U, torch.Generator().manual_seed(21))
         S_ref, F_ref = fast.action(U), fast.force(U)
         for kernel in kernels:
             with self.subTest(kernel=kernel):
-                term = FusedTwoFlavourWilson(kappas(0.12, 0.13), geo, kernel=kernel, solver_tol=1e-12,
-                                             action_tol=1e-13)
+                term = FusedTwoFlavourWilson(kappas(0.12, 0.13), geo, kernel="auto" if kernel == "fast" else kernel,
+                                             solver_tol=1e-12, action_tol=1e-13)
                 term.refresh(U, torch.Generator().manual_seed(21))
                 self.assertEqual(term.operator(U).kernel, kernel)
                 self.assertLess(rel(term.phi, fast.phi), 1e-14)
@@ -374,8 +399,16 @@ class FusedTermTest(unittest.TestCase):
         op = term.operator(U)
         self.assertIsInstance(op, FusedHalfLatticeWilson)
         self.assertIs(term.operator(U), op)
-        term.kernel = "loop"  # same resolved kernel on the CPU, but a different request: new operator
-        self.assertIsNot(term.operator(U), op)
+        self.assertEqual(op.kernel, "fast")
+        self.assertEqual(op.link_layout, "soa")
+        term.link_layout = "site"  # a different link layout: new operator
+        op_site = term.operator(U)
+        self.assertIsNot(op_site, op)
+        self.assertEqual(op_site.link_layout, "site")
+        term.kernel = "loop"  # a different request: new operator
+        self.assertIsNot(term.operator(U), op_site)
+        with self.assertRaises(ValueError):
+            FusedTwoFlavourWilson(0.12, geo, link_layout="aos")
         with self.assertRaises(ValueError):
             FusedTwoFlavourWilson(0.12, geo, kernel="nope")
         self.assertEqual(FusedHalfLatticeWilson(U, 0.12, geo, colour_product="fused").colour_product, "matmul")
@@ -411,15 +444,19 @@ class FusedTermTest(unittest.TestCase):
         geo = G4s
         U0 = links(geo, 2, 40)
         out = {}
-        for name, cls, extra in (("fast", FastTwoFlavourHamiltonian, {}),
-                                 ("loop", FusedTwoFlavourHamiltonian, {"kernel": "loop"})):
+        runs = [("fast", FastTwoFlavourHamiltonian, {}), ("loop", FusedTwoFlavourHamiltonian, {"kernel": "loop"})]
+        if cpu_reason() is None:
+            runs.append(("cpu", FusedTwoFlavourHamiltonian, {"kernel": "cpu"}))
+        for name, cls, extra in runs:
             ham = cls(5.0, 0.12, geo, n_gauge_substeps=1, solver_tol=1e-12, action_tol=1e-13,
                       precision="mixed", **extra)
             hmc = H.HMC(geo, ham, tau=0.3, n_steps=3)
             U, acc, dH, _ = hmc.trajectory(U0.clone(), torch.Generator().manual_seed(41))
             out[name] = (U, dH)
-        self.assertLess((out["loop"][1] - out["fast"][1]).abs().max().item(), 1e-8)
-        self.assertLess((out["loop"][0] - out["fast"][0]).abs().max().item(), 1e-10)
+        for name in [n for n in out if n != "fast"]:
+            with self.subTest(kernel=name):
+                self.assertLess((out[name][1] - out["fast"][1]).abs().max().item(), 1e-8)
+                self.assertLess((out[name][0] - out["fast"][0]).abs().max().item(), 1e-10)
 
 
 if __name__ == "__main__":

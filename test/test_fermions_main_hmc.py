@@ -273,6 +273,80 @@ class MainHMCTest(unittest.TestCase):
                 self.assertTrue(np.array_equal(cols[True]["accepted"], cols[False]["accepted"]))
                 self.assertLess(np.abs(cols[True]["plaquette"] - cols[False]["plaquette"]).max(), 1e-10)
 
+    def test_fused_kernel_matches_fast(self):
+        """--kernel cpu (host build of the fused kernel; skipped without a C++ compiler) and
+        --kernel loop reproduce the --fast run: dH to 1e-8, identical accept pattern; also with
+        --precision mixed."""
+        from neoqcd.fermions.fused import backend_status
+        cpu_ok, cpu_why = backend_status("cpu")
+        kernels = ["loop"] + (["cpu"] if cpu_ok else [])
+        tight = ["--n-traj", "4", "--therm", "1", "--no-reuse-guess", "--solver-tol", "1e-13", "--action-tol", "1e-13"]
+        for precision in ("double", "mixed"):
+            prec = ["--precision", precision]
+            ref = self.tmp / f"fast_{precision}"
+            MAIN.main(WILSON + tight + ["--fast"] + prec + ["--out", str(ref)])
+            want = read_observables(ref / "observables.csv")
+            meta = json.loads((ref / "run_meta.json").read_text())
+            self.assertIsNone(meta["run"]["fused_kernel"])
+            self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fast")
+            for kernel in kernels:
+                with self.subTest(kernel=kernel, precision=precision):
+                    out = self.tmp / f"{kernel}_{precision}"
+                    MAIN.main(WILSON + tight + ["--fast", "--kernel", kernel] + prec + ["--out", str(out)])
+                    got = read_observables(out / "observables.csv")
+                    self.assertLess(np.abs(got["dH"] - want["dH"]).max(), 1e-8)
+                    self.assertTrue(np.array_equal(got["accepted"], want["accepted"]))
+                    self.assertLess(np.abs(got["plaquette"] - want["plaquette"]).max(), 1e-10)
+                    meta = json.loads((out / "run_meta.json").read_text())
+                    info = meta["run"]["fused_kernel"]
+                    self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fused")
+                    self.assertEqual((info["requested"], info["resolved"], info["link_layout"]),
+                                     (kernel, kernel, "soa"))
+                    self.assertEqual(info["compiled"], kernel == "cpu")
+                    self.assertIsInstance(info["backend_status"], str)
+                    if kernel == "cpu":
+                        self.assertIn("cpu library", info["backend_status"])
+                    self.assertEqual(meta["parameters"]["kernel"], kernel)
+        if not cpu_ok:
+            self.skipTest(f"--kernel cpu not tested: host build of the fused kernel unavailable: {cpu_why}")
+
+    def test_fused_kernel_arguments_auto_and_resume_key(self):
+        for extra in (["--kernel", "cpu"],  # needs --fast
+                      ["--fast", "--link-layout", "site"],  # needs --kernel
+                      ["--fast", "--kernel", "cpu", "--kappa-heavy", "0.08"],
+                      ["--fast", "--kernel", "triton"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                MAIN.parse_args(WILSON + extra)
+        with self.assertRaisesRegex(SystemExit, "wilson"):
+            MAIN.parse_args(COMMON + ["--fermions", "staggered", "--mass", "0.3", "--fast", "--kernel", "loop"])
+        args = MAIN.parse_args(WILSON + ["--fast", "--kernel", "loop"])
+        self.assertEqual(args.link_layout, "soa")
+        self.assertEqual(MAIN.parse_args(WILSON + ["--fast", "--kernel", "cpu", "--link-layout", "site"]).link_layout,
+                         "site")
+        if not torch.cuda.is_available():  # an explicit CUDA kernel on the CPU is an error, no fallback
+            with self.assertRaisesRegex(SystemExit, "unavailable"):
+                MAIN.main(WILSON + ["--fast", "--kernel", "cuda", "--n-traj", "1", "--out", str(self.tmp / "c")])
+            # auto on the CPU: the --fast operator (matmul), recorded
+            out = self.tmp / "auto"
+            MAIN.main(WILSON + ["--fast", "--kernel", "auto", "--n-traj", "1", "--out", str(out)])
+            info = json.loads((out / "run_meta.json").read_text())["run"]["fused_kernel"]
+            self.assertEqual((info["requested"], info["resolved"], info["compiled"]), ("auto", "fast", False))
+            self.assertEqual(info["colour_product_of_fallback"], "matmul")
+            self.assertEqual(info["backend_status"], "no compiled backend requested")
+        # resume across kernels (or layouts) is refused; the same kernel resumes
+        out = self.tmp / "loop"
+        MAIN.main(WILSON + ["--fast", "--kernel", "loop", "--n-traj", "2", "--out", str(out)])
+        for extra in ([], ["--kernel", "auto"], ["--kernel", "loop", "--link-layout", "site"]):
+            with self.subTest(resume_with=extra), self.assertRaisesRegex(SystemExit, "differ"):
+                MAIN.main(WILSON + ["--fast"] + extra + ["--n-traj", "3", "--resume", "--out", str(out)])
+        MAIN.main(WILSON + ["--fast", "--kernel", "loop", "--n-traj", "3", "--resume", "--out", str(out)])
+        self.assertEqual(json.loads((out / "run_meta.json").read_text())["trajectories_done"], 3)
+        # a --kernel off checkpoint does not resume with a fused kernel
+        out = self.tmp / "off"
+        MAIN.main(WILSON + ["--fast", "--n-traj", "2", "--out", str(out)])
+        with self.assertRaisesRegex(SystemExit, "differ"):
+            MAIN.main(WILSON + ["--fast", "--kernel", "loop", "--n-traj", "3", "--resume", "--out", str(out)])
+
     def test_hasenbusch_arguments_and_resume_key(self):
         for extra in (["--hasenbusch-layout", "shared"], ["--n-heavy-substeps", "2"], ["--n-ratio-substeps", "2"],
                       ["--kappa-heavy", "0.2"], ["--kappa-heavy", "0.08", "--hasenbusch-layout", "shared",

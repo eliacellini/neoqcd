@@ -27,7 +27,16 @@ force through the half-lattice even-odd operator and lean_cg;
 --precision mixed (with --fast) solves with complex64 inner CG and complex128 residuals to the
 same tolerances (--inner-tol, --max-outer; --max-iter is then the total inner budget per solve);
 --colour-product picks the SU(N) x spinor product (auto: broadcast_sum on CUDA, matmul on CPU);
---check-every is the host convergence check interval of lean_cg. --precision, --colour-product,
+--check-every is the host convergence check interval of lean_cg;
+--kernel auto|cuda|cpu|loop|off (default off: the --fast operator as above) runs the Wilson term
+through neoqcd.fermions.fused.FusedTwoFlavourWilson (same physics, fused hop kernel): "cuda" the
+compiled CUDA kernel, "cpu" its host build (testing), "loop" the pure-torch variant, "auto" the
+CUDA kernel when it builds, the --fast operator otherwise. It needs --fast and --fermions wilson
+without --kappa-heavy; an explicit "cuda" / "cpu" that cannot be built is an error (no silent
+fallback). --link-layout soa (default) | site picks the link layout of the compiled kernel. The
+requested and resolved kernel, the layout and the backend status are recorded in run_meta.json
+("run"."fused_kernel"); kernel and layout are part of the resume key (checkpoints without them
+count as --kernel off). --precision, --colour-product,
 --check-every, --inner-tol and --max-outer are rejected without --fast (the last two also
 without --precision mixed). All are recorded in run_meta.json ("parameters" and "run").
 
@@ -90,6 +99,7 @@ from neoqcd.fermions.io import (  # noqa: E402
 )
 from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_product  # noqa: E402
 from neoqcd.fermions.fast_terms import FastHasenbuschHamiltonian, FastStaggeredHamiltonian  # noqa: E402
+from neoqcd.fermions import fused as fused_mod  # noqa: E402
 from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian  # noqa: E402
@@ -157,6 +167,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
     p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default=None,
                    help="With --fast: SU(N) x spinor product; auto (default) = broadcast_sum on CUDA, matmul on CPU.")
+    p.add_argument("--kernel", choices=("auto", "cuda", "cpu", "loop", "off"), default="off",
+                   help="With --fast, Wilson, no Hasenbusch: fused hop kernel (neoqcd.fermions.fused); "
+                        "off (default) = the --fast operator.")
+    p.add_argument("--link-layout", choices=fused_mod.LINK_LAYOUTS, default=None,
+                   help=f"With --kernel: link layout of the compiled kernel (default {fused_mod.DEFAULT_LINK_LAYOUT}).")
     p.add_argument("--check-every", type=int, default=None,
                    help="With --fast: host convergence check of the CG every k iterations (default 10).")
     p.add_argument("--inner-tol", type=float, default=None,
@@ -235,6 +250,16 @@ def validate_args(args):
     for name in ("inner_tol", "max_outer"):
         if getattr(args, name) is not None and args.precision != "mixed":
             raise SystemExit(f"--{name.replace('_', '-')} needs --fast --precision mixed")
+    if args.kernel != "off":
+        if args.fermions != "wilson":
+            raise SystemExit("--kernel is for --fermions wilson (the fused kernel is Wilson only)")
+        if not args.fast:
+            raise SystemExit("--kernel needs --fast")
+        if args.kappa_heavy is not None:
+            raise SystemExit("--kernel does not support Hasenbusch (--kappa-heavy) yet")
+        args.link_layout = fused_mod.DEFAULT_LINK_LAYOUT if args.link_layout is None else args.link_layout
+    elif args.link_layout is not None:
+        raise SystemExit("--link-layout needs --kernel")
     if args.on_unconverged is not None and not (args.fermions == "wilson" or (args.fermions == "staggered" and args.fast)):
         raise SystemExit("--on-unconverged is for --fermions wilson, or staggered with --fast")
     args.colour_product = "auto" if args.colour_product is None else args.colour_product
@@ -282,7 +307,31 @@ def physics_key(args):
         "time_sign": float(args.time_sign),
         "kappa_heavy": None if args.kappa_heavy is None else float(args.kappa_heavy),
         "hasenbusch_layout": args.hasenbusch_layout,
+        "kernel": args.kernel, "link_layout": args.link_layout,
     }
+
+
+def resolve_fused_kernel(args, device, geometry):
+    """run_meta record of the fused kernel (None with --kernel off). An explicit "cuda" / "cpu"
+    that cannot be used is a SystemExit (no silent fallback in a production run)."""
+    if args.kernel == "off":
+        return None
+    strict = args.kernel in ("cuda", "cpu")
+    try:
+        resolved, reason = fused_mod.resolve_kernel(args.kernel, device, geometry, strict=strict)
+    except fused_mod.BackendUnavailable as exc:
+        raise SystemExit(f"--kernel {args.kernel}: unavailable: {exc}")
+    target = {"auto": "cuda" if device.type == "cuda" else None}.get(args.kernel, args.kernel)
+    if resolved in ("cuda", "cpu"):
+        status = f"{resolved} library {fused_mod.load_backend(resolved, device).path}"
+    elif target in ("cuda", "cpu"):
+        status = f"{target} unavailable: {reason}"
+    else:
+        status = "no compiled backend requested"
+    return {"requested": args.kernel, "resolved": resolved, "fallback_reason": reason,
+            "link_layout": args.link_layout, "compiled": resolved in ("cuda", "cpu"), "backend_status": status,
+            "colour_product_of_fallback": (resolve_colour_product(args.colour_product, device)
+                                           if resolved == "fast" else None)}
 
 
 # ---- runtime ------------------------------------------------------------------------------------
@@ -344,6 +393,13 @@ def build_hamiltonian(args, geometry):
     if args.fermions == "staggered" and args.fast:
         ham = FastStaggeredHamiltonian(args.beta, args.mass, geometry, n_gauge_substeps=args.n_gauge_substeps,
                                        on_unconverged=args.on_unconverged, **fast_kw, **kw)
+        return ham, ham.fermion
+    if args.fermions == "wilson" and args.fast and args.kernel != "off":
+        ham = fused_mod.FusedTwoFlavourHamiltonian(
+            args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps, kernel=args.kernel,
+            link_layout=args.link_layout, strict=args.kernel in ("cuda", "cpu"), precision=args.precision,
+            check_every=args.check_every, colour_product=args.colour_product, inner_tol=args.inner_tol,
+            max_outer=args.max_outer, on_unconverged=args.on_unconverged, **kw)
         return ham, ham.fermion
     if args.fermions == "wilson" and args.fast:
         ham = FastTwoFlavourHamiltonian(args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps,
@@ -545,7 +601,8 @@ def main(argv=None):
             raise SystemExit(f"--resume: no checkpoint in {out}")
         U, meta, rng_state = load_state(state_prefix, device=device)
         stored = {k: meta[k] for k in ("geometry", "batch", "beta", "fermions", "kappa", "mass", "time_sign")}
-        stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout")})
+        stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout", "link_layout")})
+        stored["kernel"] = meta.get("extra", {}).get("kernel", "off")  # older checkpoints: --kernel off
         if stored != physics_key(args):
             raise SystemExit(f"--resume: checkpoint parameters {stored} differ from {physics_key(args)}")
         if meta["rng"]["device"].split(":")[0] != device.type:
@@ -566,6 +623,7 @@ def main(argv=None):
         traj_done = 0
         writer = ObservableWriter(csv_path, OBS_FIELDS)
 
+    fused_info = resolve_fused_kernel(args, device, geometry)
     ham, fermion = build_hamiltonian(args, geometry)
     integrator = args.integrator_levels
     hmc = HMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator)
@@ -581,7 +639,9 @@ def main(argv=None):
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "torch_threads": torch.get_num_threads(),
         "n_flavours": n_flavours(args.fermions, args.D), "lattice": list(geometry.lattice),
         "volume": geometry.volume, "dtype": "complex128", "obs_fields": list(OBS_FIELDS),
-        "fermion_operator": "half_lattice_fast" if args.fast else "reference",
+        "fermion_operator": ("reference" if not args.fast else
+                             "half_lattice_fast" if fused_info is None else "half_lattice_fused"),
+        "fused_kernel": fused_info,
         "precision": args.precision,
         "colour_product": resolve_colour_product(args.colour_product, device) if args.fast else None,
         "hasenbusch": (None if args.kappa_heavy is None else
@@ -599,7 +659,8 @@ def main(argv=None):
                    trajectory=traj_done, time_sign=args.time_sign, kappa=args.kappa, mass=args.mass,
                    generator=generator, extra={"seed": args.seed, "final": bool(final),
                                                "kappa_heavy": args.kappa_heavy,
-                                               "hasenbusch_layout": args.hasenbusch_layout})
+                                               "hasenbusch_layout": args.hasenbusch_layout,
+                                               "kernel": args.kernel, "link_layout": args.link_layout})
         try:
             summary, _ = summarize(csv_path, args.batch, args.gamma_S)
         except Exception as exc:  # checkpoint files are already written; never die on statistics
