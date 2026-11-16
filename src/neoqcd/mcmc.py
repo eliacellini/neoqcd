@@ -684,7 +684,12 @@ def SU2_left_multiply_SU3(links, subgroup, phb):
     pair = _constant(("pair", int(phb), str(links.device)),
                      lambda: torch.tensor([i for i in range(3) if i != phb], device=links.device))
     rows = links.index_select(-2, pair)
-    updated_rows = torch.matmul(subgroup, rows)
+    # Broadcast product and sum instead of torch.matmul. On CUDA, matmul sends this 2x2 @ 2x3
+    # complex product to a cuBLAS batched GEMM kernel built for large matrices (cutlass z884gemm),
+    # 28% of the GPU time of an O-REX step (reports/profiles/step_profile_orex_K2_bs64_63003660.txt);
+    # sun_utils.SUN_mul uses the same formulation for 3x3 products on CUDA. One code path on every
+    # device, so the CPU tests cover what runs on the GPU.
+    updated_rows = (subgroup.unsqueeze(-1) * rows.unsqueeze(-3)).sum(-2)
     return links.index_copy(-2, pair, updated_rows)
 
 
