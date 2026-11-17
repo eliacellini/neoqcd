@@ -1,4 +1,5 @@
 import argparse
+import copy
 import contextlib
 import csv
 import hashlib
@@ -26,13 +27,22 @@ from neoqcd.distributedPT import (
 )
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR, quiesce_for_capture
+import neoqcd.fused as fused
+import neoqcd.fused_smearing as fused_smearing
 from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.replica_history import rung_indices, summarize_history
-from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
+from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows, Smearing
 from neoqcd.smearing_jacobian import LOGDET_VERSION
 from neoqcd.sun_utils import plaquette_SUN
 from neoqcd.theory import Wilson_action
-from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer, translate_periodic_replica
+from neoqcd.utils import (
+    Defect,
+    ProtocolBox,
+    create_mask,
+    defect_patch,
+    residual_patch_buffer,
+    translate_periodic_replica,
+)
 
 
 @dataclass
@@ -338,6 +348,22 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         self.layer = DefectCouplingLayer(flow_pars, rho0, time=1.0)
         self._graphs = {}
 
+    def set_frame(self, defect=None):
+        """Where the defect sits in the configurations the layer receives: in the whole lattice
+        (None, flow_pars.defect) or in a protocol box (utils.ProtocolBox.defect, --protocol-box). The
+        map is the same; only the cut of the defect patch and its embedding move."""
+        if defect is None:
+            self.frame_pars = self.flow_pars
+        else:
+            self.frame_pars = copy.copy(self.flow_pars)
+            self.frame_pars.defect = defect
+        self._graphs = {}
+
+    def _frame(self):
+        # flow_pars with the defect coordinates of the input; subclasses without set_frame use flow_pars
+        frame = self.__dict__.get("frame_pars")
+        return self.flow_pars if frame is None else frame
+
     @property
     def checkpoint_semantics(self):
         smearing = self.layer.smearing
@@ -383,7 +409,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         Gradient-safe embedding of the defect patch into a full lattice tensor.
         Avoids mutating tensors that are part of checkpointed autograd paths.
         """
-        defect = self.flow_pars.defect
+        defect = self._frame().defect
         t = int(defect.time_slice)
         s = int(defect.space_slice)
         dsize = int(defect.dsize)
@@ -427,51 +453,63 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         )
         return out, logdet
 
+    def _capture(self, kind, x, bc, delta_bc):
+        """Capture the CUDA graph of the patch map `kind` for inputs shaped like x: the graph and its
+        static tensors, or None when the capture fails (eager from then on)."""
+        from neoqcd.smearing_jacobian import DeferredChecks, lu_logdet
+        buffer = self.flow_pars.patch_buffer
+        try:
+            static_small = self._frame().defect.cut_defect(x, buffer=buffer).clone()
+            static_bc, static_delta = bc.clone(), delta_bc.clone()
+            old_jac_shape = self._set_local_jac_shape(int(x.shape[0]))
+            try:
+                # torch.linalg.slogdet captured fine on Leonardo (torch 2.0, CUDA 12.1); the
+                # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
+                # failed capture leaves the CUDA random generator unusable.
+                with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
+                    quiesce_for_capture(x.device)
+                    stream = torch.cuda.Stream(device=x.device)
+                    stream.wait_stream(torch.cuda.current_stream(device=x.device))
+                    with torch.cuda.stream(stream):
+                        for _ in range(2):
+                            with DeferredChecks():
+                                self._run_blocks(kind, static_small, static_bc, static_delta)
+                    torch.cuda.current_stream(device=x.device).wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        with DeferredChecks() as checks:
+                            static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
+            finally:
+                self.layer.smearing.jac_shape = old_jac_shape
+        except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
+            import warnings
+            warnings.warn(f"CUDA graph capture of the smearing layer {kind} failed, running eagerly: "
+                          f"{type(err).__name__}: {err}")
+            self.use_cuda_graphs = False
+            return None
+        return graph, static_small, static_bc, static_delta, static_out, static_logdet, checks
+
     def _graphed(self, kind, x, bc, delta_bc):
         """Replay the CUDA graph of the patch map, capturing it on first use; the deferred checks
         (c1 of every block, inverse residual) are read once after the replay and a failed check
-        repeats the call eagerly. Returns None when graphs are unavailable."""
-        from neoqcd.smearing_jacobian import DeferredChecks, lu_logdet
-        bs = int(x.shape[0])
-        key = (kind, tuple(x.shape), str(x.dtype))
+        repeats the call eagerly. Returns None when graphs are unavailable.
+
+        The first use captures the map and its inverse together: on a rank whose chains all move up,
+        the inverse is needed only steps later, and its capture (which quiesces the device) would
+        then fall at a random step of the run, inside a profile window for instance."""
         if not hasattr(self, "_graphs"):
             self._graphs = {}
-        entry = self._graphs.get(key)
+        shape = (tuple(x.shape), str(x.dtype))
+        if (kind,) + shape not in self._graphs:
+            for k in (kind, "inverse" if kind == "forward" else "forward"):
+                if (k,) + shape not in self._graphs:
+                    captured = self._capture(k, x, bc, delta_bc)
+                    if captured is None:
+                        return None
+                    self._graphs[(k,) + shape] = captured
+        graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = self._graphs[(kind,) + shape]
         buffer = self.flow_pars.patch_buffer
-        if entry is None:
-            try:
-                static_small = self.flow_pars.defect.cut_defect(x, buffer=buffer).clone()
-                static_bc, static_delta = bc.clone(), delta_bc.clone()
-                old_jac_shape = self._set_local_jac_shape(bs)
-                try:
-                    # torch.linalg.slogdet captured fine on Leonardo (torch 2.0, CUDA 12.1); the
-                    # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
-                    # failed capture leaves the CUDA random generator unusable.
-                    with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
-                        quiesce_for_capture(x.device)
-                        stream = torch.cuda.Stream(device=x.device)
-                        stream.wait_stream(torch.cuda.current_stream(device=x.device))
-                        with torch.cuda.stream(stream):
-                            for _ in range(2):
-                                with DeferredChecks():
-                                    self._run_blocks(kind, static_small, static_bc, static_delta)
-                        torch.cuda.current_stream(device=x.device).wait_stream(stream)
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            with DeferredChecks() as checks:
-                                static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
-                finally:
-                    self.layer.smearing.jac_shape = old_jac_shape
-            except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
-                import warnings
-                warnings.warn(f"CUDA graph capture of the smearing layer {kind} failed, running eagerly: "
-                              f"{type(err).__name__}: {err}")
-                self.use_cuda_graphs = False
-                return None
-            entry = (graph, static_small, static_bc, static_delta, static_out, static_logdet, checks)
-            self._graphs[key] = entry
-        graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = entry
-        static_small.copy_(self.flow_pars.defect.cut_defect(x, buffer=buffer))
+        static_small.copy_(self._frame().defect.cut_defect(x, buffer=buffer))
         static_bc.copy_(bc)
         static_delta.copy_(delta_bc)
         graph.replay()
@@ -493,7 +531,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         try:
             x_small, _, dlogj = self.layer(
                 x,
-                self.flow_pars,
+                self._frame(),
                 rho_layer=None,
                 is_training=True,
                 beta=bc,
@@ -527,7 +565,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
             graphed = self._graphed("inverse", x, bc, delta_bc)
             if graphed is not None:
                 return graphed[0], graphed[1].to(dtype=work_dtype)
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
+        small_cfgs = self._frame().defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self._inverse_small(small_cfgs, bc, delta_bc, **kwargs)
         return self._embed_small_cfgs(small_cfgs, x, buffer=self.flow_pars.patch_buffer), logdet.to(dtype=work_dtype)
 
@@ -580,7 +618,7 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
 
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
+        small_cfgs = self._frame().defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self.layer(
             small_cfgs,
             self.flow_pars.small_mask[-1],
@@ -601,6 +639,19 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
             delta_beta=delta_bc,
             **kwargs,
         )
+
+
+def _protocol_box(args, defect, protocol_patch, flow_buffer, device, rank):
+    """The utils.ProtocolBox of --protocol-box, or None (flag off, or a box as large as the lattice)."""
+    if not bool(args.protocol_box):
+        return None
+    if protocol_patch is None:
+        raise ValueError("--protocol-box needs --protocol-patch-halfsize")
+    box = ProtocolBox(defect, args.protocol_patch_halfsize, flow_buffer=flow_buffer, device=device)
+    if rank == 0:
+        state = "off (the box covers the lattice)" if box.covers_lattice else "on"
+        print(f"protocol_box={state}  protocol_box_shape={box.describe()}", flush=True)
+    return None if box.covers_lattice else box
 
 
 def _build_neorex_flow_pars(
@@ -719,10 +770,28 @@ def parse_args() -> argparse.Namespace:
         "swaps always cover the whole lattice.",
     )
     parser.add_argument(
+        "--protocol-box",
+        action="store_true",
+        help="Run the protocol of each O-REX/NEO-REX swap on a box around the defect (utils.ProtocolBox): "
+        "the protocol patch with a one-site frame, the cut of the defect flow layer and the plaquettes of "
+        "the action change, cut once per swap and written back into the accepted chains. The links outside "
+        "the patch never change along a protocol, so this is the protocol of the whole lattice, apart from "
+        "the random numbers. Needs --protocol-patch-halfsize; NEO-REX with a smearing or residual layer.",
+    )
+    parser.add_argument(
         "--cuda-graphs",
         action="store_true",
         help="Replay CUDA graphs of the HBOR sweeps (equilibrium and protocol) and of the defect smearing "
         "layer, captured on first use; eager execution is the fallback when a capture fails.",
+    )
+    parser.add_argument(
+        "--fused-kernels",
+        action="store_true",
+        help="Run every HB+OR sweep (equilibrium and protocol) through the fused CUDA kernel of neoqcd.fused, "
+        "and the stout steps of the smearing layers where no gradient is recorded (forward and fixed-iteration "
+        "inverse) through those of neoqcd.fused_smearing (built with nvcc at the start of the run, cached in "
+        "$NEOQCD_KERNEL_CACHE). Equal to the torch paths to rounding, so statistically, not bitwise, "
+        "equivalent runs; the torch paths run where a kernel does not apply.",
     )
     parser.add_argument(
         "--graph-logdet",
@@ -822,6 +891,13 @@ def parse_args() -> argparse.Namespace:
         "write the operator tables and the time of each phase to <output-dir>/step_profile.txt.",
     )
     parser.add_argument(
+        "--profile-python",
+        action="store_true",
+        help="With --profile-steps, also run cProfile over the same steps on rank 0 and write the Python "
+        "functions by own and by cumulative time to <output-dir>/step_cprofile.txt: where the host time "
+        "goes outside the torch operators (cProfile slows Python calls, so the phases run slower).",
+    )
+    parser.add_argument(
         "--save-link-work-values",
         action="store_true",
         help="For O-REX/NEO-REX, save every proposed swap work by ladder link to link_work_values.npz.",
@@ -832,9 +908,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Save the rung of every chain slot and its plaquette after each step to replica_history.npz "
-        "(rewritten every --log-every steps), and report round trips and the plaquette tau_int in run_meta.json.",
+        "(rewritten during the run, see --replica-history-save-minutes, and at the end), and report round "
+        "trips and the plaquette tau_int in run_meta.json.",
     )
     parser.add_argument("--no-save-replica-history", dest="save_replica_history", action="store_false")
+    parser.add_argument(
+        "--replica-history-save-minutes",
+        type=float,
+        default=10.0,
+        help="Rewrite replica_history.npz during the run at most once per this many wall-clock minutes, at a "
+        "log step (0: at every log step, as before). Each rewrite compresses the whole history so far, so "
+        "rewriting it every --log-every steps made the cost per step grow with the steps done (+50%% at "
+        "3000 steps of 8^4). The history is written at the end of the run in any case, a stop by "
+        "--max-run-minutes included; the rewrites only cover a job killed before the end.",
+    )
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")
     parser.add_argument("--output-dir", type=str, default=None, help="If set, use this directory for logs")
     parser.add_argument("--run-name", type=str, default="")
@@ -1211,6 +1298,9 @@ def main(args: argparse.Namespace) -> None:
             parameter_name="bc",
             **protocol_updates,
         )
+        protocol_box = _protocol_box(args, defect, protocol_patch, None, device, rank)
+        protocol_mcmc = orex_mcmc if protocol_box is None else orex_mcmc.on_box(protocol_box)
+        pt.protocol_box = protocol_box
     elif args.algorithm == "neorex":
         if int(args.neorex_protocol_steps) <= 0:
             raise ValueError("For --algorithm neorex set --neorex-protocol-steps >= 1")
@@ -1245,12 +1335,22 @@ def main(args: argparse.Namespace) -> None:
             default_parameter=parameter_min,
             **protocol_updates,
         )
+        if bool(args.protocol_box) and nf_layer_kind == "cnf":
+            raise ValueError("--protocol-box: the CNF layer acts on the whole lattice")
+        protocol_box = _protocol_box(
+            args, defect, protocol_patch, None if neorex_flow_pars is None else neorex_flow_pars.patch_buffer,
+            device, rank,
+        )
+        protocol_mcmc = neorex_mcmc
+        if protocol_box is not None:
+            protocol_mcmc = neorex_mcmc.on_box(protocol_box)
+            nf_layer.set_frame(protocol_box.defect)
         neorex_flow = NEOREXProtocolWrapper(
             nf_layer=nf_layer,
-            theory=neorex_mcmc,
+            theory=protocol_mcmc,
             n_protocol_steps=args.neorex_protocol_steps,
             work_mode=args.neorex_work_mode,
-            stochastic_update=neorex_mcmc if args.neorex_heatbath_steps_per_step > 0 else None,
+            stochastic_update=protocol_mcmc if args.neorex_heatbath_steps_per_step > 0 else None,
             stochastic_steps_per_step=args.neorex_heatbath_steps_per_step,
             parameter_name="bc",
         )
@@ -1301,7 +1401,8 @@ def main(args: argparse.Namespace) -> None:
                     print(f"neorex_flow_checkpoint=auto_missing  path={load_path}", flush=True)
             else:
                 raise FileNotFoundError(f"NEO-REX flow checkpoint not found: {load_path}")
-        orex_mcmc = neorex_mcmc
+        pt.protocol_box = protocol_box
+        orex_mcmc = neorex_mcmc  # whole lattice: the dS/dc probe of the replica history
     else:
         pt_cfg = PTConfig(
             batch_size=args.batch_size,
@@ -1315,6 +1416,7 @@ def main(args: argparse.Namespace) -> None:
         )
         pt = ParallelTempering(pt_cfg, rank, world_size, device)
         orex_mcmc = None
+        protocol_mcmc = None
 
     if explicit_ladder is not None:
         parameter_ladder = torch.tensor(explicit_ladder, device=device, dtype=pt_cfg.parameter_dtype)
@@ -1357,11 +1459,34 @@ def main(args: argparse.Namespace) -> None:
     # The equilibrium sweep runs on the whole local batch at once, with the bc of each chain.
     hbor_batched = HBOR(flow_pars, beta=args.beta, defect_par=float(parameter_min))
     hbor_batched.use_cuda_graphs = bool(args.cuda_graphs)
-    if orex_mcmc is not None:
-        orex_mcmc._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
+    for adapter in (orex_mcmc, protocol_mcmc):
+        if adapter is not None:
+            adapter._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
     if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
         nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
         nf_layer.graph_logdet = str(args.graph_logdet)
+    if bool(args.fused_kernels):
+        # Every HBOR and every Smearing of the run (class attributes). Rank 0 builds the libraries first,
+        # the others then load them from the shared cache instead of compiling them concurrently. Loading
+        # also initializes each library's CUDA runtime and loads its kernels on this device, before any
+        # CUDA graph capture of the smearing layer (--cuda-graphs) launches them.
+        HBOR.use_fused_kernels = True
+        Smearing.use_fused_kernels = True
+        fused_status = smearing_status = (False, f"device {device.type}")
+        if device.type == "cuda":
+            if rank == 0:
+                fused_status = fused.backend_status("cuda", device)
+                smearing_status = fused_smearing.backend_status("cuda", device)
+            if world_size > 1:
+                dist.barrier()
+            if rank != 0:
+                fused_status = fused.backend_status("cuda", device)
+                smearing_status = fused_smearing.backend_status("cuda", device)
+        if rank == 0:
+            ok, where = fused_status
+            smearing_ok, smearing_where = smearing_status
+            print(f"fused_kernels=on  hbor={'cuda' if ok else 'torch'}  hbor_library={where}  "
+                  f"smearing={'cuda' if smearing_ok else 'torch'}  smearing_library={smearing_where}", flush=True)
     if rank == 0 and bool(args.cuda_graphs):
         print("cuda_graphs=on", flush=True)
         if world_size > 1 and os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1") != "0":
@@ -1482,9 +1607,11 @@ def main(args: argparse.Namespace) -> None:
         )
 
     last_log_elapsed = 0.0
+    history_saved_t = time.time()  # last rewrite of replica_history.npz during the run
     # Optional profile of whole REX steps on rank 0: the phases are labelled with record_function so
     # that the table attributes the time to the equilibrium sweep, the swap step and the bookkeeping.
     profiler = None
+    py_profiler = None  # cProfile of the same steps, --profile-python
     profile_first, profile_last = 1, int(args.profile_steps)  # steps [1, profile_steps]; step 0 warms up
     phase_seconds = {}
 
@@ -1517,6 +1644,10 @@ def main(args: argparse.Namespace) -> None:
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             profiler = torch.profiler.profile(activities=activities, record_shapes=False)
             profiler.__enter__()
+            if bool(args.profile_python):
+                import cProfile
+                py_profiler = cProfile.Profile()
+                py_profiler.enable()
         phase_t0 = _phase_clock() if profiling else None
         region = torch.profiler.record_function("equilibrium_sweep") if profiling else None
         if region is not None:
@@ -1542,8 +1673,8 @@ def main(args: argparse.Namespace) -> None:
         train_flow = False
         if (step + 1) % args.swap_every == 0:
             if args.algorithm == "orex":
-                orex_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
-                cfgs, stats = pt.step(cfgs, orex_mcmc)
+                protocol_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
+                cfgs, stats = pt.step(cfgs, protocol_mcmc)
             elif args.algorithm == "neorex":
                 train_flow = (
                     (not bool(args.neorex_eval_flow))
@@ -1609,7 +1740,11 @@ def main(args: argparse.Namespace) -> None:
         if bool(args.save_replica_history):
             # The plaquette of each local chain (whole lattice, Re Tr / N), gathered to rank 0 and
             # stored with the rung its slot carries now, so the carrier of any rung can be followed.
-            local_plaquette = plaquette_SUN(cfgs, args.D, args.N).to(dtype=torch.float64)
+            # one kernel with --fused-kernels (sun.plaquette_SUN where it does not apply)
+            local_plaquette = fused.plaquette(cfgs, args.N) if bool(args.fused_kernels) else None
+            if local_plaquette is None:
+                local_plaquette = plaquette_SUN(cfgs, args.D, args.N)
+            local_plaquette = local_plaquette.to(dtype=torch.float64)
             gather_list = (
                 [torch.zeros_like(local_plaquette) for _ in range(world_size)] if rank == 0 else None
             )
@@ -1796,12 +1931,15 @@ def main(args: argparse.Namespace) -> None:
                         float(gpu_memory.get("gpu_memory/total_gb", float("nan"))),
                     ]
                 )
-            if history_labels:
+            if history_labels and time.time() - history_saved_t >= 60.0 * float(args.replica_history_save_minutes):
                 save_replica_history()
+                history_saved_t = time.time()
         if region is not None:
             region.__exit__(None, None, None)
             phase_seconds["bookkeeping"] = phase_seconds.get("bookkeeping", 0.0) + _phase_clock() - phase_t0
         if profiler is not None and step == profile_last:
+            if py_profiler is not None:
+                py_profiler.disable()
             profiler.__exit__(None, None, None)
             averages = profiler.key_averages()
             n_prof = profile_last - profile_first + 1
@@ -1820,6 +1958,14 @@ def main(args: argparse.Namespace) -> None:
             print("step_profile_phases=" + json.dumps({k: round(v / n_prof, 4) for k, v in phase_seconds.items()})
                   + f"  step_profile_path={out_dir / 'step_profile.txt'}", flush=True)
             profiler = None
+            if py_profiler is not None:
+                import pstats
+                with open(out_dir / "step_cprofile.txt", "w", encoding="utf-8") as handle:
+                    for key in ("tottime", "cumulative"):
+                        handle.write(f"# Python functions by {key} time, {n_prof} REX steps on rank 0 (cProfile)\n")
+                        pstats.Stats(py_profiler, stream=handle).sort_stats(key).print_stats(60)
+                print(f"step_cprofile_path={out_dir / 'step_cprofile.txt'}", flush=True)
+                py_profiler = None
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []

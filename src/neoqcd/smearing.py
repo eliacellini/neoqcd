@@ -3,6 +3,7 @@ import torch.utils.checkpoint as checkpoint
 from torch.profiler import record_function
 import numpy as np
 import neoqcd.sun_utils as sun
+import neoqcd.fused_smearing as fused_smearing
 from neoqcd.smearing_jacobian import SmearingStep as ExactSmearingStep
 from neoqcd.smearing_jacobian import DeferredChecks, StepQuantities, exp_coefficients, inverse_smearing_step, smearing_step
 from neoqcd.nn import HTCNN
@@ -1370,6 +1371,19 @@ class DefectCouplingLayer(CouplingLayer):
         return flow_pars.defect.embedding(small_cfgs, cfgs, buffer=getattr(flow_pars, "patch_buffer", 2)), 0, dlogJ
 
 class Smearing(torch.nn.Module):
+    # Fused kernels of the stout step (neoqcd.fused_smearing): off by default; main_pt_obc.py turns them on
+    # for every Smearing with --fused-kernels (class attribute). On the SU(3) path of the selected links, the
+    # stout step of every masked update (_forward_blocks) and the fixed-iteration inverse (_inverse_blocks
+    # with fixed_iterations) run through them, unless autograd must record the step (grad mode and U or C
+    # requiring grad: fused_smearing.needs_autograd); the staple sums, gathers and write-backs stay in torch,
+    # and so does the adaptive inverse. fused_emulate runs the CPU emulation of the kernels on CPU tensors
+    # (tests); fused_strict raises instead of falling back to the torch step; fused_used is the path of the
+    # last call ('cuda', 'cpu', or 'torch' if any step of it ran in torch), as for mcmc.HBOR.
+    use_fused_kernels = False
+    fused_emulate = False
+    fused_strict = False
+    fused_used = None
+
     def __init__(self, flow_pars, time):
         super().__init__()
         self.N = flow_pars.N
@@ -1428,10 +1442,26 @@ class Smearing(torch.nn.Module):
             return torch.abs(rho_runtime[sm, m, :])
         return rho_runtime[:, sm, m, :] if batched_rho else rho_runtime[sm, m, :]
 
+    def _fused_backend(self, cfgs):
+        """The library of the fused stout step for this call (fused_smearing.backend_for), or None for the
+        torch step."""
+        return fused_smearing.backend_for(self, cfgs) if self.use_fused_kernels else None
+
+    def _fused_step(self, backend, *inputs):
+        """Whether this step goes through the kernels: a library, and no gradient to record on its inputs."""
+        return backend is not None and not fused_smearing.needs_autograd(*inputs)
+
+    def _record_fused(self, backend, torch_steps):
+        """fused_used after a call with use_fused_kernels: the kernels' target, or 'torch' if a step ran in torch."""
+        if self.use_fused_kernels:
+            self.fused_used = "torch" if backend is None or torch_steps else backend.target
+
     def forward(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None):
         """The smearing layer; on the SU(3) stout path the series branch of the exp(iQ) coefficients is
         taken for every block and c1 is checked once at the end (one host-device sync instead of
-        one per block); if some c1 was too large the call is repeated with the per-block choice."""
+        one per block); if some c1 was too large the call is repeated with the per-block choice.
+        The fused stout step (use_fused_kernels) chooses series or closed forms link by link and records
+        no c1, so its first pass always stands."""
         use_selected_links = self.N == 3 and not self.use_nn
         if use_selected_links:
             with DeferredChecks() as checks:
@@ -1455,6 +1485,8 @@ class Smearing(torch.nn.Module):
         )
         flat = sun.flat_links(cfgs, self.D) if use_selected_links else None
         cfg_shape = tuple(cfgs.shape)
+        fused_backend = self._fused_backend(cfgs)
+        torch_steps = 0
 
         for sm in range(self.smearing_steps_per_layer):
             for mu in range(self.D):
@@ -1483,8 +1515,12 @@ class Smearing(torch.nn.Module):
                         else:
                             C = selected_staples(flat, rho)
                         U = flat.index_select(1, selected_links.links[m])
-                        step = ExactSmearingStep.apply if self.explicit_backward else smearing_step
-                        U_out, logdet = step(U, C)
+                        if self._fused_step(fused_backend, U, C):
+                            U_out, logdet = fused_smearing.stout_links(U, C, fused_backend)
+                        else:
+                            torch_steps += 1
+                            step = ExactSmearingStep.apply if self.explicit_backward else smearing_step
+                            U_out, logdet = step(U, C)
                         flat = flat.index_copy(1, selected_links.links[m], U_out)
                         dlogJ = dlogJ + logdet.sum(dim=1)
                         continue
@@ -1505,6 +1541,7 @@ class Smearing(torch.nn.Module):
                         dlogJ += torch.sum(torch.log(torch.clamp(masked_jac, min=1e-12)), dims)
         if use_selected_links:
             cfgs = flat.reshape(cfg_shape)
+        self._record_fused(fused_backend, torch_steps)
         return cfgs, 0, dlogJ
 
     def inverse(self, cfgs, mask, rho_layer, dmasking=False, dmask=None, beta=None, delta_beta=None,
@@ -1544,6 +1581,10 @@ class Smearing(torch.nn.Module):
         cfg_shape = tuple(cfgs.shape)
         dlogJ = torch.zeros(cfgs.shape[0], dtype=cfgs.real.dtype, device=cfgs.device)
         stats = {"iterations": [], "residual": 0.0}
+        # The fused kernel does the fixed-iteration inverse (its residual recorded in the DeferredChecks of
+        # inverse(), as by the torch step); the adaptive inverse stays torch
+        fused_backend = self._fused_backend(cfgs) if fixed_iterations is not None else None
+        torch_steps = 0
 
         for sm in reversed(range(self.smearing_steps_per_layer)):
             for m in reversed(range(2 * self.D)):
@@ -1551,10 +1592,16 @@ class Smearing(torch.nn.Module):
                     continue
                 rho = self._mask_rho(rho_runtime, batched_rho, sm, m)
                 C = self._selected_stout_staples(flat, cfg_shape, links, m, rho)
-                U, logdet, iterations, residual = inverse_smearing_step(
-                    flat.index_select(1, links.links[m]), C, tol=tol, max_iter=max_iter,
-                    fixed_iterations=fixed_iterations,
-                )
+                Up = flat.index_select(1, links.links[m])
+                if self._fused_step(fused_backend, Up, C):
+                    U, logdet, iterations, residual = fused_smearing.inverse_smearing_step(
+                        Up, C, fixed_iterations, fused_backend
+                    )
+                else:
+                    torch_steps += 1
+                    U, logdet, iterations, residual = inverse_smearing_step(
+                        Up, C, tol=tol, max_iter=max_iter, fixed_iterations=fixed_iterations,
+                    )
                 if fixed_iterations is None:
                     if not residual <= tol:
                         raise RuntimeError(
@@ -1565,6 +1612,7 @@ class Smearing(torch.nn.Module):
                 flat = flat.index_copy(1, links.links[m], U)
                 dlogJ = dlogJ + logdet.sum(dim=1)
                 stats["iterations"].append(iterations)
+        self._record_fused(fused_backend, torch_steps)
         return (flat.reshape(cfg_shape), 0, dlogJ), stats
 
     def _class_dmask(self, dmask):

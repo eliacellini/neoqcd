@@ -272,8 +272,11 @@ class Defect():
             dphi = phi[(slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial + (slice(None), slice(None))]
         elif field == 'mask':
             dphi = phi[(slice(None), slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial]
+        elif field == 'defect':
+            # the (2, D, T, L, ...) defect mask of create_defect_mask: no colour indices
+            dphi = phi[(slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial]
         else:
-            raise ValueError("field must be 'cfgs' or 'mask'")
+            raise ValueError("field must be 'cfgs', 'mask' or 'defect'")
         return dphi
 
     def site_indices(self, buffer, device=None):
@@ -362,7 +365,7 @@ class DefectBox:
         self.links = sun.MaskedLinks(self.mask, self.D)
         self.defect_mask = (
             None if defect_mask is None
-            else defect.cut_defect(defect_mask, buffer=buffer)
+            else defect.cut_defect(defect_mask, field='defect', buffer=buffer)
         )
 
         sites = defect.site_indices(buffer, device=mask.device).flatten()
@@ -408,6 +411,92 @@ class DefectBox:
         return sun.flat_links(cfgs, self.D).index_copy(
             1, self.target_links, updated
         ).reshape(cfgs.shape)
+
+class ProtocolBox:
+    """The sub-lattice on which the protocol of an O-REX/NEO-REX swap runs (--protocol-box).
+
+    Along a protocol with a patch (Defect.protocol_patch_mask) the HB+OR updates change only the links
+    of the patch and the defect flow only the links of build_nf_changed_link_mask; every other link
+    stays as it is and is only read, through the staples of the patch links, the cut of the flow layer
+    and the plaquettes of the action change. The box holds all of them:
+
+    - the patch with a frame of one site, for the staples of its links;
+    - the cut of the flow layer (Defect.cut_defect with buffer `flow_buffer`), for NEO-REX;
+    - the sites within one site of the links that carry the defect coupling or that the flow
+      changes, for the plaquettes of the action change.
+
+    In a direction in which these need the whole extent (or more) the box takes the whole extent with
+    its periodicity; in the others its outer links are read and never updated, and no staple or
+    plaquette of the protocol crosses the box boundary. The protocol on the box is then the protocol on
+    the whole lattice, apart from the random numbers, which are drawn for the box only.
+
+    `defect` holds the coordinates of the defect inside the box, `sites` the lattice site of each box
+    site (box order); cut() copies the box out of a field, paste() writes it back.
+    """
+
+    def __init__(self, defect, protocol_half_size, flow_buffer=None, device=None):
+        D, T, L = int(defect.D), int(defect.T), int(defect.L)
+        t, s, dsize = int(defect.time_slice), int(defect.space_slice), int(defect.dsize)
+        half = int(protocol_half_size)
+        if half < 0:
+            raise ValueError(f"protocol_half_size must be >= 0, got {half}")
+        # Needed sites as [lo, hi) per direction, in lattice coordinates (periodic: may leave [0, extent))
+        time = [(t - half - 1, t + half + 3), (t - 1, t + 2)]  # patch + frame; defect links +-1
+        space = [(s - half - 2, s + dsize + half + 2), (s - 1, s + dsize + 1)]
+        if flow_buffer is not None:
+            b = int(flow_buffer)
+            time += [(t - b, t + b), (t - 2, t + 2)]  # cut of the flow; changed links +-1
+            space += [(s - b, s + dsize + b), (s - 2, s + dsize + 2)]
+
+        def interval(needed, extent):
+            lo, hi = min(a for a, _ in needed), max(b for _, b in needed)
+            if hi - lo >= extent:
+                return 0, extent, False
+            return lo, hi - lo, True
+
+        t_lo, t_n, self.cut_time = interval(time, T)
+        s_lo, s_n, self.cut_space = interval(space, L)
+        self.D = D
+        self.lattice_shape = (T,) + (L,) * (D - 1)
+        self.shape = (t_n,) + (s_n,) * (D - 1)
+        self.defect = Defect(D, t_n, s_n, dsize, time_slice=t - t_lo, space_slice=s - s_lo)
+        coords = [(t_lo + torch.arange(t_n)) % T] + [(s_lo + torch.arange(s_n)) % L] * (D - 1)
+        sites = torch.zeros(self.shape, dtype=torch.long)
+        for axis, c in enumerate(coords):
+            view = [1] * D
+            view[axis] = -1
+            sites = sites * self.lattice_shape[axis] + c.view(view)
+        self.sites = sites.flatten().to(device)
+        self.volume = int(self.sites.numel())
+        self.lattice_volume = int(np.prod(self.lattice_shape))
+
+    @property
+    def covers_lattice(self):
+        return self.volume == self.lattice_volume
+
+    def describe(self):
+        return f"{'x'.join(str(n) for n in self.shape)}  protocol_box_sites={self.volume}/{self.lattice_volume}"
+
+    def _sites_on(self, device):
+        if self.sites.device != device:
+            self.sites = self.sites.to(device)
+        return self.sites
+
+    def cut(self, field, lattice_dim=2):
+        """The box of `field`, whose D lattice directions start at dimension lattice_dim (2 for
+        configurations and masks, 3 for the random numbers of HBOR)."""
+        last = lattice_dim + self.D - 1
+        box = field.flatten(lattice_dim, last).index_select(lattice_dim, self._sites_on(field.device))
+        return box.unflatten(lattice_dim, self.shape)
+
+    def paste(self, field, box, lattice_dim=2):
+        """A copy of `field` with its box replaced by `box`."""
+        last = lattice_dim + self.D - 1
+        out = field.flatten(lattice_dim, last).index_copy(
+            lattice_dim, self._sites_on(field.device), box.flatten(lattice_dim, last).to(dtype=field.dtype)
+        )
+        return out.unflatten(lattice_dim, tuple(field.shape[lattice_dim:last + 1]))
+
 
 def create_around_defect_mask(D, dsize, buffer=2):
 

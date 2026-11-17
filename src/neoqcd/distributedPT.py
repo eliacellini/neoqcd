@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Any
 from contextlib import nullcontext
 
+# Labels of the parts of a swap in the step profile of main_pt_obc.py (--profile-steps); a few
+# microseconds per call when no profiler runs.
+_region = torch.profiler.record_function
+
 from neoqcd.ladder import is_uniform, validate_ladder
  
 
@@ -450,6 +454,17 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         super().__init__(config, rank, world_size, device)
         self.config: OREXPTConfig = config
         self._pending_pairs = []
+        # utils.ProtocolBox or None: with a box the protocol of each swap runs on the configurations
+        # cut by the box, with the protocol updates, action and flow set up on the box by the caller
+        # (DefectMCMCAdapter.on_box, DefectSNFProtocolLayer.set_frame), and the box of the accepted
+        # chains is written back into the whole lattice.
+        self.protocol_box = None
+
+    def _cut_protocol_box(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.protocol_box is None else self.protocol_box.cut(x)
+
+    def _paste_protocol_box(self, x_full: torch.Tensor, x_box: torch.Tensor) -> torch.Tensor:
+        return x_box if self.protocol_box is None else self.protocol_box.paste(x_full, x_box)
 
     def set_parameter(self, mcmc, parameter: torch.Tensor):
         """
@@ -566,9 +581,12 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         return x_out, self._finalize_stats(stats)
 
     def _step_parity(self, x: torch.Tensor, mcmc, parity: str) -> tuple[torch.Tensor, dict]:
+        x_full = x
+        x = self._cut_protocol_box(x_full)
         x_old = x.clone()
         start_parameters = self.local_parameters.clone()
-        target_parameters, active = self._prepare_orex_targets(parity)
+        with _region("swap/targets"):
+            target_parameters, active = self._prepare_orex_targets(parity)
 
         x_proposed, local_work = self._run_orex_protocol(
             x=x,
@@ -577,12 +595,14 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             target_parameters=target_parameters,
             active=active,
         )
-        accept, stats = self._accept_orex_work(local_work)
+        with _region("swap/accept"):
+            accept, stats = self._accept_orex_work(local_work)
 
         accept_view = self._sample_mask_view(accept, x)
-        x_out = torch.where(accept_view, x_proposed, x_old)
+        x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
-        self._scatter_parameters()
+        with _region("swap/scatter"):
+            self._scatter_parameters()
         self.set_parameter(mcmc, self.local_parameters)
         return x_out, stats
 
@@ -804,18 +824,20 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             parameter_0 = start_parameters + lambda_0 * parameter_delta
             parameter_1 = start_parameters + lambda_1 * parameter_delta
 
-            dwork = self.action_difference(mcmc, x_curr, parameter_0, parameter_1)
-            work = work + torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
+            with _region("swap/action_change"):
+                dwork = self.action_difference(mcmc, x_curr, parameter_0, parameter_1)
+                work = work + torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
 
             if n_mcmc > 0:
-                self.set_parameter(mcmc, parameter_1)
-                x_updated = mcmc(
-                    x_curr,
-                    nsteps=n_mcmc,
-                    ensembles=False,
-                    use_tqdm=False,
-                )
-                x_curr = torch.where(active_view, x_updated, x_curr)
+                with _region("swap/mcmc"):
+                    self.set_parameter(mcmc, parameter_1)
+                    x_updated = mcmc(
+                        x_curr,
+                        nsteps=n_mcmc,
+                        ensembles=False,
+                        use_tqdm=False,
+                    )
+                    x_curr = torch.where(active_view, x_updated, x_curr)
 
         return x_curr, work
 
@@ -1061,33 +1083,40 @@ class NEOREXProtocolWrapper(nn.Module):
         x: torch.Tensor,
         parameter_0: torch.Tensor,
         parameter_1: torch.Tensor,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # any_down: whether some chain moves down, if the caller knows it (fixed along a swap);
+        # otherwise read from the parameters, a host sync
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         down = torch.as_tensor(parameter_1 < parameter_0, device=x.device)
-        if not bool(down.any()):
-            x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
-        else:
-            if self.work_mode == "work":
-                raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
-            # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1. The
-            # map and its inverse run on the whole batch and each chain keeps its own: the shapes
-            # stay static for CUDA graphs, and the layers are launch-bound, so the doubled GPU work
-            # costs no wall-clock time.
-            down = down.expand(x.shape[0])
-            parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
-            parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
-            low = torch.minimum(parameter_0, parameter_1)
-            step = (parameter_1 - parameter_0).abs()
-            x_up, aux_up = self._call_nf(x, low, step)
-            x_down, aux_down = self._call_nf_inverse(x, low, step)
-            down_view = down.view((x.shape[0],) + (1,) * (x.dim() - 1))
-            x_next = torch.where(down_view, x_down, x_up)
-            aux = torch.where(down, aux_down.to(device=x.device, dtype=work_dtype), aux_up.to(device=x.device, dtype=work_dtype))
-        aux = aux.to(device=x.device, dtype=work_dtype)
+        if any_down is None:
+            any_down = bool(down.any())
+        with _region("swap/flow_maps"):
+            if not any_down:
+                x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
+            else:
+                if self.work_mode == "work":
+                    raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
+                # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1. The
+                # map and its inverse run on the whole batch and each chain keeps its own: the shapes
+                # stay static for CUDA graphs, and the layers are launch-bound, so the doubled GPU work
+                # costs no wall-clock time.
+                down = down.expand(x.shape[0])
+                parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
+                parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
+                low = torch.minimum(parameter_0, parameter_1)
+                step = (parameter_1 - parameter_0).abs()
+                x_up, aux_up = self._call_nf(x, low, step)
+                x_down, aux_down = self._call_nf_inverse(x, low, step)
+                down_view = down.view((x.shape[0],) + (1,) * (x.dim() - 1))
+                x_next = torch.where(down_view, x_down, x_up)
+                aux = torch.where(down, aux_down.to(device=x.device, dtype=work_dtype), aux_up.to(device=x.device, dtype=work_dtype))
+            aux = aux.to(device=x.device, dtype=work_dtype)
         if self.work_mode == "work":
             dwork = aux
         else:
-            dwork = self.action_change(x, x_next, parameter_0, parameter_1) - aux
+            with _region("swap/action_change"):
+                dwork = self.action_change(x, x_next, parameter_0, parameter_1) - aux
         return x_next, dwork
 
     def forward(
@@ -1096,10 +1125,11 @@ class NEOREXProtocolWrapper(nn.Module):
         beta_start: torch.Tensor,
         beta_target: torch.Tensor,
         nf_only: bool = False,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         if nf_only:
-            return self._run_nf_block(x, beta_start, beta_target)
+            return self._run_nf_block(x, beta_start, beta_target, any_down=any_down)
 
         x_curr = self._run_stochastic_blocks(x, beta_start)
         work = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
@@ -1248,9 +1278,12 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parity: str,
         train_flow: bool,
     ) -> tuple[torch.Tensor, dict]:
+        x_full = x
+        x = self._cut_protocol_box(x_full)
         x_old = x.detach().clone()
         start_betas = self.local_parameters.clone()
-        target_betas, active = self._prepare_orex_targets(parity)
+        with _region("swap/targets"):
+            target_betas, active = self._prepare_orex_targets(parity)
 
         if bool(train_flow):
             x_proposed, local_work, train_stats = self._train_flow_local_protocol(
@@ -1284,13 +1317,15 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             local_work.detach().to(dtype=self.param_dtype),
             torch.zeros_like(local_work.detach(), dtype=self.param_dtype),
         )
-        accept, stats = self._accept_orex_work(local_work)
+        with _region("swap/accept"):
+            accept, stats = self._accept_orex_work(local_work)
         stats.update(train_stats)
 
         accept_view = self._sample_mask_view(accept, x)
-        x_out = torch.where(accept_view, x_proposed, x_old)
+        x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
-        self._scatter_parameters()
+        with _region("swap/scatter"):
+            self._scatter_parameters()
         return x_out, stats
 
     def _run_stochastic_blocks_active(
@@ -1303,10 +1338,11 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         # The whole batch is swept (static shapes for CUDA graphs); inactive chains keep x.
         if active_idx.numel() == 0:
             return x.detach()
-        active = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
-        active[active_idx] = True
-        x_updated = module._run_stochastic_blocks(x, parameter)
-        return torch.where(self._sample_mask_view(active, x), x_updated.detach(), x.detach())
+        with _region("swap/mcmc"):
+            active = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+            active[active_idx] = True
+            x_updated = module._run_stochastic_blocks(x, parameter)
+            return torch.where(self._sample_mask_view(active, x), x_updated.detach(), x.detach())
 
     def _run_nf_block_active(
         self,
@@ -1314,11 +1350,16 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parameter_0: torch.Tensor,
         parameter_1: torch.Tensor,
         active: torch.Tensor,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The flow runs on the whole batch (static shapes for CUDA graphs): inactive chains have
         # parameter_1 == parameter_0 and their outputs are discarded.
         active = active.to(device=x.device, dtype=torch.bool)
-        x_next_all, dwork_all = self.ddp_flow(x, parameter_0, parameter_1, nf_only=True)
+        # Without gradients (evaluation) the module is called directly: DDP's forward would only
+        # broadcast the module buffers again, at every call (16 calls per swap at K = 8), and
+        # they are equal on every rank (DDP's construction and load_flow broadcast them).
+        flow = self.ddp_flow if torch.is_grad_enabled() else getattr(self.ddp_flow, "module", self.ddp_flow)
+        x_next_all, dwork_all = flow(x, parameter_0, parameter_1, nf_only=True, any_down=any_down)
         zero_anchor = dwork_all.sum() * 0.0
         dwork = torch.where(active, dwork_all.to(dtype=self.param_dtype),
                             torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)) + zero_anchor
@@ -1336,12 +1377,14 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        # A chain moves in one direction along the whole swap: one read for all the protocol steps
+        any_down = bool((target_betas < start_betas).any())
         x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
 
         for n in range(int(module.n_protocol_steps)):
             beta_0, beta_1 = points[n], points[n + 1]
 
-            x_next, dwork = self._run_nf_block_active(x_curr, beta_0, beta_1, active)
+            x_next, dwork = self._run_nf_block_active(x_curr, beta_0, beta_1, active, any_down)
             total_work = total_work + dwork.detach().to(dtype=self.param_dtype)
             x_curr = self._run_stochastic_blocks_active(module, x_next.detach(), beta_1, active_idx)
 
@@ -1358,6 +1401,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        any_down = bool((target_betas < start_betas).any())
         x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
         total_stats = {
             "_flow_loss_sum": 0.0,
@@ -1372,7 +1416,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             beta_0, beta_1 = points[n], points[n + 1]
 
             x_in = x_curr.detach()
-            x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active)
+            x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active, any_down)
             step_stats = self._train_flow_from_work(dwork, active)
             total_stats["applied_updates"] += int(step_stats.get("applied_updates", 0))
             total_stats["skipped_nan_grad_updates"] += int(
@@ -1650,6 +1694,10 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             raise RuntimeError(f"failed to load NEO-REX flow checkpoint: {error[0]}")
         for p in self.ddp_flow.parameters():
             dist.broadcast(p.data, src=0)
+        # The buffers too (rho tables, class masks, ...): only rank 0 loaded the state, and
+        # _run_nf_block_active calls the module without DDP, whose forward would broadcast them
+        for b in self.ddp_flow.module.buffers():
+            dist.broadcast(b.data, src=0)
 
 
  ####################################################################
