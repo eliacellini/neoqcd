@@ -88,6 +88,39 @@ class HaloPlaquetteMasks(dict):
     def __init__(self, masks):
         super().__init__(masks)
         self.bboxes = {key: _bbox_slices(mask.to(dtype=torch.bool)) for key, mask in masks.items()}
+        self._tables = {}
+
+    def tables(self, defect_mask: torch.Tensor, D: int, device, dtype):
+        """The halo plaquettes of every orientation as gather tables, built once per device:
+
+        - index (4, P): flat link indices (mu * V + x) of U_mu(x), U_nu(x - mu), U_mu(x - nu), U_nu(x)
+          of each anchor x of the masks, x - e = roll(+1) as in sun.pstaple;
+        - a, b (4, P): the link factors kappa = a + b * bc of those links (defect_mask[0], [1]).
+
+        S_halo then evaluates all of them with a few batched operations instead of about 25 small
+        ones per orientation."""
+        key = (str(device), dtype, id(defect_mask), defect_mask.data_ptr(), defect_mask._version)
+        entry = self._tables.get(key)
+        if entry is None:
+            first = next(iter(self.values()))
+            lattice = tuple(int(v) for v in first.shape)
+            volume = int(torch.Size(lattice).numel())
+            ids = torch.arange(volume, device=device).reshape(lattice)
+            rows = []
+            for nu in range(1, int(D)):
+                for mu in range(0, nu):
+                    mask = self[(mu, nu)].to(device=device, dtype=torch.bool)
+                    x = ids[mask]
+                    x_mmu = torch.roll(ids, 1, dims=mu)[mask]
+                    x_mnu = torch.roll(ids, 1, dims=nu)[mask]
+                    rows.append(torch.stack((mu * volume + x, nu * volume + x_mmu, mu * volume + x_mnu, nu * volume + x)))
+            index = torch.cat(rows, dim=1).contiguous()
+            factors = defect_mask.to(device=device, dtype=dtype).reshape(2, -1)
+            a = factors[0].index_select(0, index.flatten()).view(index.shape)
+            b = factors[1].index_select(0, index.flatten()).view(index.shape)
+            entry = (index, a, b)
+            self._tables[key] = entry
+        return entry
 
 
 def _bbox_slices(mask: torch.Tensor):
@@ -135,6 +168,17 @@ def S_halo(
     work_dtype = cfgs.real.dtype if torch.is_complex(cfgs) else cfgs.dtype
     batch_size = int(cfgs.shape[0])
     parameter = _as_parameter_vector(defect_par, batch_size, cfgs.device, work_dtype)
+    if isinstance(plaquette_masks, HaloPlaquetteMasks):
+        # All halo plaquettes at once from the gather tables; per plaquette the same products and
+        # link factors as the loop below (the sum over plaquettes runs in another order)
+        index, a, b = plaquette_masks.tables(defect_mask, int(D), cfgs.device, work_dtype)
+        U = sun.flat_links(cfgs, int(D)).index_select(1, index.flatten()).unflatten(1, tuple(index.shape))
+        U_mu, U_nu_rm, U_mu_rn, U_nu = U.unbind(1)
+        plaq = sun.SUN_mul(sun.SUN_mul(sun.SUN_mul(U_nu_rm, sun.SUN_dagger(U_mu_rn)), sun.SUN_dagger(U_nu)), U_mu)
+        retr = sun.SUN_trace(plaq).real
+        k = a.unsqueeze(0) + b.unsqueeze(0) * parameter.view(-1, 1, 1)
+        weight = k[:, 0] * k[:, 1] * k[:, 2] * k[:, 3]
+        return float(beta) * (1.0 - weight * retr / float(N)).sum(dim=1)
     defect = defect_mask.to(device=cfgs.device, dtype=work_dtype)
     p_view = parameter.view((batch_size,) + (1,) * int(D))
     kappa = None  # the link factors of the whole lattice, only for a halo that wraps around it

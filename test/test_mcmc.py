@@ -102,10 +102,12 @@ class LocalActionChangeTest(unittest.TestCase):
                     got = adapter.local_nf_action_change(x_old, x_new, p_old, p_new)
                 self.assertGreater(expected.abs().min().item(), 1.0)
                 self.assertLess((got - expected).abs().max().item(), 1e-9)
-                plain = dict(adapter._nf_halo_plaquette_masks)  # bounding boxes found at the call
+                # the loop over orientations with the bounding boxes (a plain dict): the same plaquette
+                # terms, summed in another order
+                plain = dict(adapter._nf_halo_plaquette_masks)
                 ref = theory.local_nf_action_change(x_old, x_new, adapter.defect_mask, 6.0, p_old, p_new,
                                                     plain, 4, 3)
-                self.assertTrue(torch.equal(got, ref))
+                self.assertLess((got - ref).abs().max().item(), 1e-11)
 
 
 class PlaquetteTest(unittest.TestCase):
