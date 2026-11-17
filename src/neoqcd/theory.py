@@ -77,7 +77,17 @@ def build_nf_halo_plaquette_masks(flow_pars, defect_mask: torch.Tensor, device=N
                 _plaquette_support_from_links(changed_links, mu, nu)
                 | _plaquette_support_from_links(defect_links, mu, nu)
             )
-    return masks
+    return HaloPlaquetteMasks(masks)
+
+
+class HaloPlaquetteMasks(dict):
+    """The plaquette masks of build_nf_halo_plaquette_masks, keyed by (mu, nu), with their bounding
+    boxes found once here: S_halo would otherwise read them back from the device at every call (two
+    host syncs per dimension and orientation, ~1500 per NEO-REX step at K = 8)."""
+
+    def __init__(self, masks):
+        super().__init__(masks)
+        self.bboxes = {key: _bbox_slices(mask.to(dtype=torch.bool)) for key, mask in masks.items()}
 
 
 def _bbox_slices(mask: torch.Tensor):
@@ -126,20 +136,29 @@ def S_halo(
     batch_size = int(cfgs.shape[0])
     parameter = _as_parameter_vector(defect_par, batch_size, cfgs.device, work_dtype)
     defect = defect_mask.to(device=cfgs.device, dtype=work_dtype)
-    kappa = _kappa_for_parameter(defect, parameter)
+    p_view = parameter.view((batch_size,) + (1,) * int(D))
+    kappa = None  # the link factors of the whole lattice, only for a halo that wraps around it
+    bboxes = getattr(plaquette_masks, "bboxes", None)  # HaloPlaquetteMasks: no host sync
     out = torch.zeros(batch_size, dtype=work_dtype, device=cfgs.device)
     lattice_shape = tuple(int(v) for v in cfgs.shape[2:-2])
+
+    def kappa_on(direction, slices):
+        # kappa[(slice(None), direction) + slices] without the link factors of the whole lattice
+        local = defect[(slice(None), direction) + slices]
+        return local[0].unsqueeze(0) + local[1].unsqueeze(0) * p_view
 
     for nu in range(1, int(D)):
         for mu in range(0, nu):
             mask = plaquette_masks[(mu, nu)].to(device=cfgs.device, dtype=torch.bool)
-            bbox = _bbox_slices(mask)
+            bbox = bboxes[(mu, nu)] if bboxes is not None else _bbox_slices(mask)
             if bbox is None:
                 continue
 
             mu_shift = _shift_slices(bbox, mu, -1)
             nu_shift = _shift_slices(bbox, nu, -1)
             if not (_slices_inside(mu_shift, lattice_shape) and _slices_inside(nu_shift, lattice_shape)):
+                if kappa is None:
+                    kappa = _kappa_for_parameter(defect, parameter)
                 plaq = sun.SUN_mul(sun.pstaple(cfgs, mu, nu, int(D)), cfgs[:, mu])
                 retr = sun.SUN_trace(plaq).real
                 weight = (
@@ -165,10 +184,10 @@ def S_halo(
             )
             retr = sun.SUN_trace(plaq).real
             weight = (
-                kappa[(slice(None), mu) + bbox]
-                * kappa[(slice(None), nu) + mu_shift]
-                * kappa[(slice(None), mu) + nu_shift]
-                * kappa[(slice(None), nu) + bbox]
+                kappa_on(mu, bbox)
+                * kappa_on(nu, mu_shift)
+                * kappa_on(mu, nu_shift)
+                * kappa_on(nu, bbox)
             )
             local_mask = mask[bbox].to(dtype=work_dtype)
             term = (1.0 - weight * retr / float(N)) * local_mask

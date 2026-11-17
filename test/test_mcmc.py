@@ -75,6 +75,39 @@ class HierarchicalDefectTest(unittest.TestCase):
         self.assertLess((sun.SUN_mul(sun.SUN_dagger(full), full) - identity).abs().max().item(), 1e-12)
 
 
+class LocalActionChangeTest(unittest.TestCase):
+    def test_halo_action_change_equals_the_whole_lattice_difference_without_host_reads(self):
+        # S_halo with the bounding boxes of HaloPlaquetteMasks (no host sync) against the Wilson
+        # action of the whole lattice, for a halo inside the lattice and one that wraps around it
+        from unittest import mock
+        import neoqcd.theory as theory
+        from neoqcd.mcmc import DefectMCMCAdapter
+        from neoqcd.utils import Defect
+        T, L = 6, 8
+        for space_slice in (3, 1):
+            with self.subTest(space_slice=space_slice):
+                torch.manual_seed(space_slice)
+                defect = Defect(4, T, L, dsize=2, time_slice=3, space_slice=space_slice)
+                pars = SimpleNamespace(N=3, D=4, T=T, L=L, orsteps=1, device=torch.device("cpu"),
+                                       mask=create_mask(4, T, L), defect=defect)
+                adapter = DefectMCMCAdapter(pars, 6.0, defect.create_defect_mask(), batch_size=3)
+                self.assertIsInstance(adapter._nf_halo_plaquette_masks, theory.HaloPlaquetteMasks)
+                x_old = sun.SUN_haar((3, 4, T, L, L, L, 3), dtype=torch.cdouble)
+                changed = theory.build_nf_changed_link_mask(pars).reshape(1, 4, T, L, L, L, 1, 1)
+                x_new = torch.where(changed, sun.SUN_haar(x_old.shape[:-1], dtype=torch.cdouble), x_old)
+                p_old = torch.tensor([0.0, 0.3, 0.9], dtype=torch.float64)
+                p_new = torch.tensor([0.2, 0.5, 1.0], dtype=torch.float64)
+                expected = adapter.action(x_new, p_new) - adapter.action(x_old, p_old)
+                with mock.patch.object(theory, "_bbox_slices", side_effect=AssertionError("bounding box read")):
+                    got = adapter.local_nf_action_change(x_old, x_new, p_old, p_new)
+                self.assertGreater(expected.abs().min().item(), 1.0)
+                self.assertLess((got - expected).abs().max().item(), 1e-9)
+                plain = dict(adapter._nf_halo_plaquette_masks)  # bounding boxes found at the call
+                ref = theory.local_nf_action_change(x_old, x_new, adapter.defect_mask, 6.0, p_old, p_new,
+                                                    plain, 4, 3)
+                self.assertTrue(torch.equal(got, ref))
+
+
 class WilsonActionPrecisionTest(unittest.TestCase):
     def test_link_factors_of_an_integer_defect_mask_are_double(self):
         # Defect.create_defect_mask is an int64 tensor: int64 * Python float would give float32 link
