@@ -1,4 +1,5 @@
 import argparse
+import copy
 import contextlib
 import csv
 import hashlib
@@ -34,7 +35,14 @@ from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows, Smear
 from neoqcd.smearing_jacobian import LOGDET_VERSION
 from neoqcd.sun_utils import plaquette_SUN
 from neoqcd.theory import Wilson_action
-from neoqcd.utils import Defect, create_mask, defect_patch, residual_patch_buffer, translate_periodic_replica
+from neoqcd.utils import (
+    Defect,
+    ProtocolBox,
+    create_mask,
+    defect_patch,
+    residual_patch_buffer,
+    translate_periodic_replica,
+)
 
 
 @dataclass
@@ -340,6 +348,22 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         self.layer = DefectCouplingLayer(flow_pars, rho0, time=1.0)
         self._graphs = {}
 
+    def set_frame(self, defect=None):
+        """Where the defect sits in the configurations the layer receives: in the whole lattice
+        (None, flow_pars.defect) or in a protocol box (utils.ProtocolBox.defect, --protocol-box). The
+        map is the same; only the cut of the defect patch and its embedding move."""
+        if defect is None:
+            self.frame_pars = self.flow_pars
+        else:
+            self.frame_pars = copy.copy(self.flow_pars)
+            self.frame_pars.defect = defect
+        self._graphs = {}
+
+    def _frame(self):
+        # flow_pars with the defect coordinates of the input; subclasses without set_frame use flow_pars
+        frame = self.__dict__.get("frame_pars")
+        return self.flow_pars if frame is None else frame
+
     @property
     def checkpoint_semantics(self):
         smearing = self.layer.smearing
@@ -385,7 +409,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         Gradient-safe embedding of the defect patch into a full lattice tensor.
         Avoids mutating tensors that are part of checkpointed autograd paths.
         """
-        defect = self.flow_pars.defect
+        defect = self._frame().defect
         t = int(defect.time_slice)
         s = int(defect.space_slice)
         dsize = int(defect.dsize)
@@ -442,7 +466,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         buffer = self.flow_pars.patch_buffer
         if entry is None:
             try:
-                static_small = self.flow_pars.defect.cut_defect(x, buffer=buffer).clone()
+                static_small = self._frame().defect.cut_defect(x, buffer=buffer).clone()
                 static_bc, static_delta = bc.clone(), delta_bc.clone()
                 old_jac_shape = self._set_local_jac_shape(bs)
                 try:
@@ -473,7 +497,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
             entry = (graph, static_small, static_bc, static_delta, static_out, static_logdet, checks)
             self._graphs[key] = entry
         graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = entry
-        static_small.copy_(self.flow_pars.defect.cut_defect(x, buffer=buffer))
+        static_small.copy_(self._frame().defect.cut_defect(x, buffer=buffer))
         static_bc.copy_(bc)
         static_delta.copy_(delta_bc)
         graph.replay()
@@ -495,7 +519,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         try:
             x_small, _, dlogj = self.layer(
                 x,
-                self.flow_pars,
+                self._frame(),
                 rho_layer=None,
                 is_training=True,
                 beta=bc,
@@ -529,7 +553,7 @@ class DefectSNFProtocolLayer(torch.nn.Module):
             graphed = self._graphed("inverse", x, bc, delta_bc)
             if graphed is not None:
                 return graphed[0], graphed[1].to(dtype=work_dtype)
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
+        small_cfgs = self._frame().defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self._inverse_small(small_cfgs, bc, delta_bc, **kwargs)
         return self._embed_small_cfgs(small_cfgs, x, buffer=self.flow_pars.patch_buffer), logdet.to(dtype=work_dtype)
 
@@ -582,7 +606,7 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
         delta_bc = self._normalize_parameter(delta_bc, bs, x.device)
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
 
-        small_cfgs = self.flow_pars.defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
+        small_cfgs = self._frame().defect.cut_defect(x, buffer=self.flow_pars.patch_buffer)
         small_cfgs, _, logdet = self.layer(
             small_cfgs,
             self.flow_pars.small_mask[-1],
@@ -603,6 +627,19 @@ class ResidualDefectSNFProtocolLayer(DefectSNFProtocolLayer):
             delta_beta=delta_bc,
             **kwargs,
         )
+
+
+def _protocol_box(args, defect, protocol_patch, flow_buffer, device, rank):
+    """The utils.ProtocolBox of --protocol-box, or None (flag off, or a box as large as the lattice)."""
+    if not bool(args.protocol_box):
+        return None
+    if protocol_patch is None:
+        raise ValueError("--protocol-box needs --protocol-patch-halfsize")
+    box = ProtocolBox(defect, args.protocol_patch_halfsize, flow_buffer=flow_buffer, device=device)
+    if rank == 0:
+        state = "off (the box covers the lattice)" if box.covers_lattice else "on"
+        print(f"protocol_box={state}  protocol_box_shape={box.describe()}", flush=True)
+    return None if box.covers_lattice else box
 
 
 def _build_neorex_flow_pars(
@@ -719,6 +756,15 @@ def parse_args() -> argparse.Namespace:
         "time-slice..time-slice+1, spatial range space-slice-1..space-slice+defect-size), each unit extends "
         "it by one site in every direction. Default: the whole lattice. The equilibrium sweeps between "
         "swaps always cover the whole lattice.",
+    )
+    parser.add_argument(
+        "--protocol-box",
+        action="store_true",
+        help="Run the protocol of each O-REX/NEO-REX swap on a box around the defect (utils.ProtocolBox): "
+        "the protocol patch with a one-site frame, the cut of the defect flow layer and the plaquettes of "
+        "the action change, cut once per swap and written back into the accepted chains. The links outside "
+        "the patch never change along a protocol, so this is the protocol of the whole lattice, apart from "
+        "the random numbers. Needs --protocol-patch-halfsize; NEO-REX with a smearing or residual layer.",
     )
     parser.add_argument(
         "--cuda-graphs",
@@ -1233,6 +1279,9 @@ def main(args: argparse.Namespace) -> None:
             parameter_name="bc",
             **protocol_updates,
         )
+        protocol_box = _protocol_box(args, defect, protocol_patch, None, device, rank)
+        protocol_mcmc = orex_mcmc if protocol_box is None else orex_mcmc.on_box(protocol_box)
+        pt.protocol_box = protocol_box
     elif args.algorithm == "neorex":
         if int(args.neorex_protocol_steps) <= 0:
             raise ValueError("For --algorithm neorex set --neorex-protocol-steps >= 1")
@@ -1267,12 +1316,22 @@ def main(args: argparse.Namespace) -> None:
             default_parameter=parameter_min,
             **protocol_updates,
         )
+        if bool(args.protocol_box) and nf_layer_kind == "cnf":
+            raise ValueError("--protocol-box: the CNF layer acts on the whole lattice")
+        protocol_box = _protocol_box(
+            args, defect, protocol_patch, None if neorex_flow_pars is None else neorex_flow_pars.patch_buffer,
+            device, rank,
+        )
+        protocol_mcmc = neorex_mcmc
+        if protocol_box is not None:
+            protocol_mcmc = neorex_mcmc.on_box(protocol_box)
+            nf_layer.set_frame(protocol_box.defect)
         neorex_flow = NEOREXProtocolWrapper(
             nf_layer=nf_layer,
-            theory=neorex_mcmc,
+            theory=protocol_mcmc,
             n_protocol_steps=args.neorex_protocol_steps,
             work_mode=args.neorex_work_mode,
-            stochastic_update=neorex_mcmc if args.neorex_heatbath_steps_per_step > 0 else None,
+            stochastic_update=protocol_mcmc if args.neorex_heatbath_steps_per_step > 0 else None,
             stochastic_steps_per_step=args.neorex_heatbath_steps_per_step,
             parameter_name="bc",
         )
@@ -1323,7 +1382,8 @@ def main(args: argparse.Namespace) -> None:
                     print(f"neorex_flow_checkpoint=auto_missing  path={load_path}", flush=True)
             else:
                 raise FileNotFoundError(f"NEO-REX flow checkpoint not found: {load_path}")
-        orex_mcmc = neorex_mcmc
+        pt.protocol_box = protocol_box
+        orex_mcmc = neorex_mcmc  # whole lattice: the dS/dc probe of the replica history
     else:
         pt_cfg = PTConfig(
             batch_size=args.batch_size,
@@ -1337,6 +1397,7 @@ def main(args: argparse.Namespace) -> None:
         )
         pt = ParallelTempering(pt_cfg, rank, world_size, device)
         orex_mcmc = None
+        protocol_mcmc = None
 
     if explicit_ladder is not None:
         parameter_ladder = torch.tensor(explicit_ladder, device=device, dtype=pt_cfg.parameter_dtype)
@@ -1379,8 +1440,9 @@ def main(args: argparse.Namespace) -> None:
     # The equilibrium sweep runs on the whole local batch at once, with the bc of each chain.
     hbor_batched = HBOR(flow_pars, beta=args.beta, defect_par=float(parameter_min))
     hbor_batched.use_cuda_graphs = bool(args.cuda_graphs)
-    if orex_mcmc is not None:
-        orex_mcmc._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
+    for adapter in (orex_mcmc, protocol_mcmc):
+        if adapter is not None:
+            adapter._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
     if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
         nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
         nf_layer.graph_logdet = str(args.graph_logdet)
@@ -1587,8 +1649,8 @@ def main(args: argparse.Namespace) -> None:
         train_flow = False
         if (step + 1) % args.swap_every == 0:
             if args.algorithm == "orex":
-                orex_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
-                cfgs, stats = pt.step(cfgs, orex_mcmc)
+                protocol_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
+                cfgs, stats = pt.step(cfgs, protocol_mcmc)
             elif args.algorithm == "neorex":
                 train_flow = (
                     (not bool(args.neorex_eval_flow))

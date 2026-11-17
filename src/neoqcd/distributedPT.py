@@ -450,6 +450,17 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         super().__init__(config, rank, world_size, device)
         self.config: OREXPTConfig = config
         self._pending_pairs = []
+        # utils.ProtocolBox or None: with a box the protocol of each swap runs on the configurations
+        # cut by the box, with the protocol updates, action and flow set up on the box by the caller
+        # (DefectMCMCAdapter.on_box, DefectSNFProtocolLayer.set_frame), and the box of the accepted
+        # chains is written back into the whole lattice.
+        self.protocol_box = None
+
+    def _cut_protocol_box(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.protocol_box is None else self.protocol_box.cut(x)
+
+    def _paste_protocol_box(self, x_full: torch.Tensor, x_box: torch.Tensor) -> torch.Tensor:
+        return x_box if self.protocol_box is None else self.protocol_box.paste(x_full, x_box)
 
     def set_parameter(self, mcmc, parameter: torch.Tensor):
         """
@@ -566,6 +577,8 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         return x_out, self._finalize_stats(stats)
 
     def _step_parity(self, x: torch.Tensor, mcmc, parity: str) -> tuple[torch.Tensor, dict]:
+        x_full = x
+        x = self._cut_protocol_box(x_full)
         x_old = x.clone()
         start_parameters = self.local_parameters.clone()
         target_parameters, active = self._prepare_orex_targets(parity)
@@ -580,7 +593,7 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         accept, stats = self._accept_orex_work(local_work)
 
         accept_view = self._sample_mask_view(accept, x)
-        x_out = torch.where(accept_view, x_proposed, x_old)
+        x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
         self._scatter_parameters()
         self.set_parameter(mcmc, self.local_parameters)
@@ -1248,6 +1261,8 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parity: str,
         train_flow: bool,
     ) -> tuple[torch.Tensor, dict]:
+        x_full = x
+        x = self._cut_protocol_box(x_full)
         x_old = x.detach().clone()
         start_betas = self.local_parameters.clone()
         target_betas, active = self._prepare_orex_targets(parity)
@@ -1288,7 +1303,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         stats.update(train_stats)
 
         accept_view = self._sample_mask_view(accept, x)
-        x_out = torch.where(accept_view, x_proposed, x_old)
+        x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
         self._scatter_parameters()
         return x_out, stats

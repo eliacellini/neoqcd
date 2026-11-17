@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 import torch.utils.checkpoint as checkpoint
 import neoqcd.sun_utils as sun
@@ -739,6 +741,7 @@ class DefectMCMCAdapter:
         self.defect_mask = defect_mask
         self.batch_size = int(batch_size)
         self.parameter_name = str(parameter_name)
+        self.default_parameter = float(default_parameter)
         self.symmetric_updates = bool(symmetric_updates)
         self.patch_mask = patch_mask
         # One tensor, kept for the whole run, so the masked-link index cache hits on its identity.
@@ -767,6 +770,37 @@ class DefectMCMCAdapter:
                 device=self.flow_pars.device,
             )
         self._defect_plaquettes = None  # built on first use: see _defect_plaquette_tables
+
+    def on_box(self, box) -> "DefectMCMCAdapter":
+        """The same protocol updates and action change on the configurations cut by `box`
+        (utils.ProtocolBox): every mask cut with the box, the defect at its box coordinates. Needs the
+        protocol patch, whose links the box holds with their staples."""
+        if self.patch_mask is None:
+            raise ValueError("a protocol box needs the protocol patch (patch_mask)")
+        D = int(self.flow_pars.D)
+        # the lattice directions of the masks: (..., D, T, L, ..., 1, 1) and (2, D, T, L, ...)
+        cut_mask = lambda m: box.cut(m, lattice_dim=m.dim() - 2 - D)
+        mask = cut_mask(self.flow_pars.mask)
+        pars = SimpleNamespace(
+            N=self.flow_pars.N, D=self.flow_pars.D, T=box.shape[0], L=box.shape[1],
+            orsteps=self.flow_pars.orsteps, device=self.flow_pars.device, mask=mask, defect=box.defect,
+        )
+        adapter = DefectMCMCAdapter(
+            pars,
+            self.beta,
+            box.cut(self.defect_mask, lattice_dim=self.defect_mask.dim() - D),
+            self.batch_size,
+            parameter_name=self.parameter_name,
+            default_parameter=self.default_parameter,
+            patch_mask=cut_mask(self.patch_mask.to(device=mask.device)),
+            symmetric_updates=self.symmetric_updates,
+        )
+        adapter._current_parameter = self._current_parameter
+        # the switches of this sweep set on the instance (main_pt_obc.py sets the kernel ones on the class)
+        for name in ("use_cuda_graphs", "use_fused_kernels", "fused_emulate", "fused_strict"):
+            if name in vars(self._batch_hbor):
+                setattr(adapter._batch_hbor, name, getattr(self._batch_hbor, name))
+        return adapter
 
     def _defect_plaquette_tables(self, device):
         """Flat link indices of the plaquettes whose weight depends on bc: one (4, n) table per
