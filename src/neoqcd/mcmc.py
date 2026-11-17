@@ -1,6 +1,7 @@
 import torch
 import torch.utils.checkpoint as checkpoint
 import neoqcd.sun_utils as sun
+import neoqcd.fused as fused
 from neoqcd.theory import (
     Wilson_action,
     build_nf_halo_plaquette_masks,
@@ -179,6 +180,15 @@ class NEMCMC_update(torch.nn.Module):
 
 
 class HBOR():
+    # Fused CUDA kernel of the sweep (neoqcd.fused): off by default; main_pt_obc.py turns it on for
+    # every HBOR with --fused-kernels (class attribute). fused_emulate runs the CPU emulation of the
+    # kernel on CPU tensors (tests); fused_strict raises instead of falling back to the torch sweep;
+    # fused_used is the path of the last call ('cuda', 'cpu' or 'torch').
+    use_fused_kernels = False
+    fused_emulate = False
+    fused_strict = False
+    fused_used = None
+
     def __init__(self, flow_pars, beta, defect_par=1.0, hierarchical=False):
         self.N = flow_pars.N
         self.D = flow_pars.D
@@ -238,6 +248,11 @@ class HBOR():
         gives a self-adjoint update, as the detailed balance of the O-REX swap requires.
         """
 
+        if self.use_fused_kernels:
+            out = fused.hbor_call(self, cfgs, mask, defect, rand=rand, reverse=reverse)
+            if out is not None:
+                return out
+            self.fused_used = "torch"
         if (self.use_cuda_graphs and cfgs.is_cuda and not torch.is_grad_enabled()
                 and not isinstance(mask, sun.MaskedLinks)):
             return self._graphed_sweep(cfgs, mask, defect, rand, reverse)

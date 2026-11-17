@@ -26,6 +26,7 @@ from neoqcd.distributedPT import (
 )
 from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR, quiesce_for_capture
+import neoqcd.fused as fused
 from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.replica_history import rung_indices, summarize_history
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows
@@ -725,6 +726,13 @@ def parse_args() -> argparse.Namespace:
         "layer, captured on first use; eager execution is the fallback when a capture fails.",
     )
     parser.add_argument(
+        "--fused-kernels",
+        action="store_true",
+        help="Run every HB+OR sweep (equilibrium and protocol) through the fused CUDA kernel of neoqcd.fused "
+        "(built with nvcc at the start of the run, cached in $NEOQCD_KERNEL_CACHE). Statistically, not "
+        "bitwise, equivalent to the torch sweep; the torch sweep runs where the kernel does not apply.",
+    )
+    parser.add_argument(
         "--graph-logdet",
         choices=("slogdet", "lu"),
         default="slogdet",
@@ -1362,6 +1370,21 @@ def main(args: argparse.Namespace) -> None:
     if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
         nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
         nf_layer.graph_logdet = str(args.graph_logdet)
+    if bool(args.fused_kernels):
+        # Every HBOR of the run (class attribute). Rank 0 builds the library first, the others then
+        # load it from the shared cache instead of compiling it concurrently.
+        HBOR.use_fused_kernels = True
+        fused_status = (False, f"device {device.type}")
+        if device.type == "cuda":
+            if rank == 0:
+                fused_status = fused.backend_status("cuda", device)
+            if world_size > 1:
+                dist.barrier()
+            if rank != 0:
+                fused_status = fused.backend_status("cuda", device)
+        if rank == 0:
+            ok, where = fused_status
+            print(f"fused_kernels=on  hbor={'cuda' if ok else 'torch'}  hbor_library={where}", flush=True)
     if rank == 0 and bool(args.cuda_graphs):
         print("cuda_graphs=on", flush=True)
         if world_size > 1 and os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1") != "0":
