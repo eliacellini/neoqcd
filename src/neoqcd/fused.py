@@ -29,7 +29,11 @@ Changes with respect to snf_SUN:
   measure out of the first four random numbers, always accepted (mcmc._su2_haar_from_uniform), with or
   without the defect, as HBOR.heatbath_standard does; snf_SUN applies the acceptance test there;
 - the weights of the lower staples are multiplied in the order of HBOR._gathered_staples;
-- after the kernel the updated links are re-unitarized by torch, as HBOR._sweep does.
+- after the kernel the updated links are re-unitarized by torch, as HBOR._sweep does;
+- snf_init, called by load_backend once per device: initializes the CUDA runtime of the library (nvcc links
+  it statically) and loads the kernels there (cudaFuncGetAttributes), so that nothing is loaded lazily
+  (CUDA_MODULE_LOADING=LAZY) at a later launch, which may be inside a CUDA graph capture of the caller
+  (the smearing kernels of fused_smearing.py, whose library has the same hook, snf_stout_init).
 
 The kernel runs only without gradients, for SU(3) in D = 4, complex128, on CUDA, or on the CPU with
 HBOR.fused_emulate (the host build of the same source: the CPU emulation the tests compare with HBOR
@@ -356,6 +360,29 @@ int snf_is_cuda(void) {
 #endif
 }
 
+// Initializes the CUDA runtime of this library on `device` and loads the kernels there (cudaFuncGetAttributes
+// forces the lazy loading of CUDA_MODULE_LOADING=LAZY): called once per device when the library is loaded
+// (load_backend in fused.py), so that neither happens later inside a CUDA graph capture. Returns 0 on success,
+// a cudaError_t code otherwise; nothing on the host build.
+int snf_init(int device) {
+#ifdef __CUDACC__
+    int previous = -1;
+    int err = (int)cudaGetDevice(&previous);
+    if (err) return err;
+    if (previous != device && (err = (int)cudaSetDevice(device))) return err;
+    cudaFuncAttributes attr;
+    err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 0, false>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 0, true>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, false>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, true>);
+    if (previous != device) cudaSetDevice(previous);
+    return err;
+#else
+    (void)device;
+    return 0;
+#endif
+}
+
 // Returns 0 on success, -1 for an unsupported dtype, a cudaError_t code otherwise.
 int snf_hbor(const SnfArgs* a, void* stream) {
 #ifdef __CUDACC__
@@ -513,9 +540,11 @@ def _build(target, device=None, source=None, name='neoqcd_hbor', rebuild=False):
 
 class _Backend:
     # A loaded kernel library; run(args, stream) raises RuntimeError on a nonzero return code. SOURCE and
-    # NAME: what _build compiles (a subclass with its own source binds its own entry points)
+    # NAME: what _build compiles (a subclass with its own source binds its own entry points); INIT: the entry
+    # point int(int device) that prepare() calls once per CUDA device
     SOURCE = KERNEL_SOURCE
     NAME = 'neoqcd_hbor'
+    INIT = 'snf_init'
 
     def __init__(self, target, path):
         self.target = target
@@ -523,6 +552,8 @@ class _Backend:
         lib = ctypes.CDLL(self.path)
         lib.snf_args_size.restype = ctypes.c_int
         lib.snf_is_cuda.restype = ctypes.c_int
+        lib.snf_init.argtypes = [ctypes.c_int]
+        lib.snf_init.restype = ctypes.c_int
         lib.snf_hbor.argtypes = [ctypes.POINTER(_Args), ctypes.c_void_p]
         lib.snf_hbor.restype = ctypes.c_int
         lib.snf_error_string.argtypes = [ctypes.c_int]
@@ -533,6 +564,7 @@ class _Backend:
         if bool(lib.snf_is_cuda()) != (target == 'cuda'):
             raise BackendUnavailable(f'library {self.path} is not a {target} build')
         self._lib = lib
+        self._prepared = set()
 
     @property
     def log(self):
@@ -540,11 +572,28 @@ class _Backend:
         log = Path(self.path).with_suffix('.log')
         return log.read_text() if log.is_file() else ''
 
+    def error_string(self, code):
+        return self._lib.snf_error_string(code).decode(errors='replace')
+
+    def prepare(self, device):
+        # Initializes the CUDA runtime of the library on `device` and loads its kernels there (INIT), once per
+        # device; nothing for the CPU build. load_backend calls it, so that the first launch of a kernel inside
+        # a CUDA graph capture (the smearing layer with --cuda-graphs) loads nothing lazily.
+        if self.target != 'cuda':
+            return
+        index = device.index if device is not None and device.index is not None else torch.cuda.current_device()
+        if index in self._prepared:
+            return
+        code = getattr(self._lib, self.INIT)(index)
+        if code != 0:
+            raise BackendUnavailable(f'{self.NAME}: the kernels do not load on cuda:{index}: code {code}: '
+                                     f'{self.error_string(code)}')
+        self._prepared.add(index)
+
     def run(self, args, stream):
         code = self._lib.snf_hbor(ctypes.byref(args), stream)
         if code != 0:
-            raise RuntimeError(f'fused HBOR ({self.target}) failed: code {code}: '
-                               f'{self._lib.snf_error_string(code).decode(errors="replace")}')
+            raise RuntimeError(f'fused HBOR ({self.target}) failed: code {code}: {self.error_string(code)}')
 
 
 def _load(backend_class, target, device):
@@ -560,7 +609,8 @@ def _load(backend_class, target, device):
 
 def load_backend(target, device=None, backend_class=_Backend):
     """The kernel library for target 'cuda' or 'cpu' (the emulation), built at first use and cached
-    in the process and on disk; raises BackendUnavailable with the reason."""
+    in the process and on disk, its kernels loaded on `device` (_Backend.prepare); raises
+    BackendUnavailable with the reason."""
     if target == 'cuda':
         if not torch.cuda.is_available():
             raise BackendUnavailable('CUDA is not available to torch')
@@ -583,6 +633,8 @@ def load_backend(target, device=None, backend_class=_Backend):
         _BACKENDS[key] = hit
         if isinstance(hit, Exception):
             raise hit
+    # once per device (a set lookup afterwards): the library may be shared by devices of one capability
+    hit.prepare(device)
     return hit
 
 
