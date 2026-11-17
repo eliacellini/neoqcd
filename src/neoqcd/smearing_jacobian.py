@@ -255,12 +255,15 @@ class DeferredChecks:
 
     def resolve(self):
         """(every c1 was below C1_SERIES, largest inverse residual) with one host-device sync."""
+        noted = [v for v in (self.c1_max, self.residual_max) if v is not None]
+        device = next((v.device for v in noted if v.device.type != "cpu"), torch.device("cpu"))
+        # The missing value as a zero made on the device: a CPU zero copied there would be a
+        # second host sync, since a copy from pageable memory waits for the stream
         values = [
-            torch.zeros(()) if self.c1_max is None else self.c1_max,
-            torch.zeros(()) if self.residual_max is None else self.residual_max,
+            torch.zeros((), device=device, dtype=torch.double) if v is None else v.to(dtype=torch.double)
+            for v in (self.c1_max, self.residual_max)
         ]
-        device = next((v.device for v in values if v.device.type != "cpu"), torch.device("cpu"))
-        c1_max, residual_max = torch.stack([v.to(device=device, dtype=torch.double) for v in values]).tolist()
+        c1_max, residual_max = torch.stack([v.to(device=device) for v in values]).tolist()
         return c1_max < C1_SERIES, residual_max
 
 

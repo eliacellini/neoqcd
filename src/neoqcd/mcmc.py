@@ -224,7 +224,11 @@ class HBOR():
 
     def _compute_uses_defect(self) -> bool:
         if torch.is_tensor(self.defect_par):
-            return bool((self.defect_par < 1.0).any().item())
+            # A tensor of couplings always takes the defect branch: reading it back would cost a
+            # host sync per sweep (one per protocol update in O-REX/NEO-REX), and with every
+            # coupling at 1 the branch multiplies the staples by kappa = 1 exactly and gives the
+            # same links.
+            return True
         return bool(self.defect_par < 1.0)
 
     def set_defect_parameter(self, defect_par):

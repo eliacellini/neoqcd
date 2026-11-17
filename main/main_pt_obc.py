@@ -453,50 +453,62 @@ class DefectSNFProtocolLayer(torch.nn.Module):
         )
         return out, logdet
 
+    def _capture(self, kind, x, bc, delta_bc):
+        """Capture the CUDA graph of the patch map `kind` for inputs shaped like x: the graph and its
+        static tensors, or None when the capture fails (eager from then on)."""
+        from neoqcd.smearing_jacobian import DeferredChecks, lu_logdet
+        buffer = self.flow_pars.patch_buffer
+        try:
+            static_small = self._frame().defect.cut_defect(x, buffer=buffer).clone()
+            static_bc, static_delta = bc.clone(), delta_bc.clone()
+            old_jac_shape = self._set_local_jac_shape(int(x.shape[0]))
+            try:
+                # torch.linalg.slogdet captured fine on Leonardo (torch 2.0, CUDA 12.1); the
+                # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
+                # failed capture leaves the CUDA random generator unusable.
+                with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
+                    quiesce_for_capture(x.device)
+                    stream = torch.cuda.Stream(device=x.device)
+                    stream.wait_stream(torch.cuda.current_stream(device=x.device))
+                    with torch.cuda.stream(stream):
+                        for _ in range(2):
+                            with DeferredChecks():
+                                self._run_blocks(kind, static_small, static_bc, static_delta)
+                    torch.cuda.current_stream(device=x.device).wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        with DeferredChecks() as checks:
+                            static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
+            finally:
+                self.layer.smearing.jac_shape = old_jac_shape
+        except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
+            import warnings
+            warnings.warn(f"CUDA graph capture of the smearing layer {kind} failed, running eagerly: "
+                          f"{type(err).__name__}: {err}")
+            self.use_cuda_graphs = False
+            return None
+        return graph, static_small, static_bc, static_delta, static_out, static_logdet, checks
+
     def _graphed(self, kind, x, bc, delta_bc):
         """Replay the CUDA graph of the patch map, capturing it on first use; the deferred checks
         (c1 of every block, inverse residual) are read once after the replay and a failed check
-        repeats the call eagerly. Returns None when graphs are unavailable."""
-        from neoqcd.smearing_jacobian import DeferredChecks, lu_logdet
-        bs = int(x.shape[0])
-        key = (kind, tuple(x.shape), str(x.dtype))
+        repeats the call eagerly. Returns None when graphs are unavailable.
+
+        The first use captures the map and its inverse together: on a rank whose chains all move up,
+        the inverse is needed only steps later, and its capture (which quiesces the device) would
+        then fall at a random step of the run, inside a profile window for instance."""
         if not hasattr(self, "_graphs"):
             self._graphs = {}
-        entry = self._graphs.get(key)
+        shape = (tuple(x.shape), str(x.dtype))
+        if (kind,) + shape not in self._graphs:
+            for k in (kind, "inverse" if kind == "forward" else "forward"):
+                if (k,) + shape not in self._graphs:
+                    captured = self._capture(k, x, bc, delta_bc)
+                    if captured is None:
+                        return None
+                    self._graphs[(k,) + shape] = captured
+        graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = self._graphs[(kind,) + shape]
         buffer = self.flow_pars.patch_buffer
-        if entry is None:
-            try:
-                static_small = self._frame().defect.cut_defect(x, buffer=buffer).clone()
-                static_bc, static_delta = bc.clone(), delta_bc.clone()
-                old_jac_shape = self._set_local_jac_shape(bs)
-                try:
-                    # torch.linalg.slogdet captured fine on Leonardo (torch 2.0, CUDA 12.1); the
-                    # tensor-only LU is the alternative where cuSOLVER cannot be captured, since a
-                    # failed capture leaves the CUDA random generator unusable.
-                    with (lu_logdet() if self.graph_logdet == "lu" else contextlib.nullcontext()):
-                        quiesce_for_capture(x.device)
-                        stream = torch.cuda.Stream(device=x.device)
-                        stream.wait_stream(torch.cuda.current_stream(device=x.device))
-                        with torch.cuda.stream(stream):
-                            for _ in range(2):
-                                with DeferredChecks():
-                                    self._run_blocks(kind, static_small, static_bc, static_delta)
-                        torch.cuda.current_stream(device=x.device).wait_stream(stream)
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            with DeferredChecks() as checks:
-                                static_out, static_logdet = self._run_blocks(kind, static_small, static_bc, static_delta)
-                finally:
-                    self.layer.smearing.jac_shape = old_jac_shape
-            except Exception as err:  # noqa: BLE001 - any capture failure means eager from now on
-                import warnings
-                warnings.warn(f"CUDA graph capture of the smearing layer {kind} failed, running eagerly: "
-                              f"{type(err).__name__}: {err}")
-                self.use_cuda_graphs = False
-                return None
-            entry = (graph, static_small, static_bc, static_delta, static_out, static_logdet, checks)
-            self._graphs[key] = entry
-        graph, static_small, static_bc, static_delta, static_out, static_logdet, checks = entry
         static_small.copy_(self._frame().defect.cut_defect(x, buffer=buffer))
         static_bc.copy_(bc)
         static_delta.copy_(delta_bc)

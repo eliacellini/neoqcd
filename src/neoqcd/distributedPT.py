@@ -1083,11 +1083,16 @@ class NEOREXProtocolWrapper(nn.Module):
         x: torch.Tensor,
         parameter_0: torch.Tensor,
         parameter_1: torch.Tensor,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # any_down: whether some chain moves down, if the caller knows it (fixed along a swap);
+        # otherwise read from the parameters, a host sync
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         down = torch.as_tensor(parameter_1 < parameter_0, device=x.device)
+        if any_down is None:
+            any_down = bool(down.any())
         with _region("swap/flow_maps"):
-            if not bool(down.any()):
+            if not any_down:
                 x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
             else:
                 if self.work_mode == "work":
@@ -1120,10 +1125,11 @@ class NEOREXProtocolWrapper(nn.Module):
         beta_start: torch.Tensor,
         beta_target: torch.Tensor,
         nf_only: bool = False,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         if nf_only:
-            return self._run_nf_block(x, beta_start, beta_target)
+            return self._run_nf_block(x, beta_start, beta_target, any_down=any_down)
 
         x_curr = self._run_stochastic_blocks(x, beta_start)
         work = torch.zeros(x.shape[0], device=x.device, dtype=work_dtype)
@@ -1344,6 +1350,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         parameter_0: torch.Tensor,
         parameter_1: torch.Tensor,
         active: torch.Tensor,
+        any_down: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The flow runs on the whole batch (static shapes for CUDA graphs): inactive chains have
         # parameter_1 == parameter_0 and their outputs are discarded.
@@ -1352,7 +1359,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         # broadcast the module buffers again, at every call (16 calls per swap at K = 8), and
         # they are equal on every rank (DDP's construction and load_flow broadcast them).
         flow = self.ddp_flow if torch.is_grad_enabled() else getattr(self.ddp_flow, "module", self.ddp_flow)
-        x_next_all, dwork_all = flow(x, parameter_0, parameter_1, nf_only=True)
+        x_next_all, dwork_all = flow(x, parameter_0, parameter_1, nf_only=True, any_down=any_down)
         zero_anchor = dwork_all.sum() * 0.0
         dwork = torch.where(active, dwork_all.to(dtype=self.param_dtype),
                             torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)) + zero_anchor
@@ -1370,12 +1377,14 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        # A chain moves in one direction along the whole swap: one read for all the protocol steps
+        any_down = bool((target_betas < start_betas).any())
         x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
 
         for n in range(int(module.n_protocol_steps)):
             beta_0, beta_1 = points[n], points[n + 1]
 
-            x_next, dwork = self._run_nf_block_active(x_curr, beta_0, beta_1, active)
+            x_next, dwork = self._run_nf_block_active(x_curr, beta_0, beta_1, active, any_down)
             total_work = total_work + dwork.detach().to(dtype=self.param_dtype)
             x_curr = self._run_stochastic_blocks_active(module, x_next.detach(), beta_1, active_idx)
 
@@ -1392,6 +1401,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         points = _protocol_points(start_betas, target_betas, int(module.n_protocol_steps))
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        any_down = bool((target_betas < start_betas).any())
         x_curr = self._run_stochastic_blocks_active(module, x, start_betas, active_idx)
         total_stats = {
             "_flow_loss_sum": 0.0,
@@ -1406,7 +1416,7 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             beta_0, beta_1 = points[n], points[n + 1]
 
             x_in = x_curr.detach()
-            x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active)
+            x_next, dwork = self._run_nf_block_active(x_in, beta_0, beta_1, active, any_down)
             step_stats = self._train_flow_from_work(dwork, active)
             total_stats["applied_updates"] += int(step_stats.get("applied_updates", 0))
             total_stats["skipped_nan_grad_updates"] += int(
