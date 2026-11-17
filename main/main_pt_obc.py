@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -708,6 +709,51 @@ def _build_neorex_flow_pars(
     )
 
 
+# Arguments that a resumed run may change: run length and time limits, checkpoints, logging, profiling and
+# the cache of the thermalization (skipped on resume); every other argument defines the run.
+RESUME_FREE_ARGS = {
+    "steps", "max_run_minutes", "save_resume", "resume_every_minutes", "resume", "log_every", "profile_steps",
+    "profile_python", "log_gpu_memory", "replica_history_save_minutes", "wandb", "wandb_project",
+    "wandb_entity", "wandb_run_name", "thermal_steps", "use_cfg_cache", "cfg_cache_dir", "cfg_cache_tag",
+    "overwrite_cfg_cache", "main_dir", "resume_dir",
+}
+
+
+def _resume_semantics(args: argparse.Namespace, world_size: int) -> dict:
+    values = {key: value for key, value in vars(args).items() if key not in RESUME_FREE_ARGS}
+    values["world_size"] = int(world_size)
+    return json.loads(json.dumps(values, sort_keys=True, default=str))
+
+
+def _resume_root(args: argparse.Namespace, out_dir: Path) -> Path:
+    """Where the resume checkpoints of the run in out_dir go (see --resume-dir)."""
+    if args.resume_dir:
+        return Path(args.resume_dir)
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        path = str(Path(out_dir).resolve())
+        return Path(scratch) / "neoqcd_resume" / f"{Path(out_dir).name}_{hashlib.sha1(path.encode()).hexdigest()[:8]}"
+    return Path(out_dir) / "resume"
+
+
+def _atomic_torch_save(obj, path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _truncate_csv(path: Path, last_step: int) -> None:
+    """Keep the header and the rows of steps <= last_step (rows written after the resume checkpoint go)."""
+    tmp = path.with_name(f".{path.name}.resume.tmp")
+    with open(path, newline="", encoding="utf-8") as source, open(tmp, "w", newline="", encoding="utf-8") as target:
+        reader, writer = csv.reader(source), csv.writer(target)
+        writer.writerow(next(reader))
+        for row in reader:
+            if row and int(row[0]) <= int(last_step):
+                writer.writerow(row)
+    os.replace(tmp, path)
+
+
 def _default_output_dir(main_dir: str, run_name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_run_name = run_name or f"pt_obc_{timestamp}"
@@ -871,6 +917,34 @@ def parse_args() -> argparse.Namespace:
         help="Stop the measurement before the step that would end after this many minutes from the start of "
         "main (projected with 1.5 times the mean step time) and write every output as at the end of a full run; "
         "0 = off. Set it a few minutes below the job time limit.",
+    )
+    parser.add_argument(
+        "--save-resume",
+        action="store_true",
+        help="Write a resume checkpoint (<output-dir>/resume/) when --max-run-minutes stops the run, every "
+        "--resume-every-minutes, and at the end: configurations, PT state, NEO-REX flow and optimizer, random "
+        "generators, totals and histories, so that --resume continues the run exactly.",
+    )
+    parser.add_argument(
+        "--resume-every-minutes",
+        type=float,
+        default=60.0,
+        help="With --save-resume: also write a checkpoint after this many wall-clock minutes since the last "
+        "(0: only at the stop and at the end).",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        type=str,
+        default=None,
+        help="Directory of the resume checkpoints. Default: $SCRATCH/neoqcd_resume/<output-dir name>_<hash of its "
+        "path> when $SCRATCH is set (Leonardo: no backup, files purged after ~40 days, fine between jobs), "
+        "otherwise <output-dir>/resume.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue the run in --output-dir from its last resume checkpoint, to --steps (a larger --steps "
+        "extends a finished run). The arguments that define the run must equal the original ones.",
     )
     parser.add_argument("--sweeps-per-step", type=int, default=1)
     parser.add_argument("--sweep", type=int, default=None, help="Alias of --sweeps-per-step")
@@ -1164,6 +1238,42 @@ def main(args: argparse.Namespace) -> None:
     out_dir = Path(out_dir_box[0])
     csv_path = out_dir / "pt_metrics.csv"
     meta_path = out_dir / "run_meta.json"
+    # --resume: the last complete checkpoint of <output-dir>/resume ({"step", "dir"}); run_state (rank 0) holds
+    # the totals and histories, rank_state (every rank) its configurations, PT state and random generators
+    resume_info, run_state, rank_state = None, None, None
+    # one path for every rank, decided on rank 0
+    resume_root_box = [str(_resume_root(args, out_dir)) if rank == 0 else None]
+    dist.broadcast_object_list(resume_root_box, src=0)
+    resume_root = Path(resume_root_box[0])
+    if rank == 0 and (bool(args.save_resume) or bool(args.resume)):
+        print(f"resume_dir={resume_root}", flush=True)
+    if bool(args.resume):
+        if not args.output_dir:
+            raise ValueError("--resume needs the --output-dir of the run to continue")
+        found = [None]
+        if rank == 0:
+            latest = resume_root / "latest.json"
+            if not latest.is_file():
+                found = [f"no resume checkpoint in {latest.parent} (the run needs --save-resume)"]
+            else:
+                info = json.loads(latest.read_text(encoding="utf-8"))
+                run_state = torch.load(Path(info["dir"]) / "run.pt", map_location="cpu", weights_only=False)
+                expected = _resume_semantics(args, world_size)
+                if run_state["semantics"] != expected:
+                    changed = sorted(k for k in set(expected) | set(run_state["semantics"])
+                                     if expected.get(k) != run_state["semantics"].get(k))
+                    found = [f"the run arguments differ from those of the checkpoint: {changed}"]
+                elif int(info["step"]) > int(args.steps):
+                    found = [f"the checkpoint is at step {info['step']}, beyond --steps {args.steps}"]
+                else:
+                    found = [info]
+        dist.broadcast_object_list(found, src=0)
+        if isinstance(found[0], str):
+            raise ValueError(f"--resume: {found[0]}")
+        resume_info = found[0]
+        rank_state = torch.load(Path(resume_info["dir"]) / f"rank{rank}.pt", map_location="cpu", weights_only=False)
+        if int(rank_state["step"]) != int(resume_info["step"]) or int(rank_state["world_size"]) != world_size:
+            raise ValueError(f"--resume: inconsistent checkpoint file for rank {rank} in {resume_info['dir']}")
     wandb_mod = None
     wandb_run = None
 
@@ -1186,7 +1296,18 @@ def main(args: argparse.Namespace) -> None:
             config=vars(args),
         )
 
-    if rank == 0:
+    if rank == 0 and resume_info is not None:
+        # continue the outputs of the run: rows of steps after the checkpoint (if any) are dropped
+        with open(meta_path, encoding="utf-8") as f:
+            resumed_meta = json.load(f)
+        resumed_meta.setdefault("resumes", []).append(
+            {"from_step": int(resume_info["step"]), "steps": int(args.steps), "started": datetime.now().isoformat()}
+        )
+        resumed_meta["args"] = vars(args)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(resumed_meta, f, indent=2, default=str)
+        _truncate_csv(csv_path, int(resume_info["step"]))
+    elif rank == 0:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -1515,7 +1636,7 @@ def main(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-    cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0
+    cache_enabled = bool(args.use_cfg_cache) and int(args.thermal_steps) > 0 and resume_info is None
     cache_mode = "disabled"
     cache_steps = 0
     cache_dir = None
@@ -1538,7 +1659,11 @@ def main(args: argparse.Namespace) -> None:
         cache_dir = Path(cache_dir_str)
 
     thermalization_t0 = time.time()
-    if cache_enabled and cache_mode == "load":
+    if resume_info is not None:
+        cfgs = rank_state["cfgs"].to(device)
+        thermal_steps_executed = 0
+        cache_mode = "resume"
+    elif cache_enabled and cache_mode == "load":
         cfgs = _load_cached_cfgs(cache_dir, rank, device, args)
         thermal_steps_executed = 0
     else:
@@ -1634,13 +1759,104 @@ def main(args: argparse.Namespace) -> None:
                 "cooling_steps": np.asarray(int(args.cooling_steps))} if history_topology else {}),
         )
 
+    def _resume_totals() -> dict:
+        return {
+            "total_swap_accepted": total_swap_accepted, "total_swap_proposed": total_swap_proposed,
+            "total_swap_attempts": total_swap_attempts, "total_work_sum": total_work_sum,
+            "total_work_sum_sq": total_work_sum_sq, "total_work_count": total_work_count,
+            "total_flow_loss_sum": total_flow_loss_sum, "total_flow_loss_count": total_flow_loss_count,
+            "total_flow_applied_updates": total_flow_applied_updates,
+            "total_flow_skipped_updates": total_flow_skipped_updates,
+            "total_link_accepted": total_link_accepted, "total_link_proposed": total_link_proposed,
+            "total_link_work_sum": total_link_work_sum, "total_link_work_sum_sq": total_link_work_sum_sq,
+            "total_link_work_count": total_link_work_count, "saved_link_work_values": saved_link_work_values,
+            "history_labels": history_labels, "history_plaquette": history_plaquette,
+            "history_defect_action": history_defect_action, "history_topology": history_topology,
+            "history_topology_steps": history_topology_steps,
+        }
+
+    def write_resume(completed: int) -> None:
+        """Resume checkpoint after `completed` steps: one directory per checkpoint, made valid by latest.json
+        (written last, atomically), so that a job killed while writing leaves the previous one usable."""
+        root = resume_root
+        target = root / f"step_{int(completed):08d}"
+        if rank == 0:
+            target.mkdir(parents=True, exist_ok=True)
+            (root / "output_dir.txt").write_text(str(Path(out_dir).resolve()) + "\n", encoding="utf-8")
+        dist.barrier()
+        state_of_rank = {
+            "step": int(completed), "rank": rank, "world_size": world_size, "cfgs": cfgs.detach().cpu(),
+            "local_parameters": pt.local_parameters.detach().cpu(), "pt_step": int(getattr(pt, "_pt_step", 0)),
+            "parameter_matrix": pt.parameter_matrix.detach().cpu() if rank == 0 else None,
+            "rng": {"cpu": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None},
+        }
+        if args.algorithm == "neorex":
+            state_of_rank.update(flow=pt.flow.state_dict(), optimizer=pt.optimizer.state_dict(),
+                                 consecutive_nan=int(pt.consecutive_nan_grad_updates))
+        _atomic_torch_save(state_of_rank, target / f"rank{rank}.pt")
+        if rank == 0:
+            _atomic_torch_save({"step": int(completed), "semantics": _resume_semantics(args, world_size),
+                                "totals": _resume_totals(), "thermalization_seconds": float(thermalization_elapsed),
+                                "measurement_seconds": float(time.time() - t0)}, target / "run.pt")
+        dist.barrier()
+        if rank == 0:
+            latest = root / "latest.json"
+            tmp = latest.with_name(".latest.json.tmp")
+            tmp.write_text(json.dumps({"step": int(completed), "dir": str(target)}), encoding="utf-8")
+            os.replace(tmp, latest)
+            for old in root.glob("step_*"):
+                if old != target:
+                    shutil.rmtree(old, ignore_errors=True)
+            print(f"resume_checkpoint=saved  step={int(completed)}  dir={target}", flush=True)
+        dist.barrier()
+
+    start_step = 0
     last_log_elapsed = 0.0
+    if resume_info is not None:
+        # the state after resume_info["step"] steps; the random generators last, after every setup that draws
+        start_step = int(resume_info["step"])
+        pt.local_parameters.copy_(rank_state["local_parameters"].to(pt.local_parameters.device))
+        if hasattr(pt, "_pt_step"):
+            pt._pt_step = int(rank_state["pt_step"])
+        if rank == 0:
+            pt.parameter_matrix.copy_(rank_state["parameter_matrix"].to(pt.parameter_matrix.device))
+        if args.algorithm == "neorex":
+            pt.flow.load_state_dict(rank_state["flow"])
+            pt.optimizer.load_state_dict(rank_state["optimizer"])
+            pt.consecutive_nan_grad_updates = int(rank_state["consecutive_nan"])
+        if rank == 0:
+            r = run_state["totals"]
+            total_swap_accepted, total_swap_proposed = r["total_swap_accepted"], r["total_swap_proposed"]
+            total_swap_attempts = r["total_swap_attempts"]
+            total_work_sum, total_work_sum_sq = r["total_work_sum"], r["total_work_sum_sq"]
+            total_work_count = r["total_work_count"]
+            total_flow_loss_sum, total_flow_loss_count = r["total_flow_loss_sum"], r["total_flow_loss_count"]
+            total_flow_applied_updates = r["total_flow_applied_updates"]
+            total_flow_skipped_updates = r["total_flow_skipped_updates"]
+            total_link_accepted, total_link_proposed = r["total_link_accepted"], r["total_link_proposed"]
+            total_link_work_sum, total_link_work_sum_sq = r["total_link_work_sum"], r["total_link_work_sum_sq"]
+            total_link_work_count = r["total_link_work_count"]
+            saved_link_work_values = r["saved_link_work_values"]
+            history_labels, history_plaquette = r["history_labels"], r["history_plaquette"]
+            history_defect_action, history_topology = r["history_defect_action"], r["history_topology"]
+            history_topology_steps = r["history_topology_steps"]
+            thermalization_elapsed = float(run_state["thermalization_seconds"])
+            t0 = time.time() - float(run_state["measurement_seconds"])  # elapsed times count the earlier jobs
+            last_log_elapsed = float(run_state["measurement_seconds"])
+        torch.set_rng_state(rank_state["rng"]["cpu"])
+        if device.type == "cuda" and rank_state["rng"]["cuda"] is not None:
+            torch.cuda.set_rng_state(rank_state["rng"]["cuda"], device)
+        rank_state = run_state = None
+        if rank == 0:
+            print(f"resume=1  from_step={start_step}  steps={args.steps}  dir={resume_info['dir']}", flush=True)
     history_saved_t = time.time()  # last rewrite of replica_history.npz during the run
     # Optional profile of whole REX steps on rank 0: the phases are labelled with record_function so
     # that the table attributes the time to the equilibrium sweep, the swap step and the bookkeeping.
     profiler = None
     py_profiler = None  # cProfile of the same steps, --profile-python
-    profile_first, profile_last = 1, int(args.profile_steps)  # steps [1, profile_steps]; step 0 warms up
+    # steps [start + 1, start + profile_steps]; the first step of the job warms up
+    profile_first, profile_last = start_step + 1, start_step + int(args.profile_steps)
     phase_seconds = {}
 
     def _phase_clock():
@@ -1649,16 +1865,26 @@ def main(args: argparse.Namespace) -> None:
         return time.perf_counter()
 
     stop_after_s = 60.0 * float(args.max_run_minutes)
+    resume_every_s = 60.0 * float(args.resume_every_minutes) if bool(args.save_resume) else 0.0
+    resume_saved_t = time.time()
     loop_t0 = time.time()
-    steps_completed = 0
-    for step in range(args.steps):
-        if stop_after_s > 0 and step > 0:
-            # Rank 0 decides and broadcasts, so every rank leaves the loop after the same step.
-            stop = [False]
+    steps_completed = start_step
+    for step in range(start_step, args.steps):
+        if (stop_after_s > 0 or resume_every_s > 0) and step > start_step:
+            # Rank 0 decides and broadcasts, so every rank leaves the loop (or writes a checkpoint) after the
+            # same step.
+            control = [False, False]
             if rank == 0:
                 now = time.time()
-                stop[0] = (now - run_t0) + 1.5 * (now - loop_t0) / step > stop_after_s
-            dist.broadcast_object_list(stop, src=0)
+                control[0] = stop_after_s > 0 and (
+                    (now - run_t0) + 1.5 * (now - loop_t0) / (step - start_step) > stop_after_s
+                )
+                control[1] = resume_every_s > 0 and now - resume_saved_t >= resume_every_s
+            dist.broadcast_object_list(control, src=0)
+            stop = control[:1]
+            if control[1] and not control[0]:
+                write_resume(step)
+                resume_saved_t = time.time()
             if stop[0]:
                 if rank == 0:
                     print(f"time_limit_stop=1  steps_completed={step}  steps_requested={args.steps}  "
@@ -2012,6 +2238,9 @@ def main(args: argparse.Namespace) -> None:
                         pstats.Stats(py_profiler, stream=handle).sort_stats(key).print_stats(60)
                 print(f"step_cprofile_path={out_dir / 'step_cprofile.txt'}", flush=True)
                 py_profiler = None
+
+    if bool(args.save_resume):
+        write_resume(steps_completed)  # the stop of --max-run-minutes or the end: --resume continues from here
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []
