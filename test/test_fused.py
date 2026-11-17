@@ -14,7 +14,7 @@ import torch
 import neoqcd.fused as fused
 import neoqcd.sun_utils as sun
 from neoqcd.mcmc import HBOR
-from neoqcd.utils import Defect, create_mask
+from neoqcd.utils import Defect, DefectBox, create_mask
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 TOL = 1e-11
@@ -110,6 +110,33 @@ class FusedHBORTest(unittest.TestCase):
                     inside = patch[0, ..., 0, 0].to(torch.bool).to(device)
                     inside = inside.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand_as(got)
                     self.assertEqual((got - cfgs)[~inside].abs().max().item(), 0.0)
+
+    def test_hierarchical_box_updates(self):
+        # The sweep of a nested box around the defect (DefectBox, NEMCMC_update.hierarchical): the cut
+        # lattice of the box, with odd spatial extents (dsize + 2 buffer = 7), and its interior links
+        # only. (NEMCMC_update.hierarchical itself cannot run with a defect on this code: DefectBox cuts
+        # the (2, D, T, L, L, L) defect mask with the indexing of a configuration.)
+        T, L = 8, 8
+        defect = Defect(4, T, L, dsize=3, time_slice=4, space_slice=2)
+        t, s, b = defect.time_slice, defect.space_slice, 2
+        cut = (slice(None), slice(None), slice(t - b, t + b)) + tuple(slice(s - b, s + defect.dsize + b) for _ in range(3))
+        for device in DEVICES:
+            pars = _pars(T, L, device)
+            box = DefectBox(defect, pars.mask, None, b)
+            cfgs = box.cut(_thermalized(HBOR(pars, beta=6.0), pars, 2, T, L, sweeps=2))
+            defect_mask = defect.create_defect_mask()[cut].contiguous().to(device)
+            rand = torch.rand(cfgs.shape[:1] + (18,) + cfgs.shape[1:-2], dtype=torch.float64, device=device)
+            bc = torch.tensor([0.0, 0.6], dtype=torch.float64)
+            outs = []
+            for use_kernel in (False, True):
+                hbor = HBOR(pars, beta=6.0, defect_par=bc)
+                hbor.use_fused_kernels = hbor.fused_emulate = hbor.fused_strict = use_kernel
+                with torch.no_grad():
+                    outs.append(hbor(cfgs, box.links, defect_mask, rand=rand))
+            with self.subTest(device=device):
+                self.assertEqual(tuple(cfgs.shape[2:6]), (4, 7, 7, 7))
+                self.assertGreater((outs[0] - cfgs).abs().max().item(), 1e-3)
+                self.assertLess((outs[1] - outs[0]).abs().max().item(), TOL)
 
     def test_beta_per_chain(self):
         for device in DEVICES:
