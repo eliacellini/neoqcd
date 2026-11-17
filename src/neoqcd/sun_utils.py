@@ -89,15 +89,15 @@ def SUN_mul(U,V):
     return torch.einsum('...ij,...jk->...ik',U,V)
 
 def plaquette_SUN(cfgs, D, N):
-    retr = torch.zeros(cfgs[:,0].shape[:-2], dtype=cfgs.real.dtype, device=cfgs.device)
-    dims = range(1,D+1)
-    for nu in range(1,D):
-        for mu in range(0,nu):
-            plaq = SUN_mul(SUN_dagger(cfgs[:,nu]),cfgs[:,mu])
-            plaq = SUN_mul(plaq,torch.roll(cfgs,1,dims=(-D + mu - 2))[:,nu])
-            plaq = SUN_mul(plaq,SUN_dagger(torch.roll(cfgs,1,dims=(-D + nu - 2)))[:,mu])
-            retr += SUN_trace(plaq).real
-    return torch.mean(retr, tuple(dims))/(D*(D-1)/2)/N
+    """Mean plaquette Re Tr P / N of each configuration, over sites and planes. Through plaquette_retr:
+    it rolls one link direction per staple (the former loop rolled every direction of the
+    configurations, four times the data) and needs two matrix products per plaquette, not three."""
+    retr = None
+    for nu in range(1, D):
+        for mu in range(0, nu):
+            plaq = plaquette_retr(cfgs, mu, nu, D)
+            retr = plaq if retr is None else retr + plaq
+    return torch.mean(retr, tuple(range(1, D + 1))) / (D * (D - 1) / 2) / N
 
 def pstaple(cfgs, mu, nu, D):
     # Slice out the link direction before rolling. Rolling the full D-direction

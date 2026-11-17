@@ -108,6 +108,30 @@ class LocalActionChangeTest(unittest.TestCase):
                 self.assertTrue(torch.equal(got, ref))
 
 
+class PlaquetteTest(unittest.TestCase):
+    def test_mean_plaquette_equals_the_loop_over_whole_rolled_configurations(self):
+        # sun.plaquette_SUN through plaquette_retr against the former loop, on unequal extents
+        D, N = 4, 3
+        # links exp(iH) with H traceless hermitian of size ~0.5: a plaquette far from zero
+        g = torch.Generator().manual_seed(0)
+        A = torch.randn(3, D, 4, 5, 6, 3, N, N, dtype=torch.cdouble, generator=g)
+        H = 0.5 * (A + A.conj().transpose(-1, -2))
+        H = H - torch.diagonal(H, dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(N, dtype=torch.cdouble)
+        cfgs = torch.linalg.matrix_exp(0.5j * H)
+        retr = torch.zeros(cfgs[:, 0].shape[:-2], dtype=torch.float64)
+        for nu in range(1, D):
+            for mu in range(nu):
+                plaq = sun.SUN_mul(sun.SUN_dagger(cfgs[:, nu]), cfgs[:, mu])
+                plaq = sun.SUN_mul(plaq, torch.roll(cfgs, 1, dims=(-D + mu - 2))[:, nu])
+                plaq = sun.SUN_mul(plaq, sun.SUN_dagger(torch.roll(cfgs, 1, dims=(-D + nu - 2)))[:, mu])
+                retr += sun.SUN_trace(plaq).real
+        reference = torch.mean(retr, tuple(range(1, D + 1))) / (D * (D - 1) / 2) / N
+        got = sun.plaquette_SUN(cfgs, D, N)
+        self.assertEqual(got.shape, (3,))
+        self.assertLess((got - reference).abs().max().item(), 1e-15)
+        self.assertGreater(reference.min().item(), 0.1)
+
+
 class WilsonActionPrecisionTest(unittest.TestCase):
     def test_link_factors_of_an_integer_defect_mask_are_double(self):
         # Defect.create_defect_mask is an int64 tensor: int64 * Python float would give float32 link
