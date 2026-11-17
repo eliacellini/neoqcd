@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Any
 from contextlib import nullcontext
 
+# Labels of the parts of a swap in the step profile of main_pt_obc.py (--profile-steps); a few
+# microseconds per call when no profiler runs.
+_region = torch.profiler.record_function
+
 from neoqcd.ladder import is_uniform, validate_ladder
  
 
@@ -581,7 +585,8 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
         x = self._cut_protocol_box(x_full)
         x_old = x.clone()
         start_parameters = self.local_parameters.clone()
-        target_parameters, active = self._prepare_orex_targets(parity)
+        with _region("swap/targets"):
+            target_parameters, active = self._prepare_orex_targets(parity)
 
         x_proposed, local_work = self._run_orex_protocol(
             x=x,
@@ -590,12 +595,14 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             target_parameters=target_parameters,
             active=active,
         )
-        accept, stats = self._accept_orex_work(local_work)
+        with _region("swap/accept"):
+            accept, stats = self._accept_orex_work(local_work)
 
         accept_view = self._sample_mask_view(accept, x)
         x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
-        self._scatter_parameters()
+        with _region("swap/scatter"):
+            self._scatter_parameters()
         self.set_parameter(mcmc, self.local_parameters)
         return x_out, stats
 
@@ -817,18 +824,20 @@ class OutOfEquilibriumParallelTempering(ParallelTempering):
             parameter_0 = start_parameters + lambda_0 * parameter_delta
             parameter_1 = start_parameters + lambda_1 * parameter_delta
 
-            dwork = self.action_difference(mcmc, x_curr, parameter_0, parameter_1)
-            work = work + torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
+            with _region("swap/action_change"):
+                dwork = self.action_difference(mcmc, x_curr, parameter_0, parameter_1)
+                work = work + torch.where(active, dwork.to(dtype=self.param_dtype), 0.0)
 
             if n_mcmc > 0:
-                self.set_parameter(mcmc, parameter_1)
-                x_updated = mcmc(
-                    x_curr,
-                    nsteps=n_mcmc,
-                    ensembles=False,
-                    use_tqdm=False,
-                )
-                x_curr = torch.where(active_view, x_updated, x_curr)
+                with _region("swap/mcmc"):
+                    self.set_parameter(mcmc, parameter_1)
+                    x_updated = mcmc(
+                        x_curr,
+                        nsteps=n_mcmc,
+                        ensembles=False,
+                        use_tqdm=False,
+                    )
+                    x_curr = torch.where(active_view, x_updated, x_curr)
 
         return x_curr, work
 
@@ -1077,30 +1086,32 @@ class NEOREXProtocolWrapper(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         work_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
         down = torch.as_tensor(parameter_1 < parameter_0, device=x.device)
-        if not bool(down.any()):
-            x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
-        else:
-            if self.work_mode == "work":
-                raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
-            # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1. The
-            # map and its inverse run on the whole batch and each chain keeps its own: the shapes
-            # stay static for CUDA graphs, and the layers are launch-bound, so the doubled GPU work
-            # costs no wall-clock time.
-            down = down.expand(x.shape[0])
-            parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
-            parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
-            low = torch.minimum(parameter_0, parameter_1)
-            step = (parameter_1 - parameter_0).abs()
-            x_up, aux_up = self._call_nf(x, low, step)
-            x_down, aux_down = self._call_nf_inverse(x, low, step)
-            down_view = down.view((x.shape[0],) + (1,) * (x.dim() - 1))
-            x_next = torch.where(down_view, x_down, x_up)
-            aux = torch.where(down, aux_down.to(device=x.device, dtype=work_dtype), aux_up.to(device=x.device, dtype=work_dtype))
-        aux = aux.to(device=x.device, dtype=work_dtype)
+        with _region("swap/flow_maps"):
+            if not bool(down.any()):
+                x_next, aux = self._call_nf(x, parameter_0, parameter_1 - parameter_0)
+            else:
+                if self.work_mode == "work":
+                    raise NotImplementedError("work_mode='work' has no inverse for chains moving down")
+                # A step down from parameter_0 to parameter_1 undoes the step up from parameter_1. The
+                # map and its inverse run on the whole batch and each chain keeps its own: the shapes
+                # stay static for CUDA graphs, and the layers are launch-bound, so the doubled GPU work
+                # costs no wall-clock time.
+                down = down.expand(x.shape[0])
+                parameter_0 = torch.as_tensor(parameter_0, device=x.device).expand(x.shape[0])
+                parameter_1 = torch.as_tensor(parameter_1, device=x.device).expand(x.shape[0])
+                low = torch.minimum(parameter_0, parameter_1)
+                step = (parameter_1 - parameter_0).abs()
+                x_up, aux_up = self._call_nf(x, low, step)
+                x_down, aux_down = self._call_nf_inverse(x, low, step)
+                down_view = down.view((x.shape[0],) + (1,) * (x.dim() - 1))
+                x_next = torch.where(down_view, x_down, x_up)
+                aux = torch.where(down, aux_down.to(device=x.device, dtype=work_dtype), aux_up.to(device=x.device, dtype=work_dtype))
+            aux = aux.to(device=x.device, dtype=work_dtype)
         if self.work_mode == "work":
             dwork = aux
         else:
-            dwork = self.action_change(x, x_next, parameter_0, parameter_1) - aux
+            with _region("swap/action_change"):
+                dwork = self.action_change(x, x_next, parameter_0, parameter_1) - aux
         return x_next, dwork
 
     def forward(
@@ -1265,7 +1276,8 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         x = self._cut_protocol_box(x_full)
         x_old = x.detach().clone()
         start_betas = self.local_parameters.clone()
-        target_betas, active = self._prepare_orex_targets(parity)
+        with _region("swap/targets"):
+            target_betas, active = self._prepare_orex_targets(parity)
 
         if bool(train_flow):
             x_proposed, local_work, train_stats = self._train_flow_local_protocol(
@@ -1299,13 +1311,15 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             local_work.detach().to(dtype=self.param_dtype),
             torch.zeros_like(local_work.detach(), dtype=self.param_dtype),
         )
-        accept, stats = self._accept_orex_work(local_work)
+        with _region("swap/accept"):
+            accept, stats = self._accept_orex_work(local_work)
         stats.update(train_stats)
 
         accept_view = self._sample_mask_view(accept, x)
         x_out = self._paste_protocol_box(x_full, torch.where(accept_view, x_proposed, x_old))
 
-        self._scatter_parameters()
+        with _region("swap/scatter"):
+            self._scatter_parameters()
         return x_out, stats
 
     def _run_stochastic_blocks_active(
@@ -1318,10 +1332,11 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         # The whole batch is swept (static shapes for CUDA graphs); inactive chains keep x.
         if active_idx.numel() == 0:
             return x.detach()
-        active = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
-        active[active_idx] = True
-        x_updated = module._run_stochastic_blocks(x, parameter)
-        return torch.where(self._sample_mask_view(active, x), x_updated.detach(), x.detach())
+        with _region("swap/mcmc"):
+            active = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+            active[active_idx] = True
+            x_updated = module._run_stochastic_blocks(x, parameter)
+            return torch.where(self._sample_mask_view(active, x), x_updated.detach(), x.detach())
 
     def _run_nf_block_active(
         self,
@@ -1333,7 +1348,11 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         # The flow runs on the whole batch (static shapes for CUDA graphs): inactive chains have
         # parameter_1 == parameter_0 and their outputs are discarded.
         active = active.to(device=x.device, dtype=torch.bool)
-        x_next_all, dwork_all = self.ddp_flow(x, parameter_0, parameter_1, nf_only=True)
+        # Without gradients (evaluation) the module is called directly: DDP's forward would only
+        # broadcast the module buffers again, at every call (16 calls per swap at K = 8), and
+        # they are equal on every rank (DDP's construction and load_flow broadcast them).
+        flow = self.ddp_flow if torch.is_grad_enabled() else getattr(self.ddp_flow, "module", self.ddp_flow)
+        x_next_all, dwork_all = flow(x, parameter_0, parameter_1, nf_only=True)
         zero_anchor = dwork_all.sum() * 0.0
         dwork = torch.where(active, dwork_all.to(dtype=self.param_dtype),
                             torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)) + zero_anchor
@@ -1665,6 +1684,10 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             raise RuntimeError(f"failed to load NEO-REX flow checkpoint: {error[0]}")
         for p in self.ddp_flow.parameters():
             dist.broadcast(p.data, src=0)
+        # The buffers too (rho tables, class masks, ...): only rank 0 loaded the state, and
+        # _run_nf_block_active calls the module without DDP, whose forward would broadcast them
+        for b in self.ddp_flow.module.buffers():
+            dist.broadcast(b.data, src=0)
 
 
  ####################################################################
