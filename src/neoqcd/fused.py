@@ -665,9 +665,13 @@ def _backend_for(hbor, cfgs, links):
 def hbor_call(hbor, cfgs, mask, defect, rand=None, reverse=False):
     """The sweep of HBOR.__call__ through the kernel: one HB sweep and hbor.orsteps OR sweeps over
     the links selected by `mask` (reversed with reverse=True), out of place. Returns None when the
-    kernel does not apply (grad mode, CPU without hbor.fused_emulate, another N, D or dtype, a kernel
-    that cannot be built): the caller then runs its torch sweep."""
-    if torch.is_grad_enabled():
+    kernel does not apply (an input that requires gradients in grad mode, CPU without
+    hbor.fused_emulate, another N, D or dtype, a kernel that cannot be built): the caller then runs
+    its torch sweep. Grad mode alone does not stop the kernel: main_pt_obc.py sweeps in grad mode, and
+    without an input that requires gradients the torch sweep builds no graph either."""
+    if torch.is_grad_enabled() and any(
+            torch.is_tensor(t) and t.requires_grad
+            for t in (cfgs, rand, defect, hbor.beta, getattr(hbor, "defect_par", None))):
         return None
     links = mask if isinstance(mask, sun.MaskedLinks) else hbor._links_for_mask(mask)
     backend = _backend_for(hbor, cfgs, links)

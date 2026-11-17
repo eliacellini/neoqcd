@@ -117,7 +117,7 @@ class FusedHBORTest(unittest.TestCase):
                 beta = torch.tensor([5.7, 6.0, 6.3], dtype=torch.float64)
                 self._compare(device, batch=3, beta=beta)
 
-    def test_torch_sweep_in_grad_mode_and_on_cpu_without_emulation(self):
+    def test_kernel_unless_an_input_needs_gradients_and_torch_on_cpu_without_emulation(self):
         pars = _pars(4, 4, "cpu")
         hbor = HBOR(pars, beta=6.0)
         hbor.use_fused_kernels = True
@@ -126,11 +126,17 @@ class FusedHBORTest(unittest.TestCase):
             hbor(cfgs, pars.mask, None)
         self.assertEqual(hbor.fused_used, "torch")
         hbor.fused_emulate = True
+        # grad mode alone (main_pt_obc.py sweeps in grad mode): no input requires gradients, the kernel runs
         with torch.enable_grad():
             hbor(cfgs, pars.mask, None)
+        self.assertEqual(hbor.fused_used, "cpu")
+        # an input that requires gradients: the torch sweep, which builds the graph
+        with torch.enable_grad():
+            out = hbor(cfgs.clone().requires_grad_(True), pars.mask, None)
         self.assertEqual(hbor.fused_used, "torch")
+        self.assertTrue(out.requires_grad)
         with torch.no_grad():
-            hbor(cfgs, pars.mask, None)
+            hbor(cfgs.clone().requires_grad_(True), pars.mask, None)
         self.assertEqual(hbor.fused_used, "cpu")
 
     def test_other_dtype_falls_back_with_a_warning(self):
