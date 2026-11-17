@@ -13,7 +13,7 @@ import torch
 
 import neoqcd.fused as fused
 import neoqcd.sun_utils as sun
-from neoqcd.mcmc import HBOR
+from neoqcd.mcmc import HBOR, NEMCMC_update
 from neoqcd.utils import Defect, DefectBox, create_mask
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
@@ -135,6 +135,28 @@ class FusedHBORTest(unittest.TestCase):
                     outs.append(hbor(cfgs, box.links, defect_mask, rand=rand))
             with self.subTest(device=device):
                 self.assertEqual(tuple(cfgs.shape[2:6]), (4, 7, 7, 7))
+                self.assertGreater((outs[0] - cfgs).abs().max().item(), 1e-3)
+                self.assertLess((outs[1] - outs[0]).abs().max().item(), TOL)
+
+    def test_hierarchical_update_with_a_defect(self):
+        # NEMCMC_update with nested boxes (main_nemcmc_snf.py --hierarchical-levels): whole-lattice
+        # sweep, then the box sweeps. Both paths draw the random numbers in the same order, so the same
+        # seed gives the same chain.
+        T, L = 8, 8
+        defect = Defect(4, T, L, dsize=2, time_slice=4, space_slice=3)
+        for device in DEVICES:
+            pars = SimpleNamespace(N=3, D=4, orsteps=1, device=torch.device(device),
+                                   mask=create_mask(4, T, L).to(device), defect=defect, updates_per_layer=1,
+                                   hierarchical_levels=2, hierarchical_rectangles=[2, 1], hierarchical_updates=[1, 2])
+            cfgs = _thermalized(HBOR(pars, beta=6.0), pars, 1, T, L, sweeps=2)
+            outs = []
+            for use_kernel in (False, True):
+                update = NEMCMC_update(pars, 6.0, defect_mask=defect.create_defect_mask().to(device), defect_par=0.3)
+                update.update.use_fused_kernels = update.update.fused_emulate = update.update.fused_strict = use_kernel
+                torch.manual_seed(7)
+                with torch.no_grad():
+                    outs.append(update(cfgs, pars)[0])
+            with self.subTest(device=device):
                 self.assertGreater((outs[0] - cfgs).abs().max().item(), 1e-3)
                 self.assertLess((outs[1] - outs[0]).abs().max().item(), TOL)
 

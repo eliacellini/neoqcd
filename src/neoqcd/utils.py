@@ -272,8 +272,11 @@ class Defect():
             dphi = phi[(slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial + (slice(None), slice(None))]
         elif field == 'mask':
             dphi = phi[(slice(None), slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial]
+        elif field == 'defect':
+            # the (2, D, T, L, ...) defect mask of create_defect_mask: no colour indices
+            dphi = phi[(slice(None), slice(None), slice(t - buffer, t + buffer)) + spatial]
         else:
-            raise ValueError("field must be 'cfgs' or 'mask'")
+            raise ValueError("field must be 'cfgs', 'mask' or 'defect'")
         return dphi
 
     def site_indices(self, buffer, device=None):
@@ -362,7 +365,7 @@ class DefectBox:
         self.links = sun.MaskedLinks(self.mask, self.D)
         self.defect_mask = (
             None if defect_mask is None
-            else defect.cut_defect(defect_mask, buffer=buffer)
+            else defect.cut_defect(defect_mask, field='defect', buffer=buffer)
         )
 
         sites = defect.site_indices(buffer, device=mask.device).flatten()

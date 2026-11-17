@@ -48,5 +48,32 @@ class SU2SubgroupProductTest(unittest.TestCase):
                 self.assertTrue(torch.equal(updated[..., phb, :], links[..., phb, :]))
 
 
+class HierarchicalDefectTest(unittest.TestCase):
+    def test_box_updates_with_a_defect_move_only_the_interior_links_of_the_largest_box(self):
+        # NEMCMC_update.hierarchical with a defect: DefectBox used to cut the (2, D, T, L, L, L)
+        # defect mask with the indexing of a configuration (IndexError before any sweep)
+        from neoqcd.mcmc import NEMCMC_update
+        from neoqcd.utils import Defect, DefectBox
+        torch.manual_seed(0)
+        T, L = 8, 8
+        defect = Defect(4, T, L, dsize=2, time_slice=4, space_slice=3)
+        pars = SimpleNamespace(N=3, D=4, orsteps=1, device=torch.device("cpu"), mask=create_mask(4, T, L),
+                               defect=defect, updates_per_layer=1, hierarchical_levels=2,
+                               hierarchical_rectangles=[2, 1], hierarchical_updates=[1, 2])
+        update = NEMCMC_update(pars, 6.0, defect_mask=defect.create_defect_mask(), defect_par=0.3)
+        cfgs = sun.SUN_haar((2, 4, T, L, L, L, 3), dtype=torch.cdouble)
+        with torch.no_grad():
+            out = update.hierarchical(cfgs, 0, pars)
+            full = update(cfgs, pars)[0]
+        largest = DefectBox(defect, pars.mask, None, 2)
+        moved = torch.zeros(4 * T * L ** 3, dtype=torch.bool)
+        moved[largest.lattice_links] = True
+        moved = moved.reshape(1, 4, T, L, L, L, 1, 1).expand_as(out)
+        self.assertEqual((out - cfgs)[~moved].abs().max().item(), 0.0)
+        self.assertGreater((out - cfgs)[moved].abs().max().item(), 1e-3)
+        identity = sun.SUN_identity(full.shape[:-1], dtype=full.dtype)
+        self.assertLess((sun.SUN_mul(sun.SUN_dagger(full), full) - identity).abs().max().item(), 1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

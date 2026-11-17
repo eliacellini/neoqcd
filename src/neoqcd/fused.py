@@ -594,6 +594,26 @@ def backend_status(target, device=None, backend_class=_Backend):
         return False, str(exc)
 
 
+def enable_hbor_kernel(device, rank=0, world_size=1):
+    """Turn the kernel on for every HBOR of the process (the class attribute HBOR.use_fused_kernels)
+    and load its library for `device`: rank 0 builds it first, the other ranks then load it from the
+    shared cache instead of compiling it concurrently (a barrier in between when torch.distributed is
+    initialized). Returns (available, library path or the reason why not); where it is not available
+    the torch sweep runs, with one RuntimeWarning. Used by the --fused-kernels options of the mains."""
+    import torch.distributed as dist
+    from neoqcd.mcmc import HBOR
+    HBOR.use_fused_kernels = True
+    device = torch.device(device)
+    status = (False, f'device {device.type}: the kernel runs on CUDA (the CPU build is for the tests)')
+    if device.type == 'cuda' and rank == 0:
+        status = backend_status('cuda', device)
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if device.type == 'cuda' and rank != 0:
+        status = backend_status('cuda', device)
+    return status
+
+
 # MaskedLinks -> None, or why its masks cannot be updated in place: a link of a mask among the staple
 # links of the same mask (HBOR computes all the staples of a mask from the links before its update)
 _IN_PLACE = weakref.WeakKeyDictionary()

@@ -29,6 +29,7 @@ import torch.distributed as dist
 from neoqcd.flow import FlowPars
 from neoqcd.analysis import OBSERVABLES_HEADER, analyze_observables_csv
 from neoqcd.mcmc import HBOR, NEMCMC_update
+import neoqcd.fused as fused
 from neoqcd.nn import HyperTimeScalar, time_embedding
 import neoqcd.sun_utils as sun
 from neoqcd.smearing import (
@@ -60,6 +61,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--backend", choices=("auto", "gloo", "nccl"), default="auto")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--fused-kernels",
+        action="store_true",
+        help="Run the HB+OR sweeps through the fused CUDA kernel of neoqcd.fused (built with nvcc at the start "
+        "of the run, cached in $NEOQCD_KERNEL_CACHE). Statistically, not bitwise, equivalent to the torch "
+        "sweep; the torch sweep runs where the kernel does not apply (an input that needs gradients, CPU).",
+    )
 
     # Lattice and protocol.
     parser.add_argument("--D", type=int, default=4)
@@ -2479,6 +2487,10 @@ def main(args: argparse.Namespace) -> None:
     runtime = None
     try:
         runtime = setup_runtime(args)
+        if args.fused_kernels:
+            ok, where = fused.enable_hbor_kernel(runtime[2], rank=runtime[0], world_size=runtime[1])
+            if runtime[0] == 0:
+                print(f"fused_kernels=on  hbor={'cuda' if ok else 'torch'}  hbor_library={where}", flush=True)
         return _main_impl(args, runtime)
     finally:
         if _ACTIVE_WANDB_RUN is not None:
