@@ -10,17 +10,27 @@ they agree to float64 rounding:
 - the coefficients of order 2 (exp_coefficients) to TOL_COEFF relative to the largest of each kind;
 - the inverse (stout_links_inverse against inverse_smearing_step(fixed_iterations=10)): U, log|det| and
   residual, and inverse(forward) = identity for small rho;
-The deviations are printed. CudaSource checks the CUDA halves of both kernel sources (fused.py, fused_smearing.py) with clang's
+- whole NEO-REX defect smearing layers (main_pt_obc.DefectSNFProtocolLayer, hyper smearing in class mode, 1 and
+  2 smearing steps) and a whole-lattice hyper smearing layer, with Smearing.use_fused_kernels on and off: maps
+  and log J per configuration, forward and fixed-iteration inverse, to TOL_LAYER; grad mode with an input that
+  requires grad (rho from the hypernetwork being trained, or the configurations), the CPU without the emulation
+  and the adaptive inverse stay torch, grad mode alone does not.
+The deviations are printed. CudaGraph (GPU only) replays the captured layer with the kernels against the eager
+torch layer; CudaSource checks the CUDA halves of both kernel sources (fused.py, fused_smearing.py) with clang's
 CUDA front end, where available.
 """
 
+import functools
+import importlib.util
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -28,12 +38,21 @@ import neoqcd.fused as fused
 import neoqcd.fused_smearing as fs
 import neoqcd.smearing_jacobian as sj
 import neoqcd.sun_utils as sun
+from neoqcd.flow import FlowPars
+from neoqcd.smearing import CouplingLayer, Smearing
+from neoqcd.utils import Defect, create_mask
+
+ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("main_pt_obc_fused", ROOT / "main" / "main_pt_obc.py")
+PT_OBC = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(PT_OBC)
 
 CUDA = torch.cuda.is_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 TOL_LINK = 1e-13
 TOL_LOGDET = 1e-12
 TOL_COEFF = 1e-13
+TOL_LAYER = 1e-13
 
 
 def _cpu_backend_or_skip():
@@ -260,6 +279,294 @@ class BackendChoiceTest(unittest.TestCase):
         self.assertTrue(fs.needs_autograd(U, U.clone().requires_grad_()))
         with torch.no_grad():
             self.assertFalse(fs.needs_autograd(U, U.clone().requires_grad_()))
+
+
+def _perturb(module, scale, seed):
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.add_(scale * torch.randn(parameter.shape, generator=g, dtype=parameter.dtype))
+
+
+def _neorex_layer(rho_init, perturbation, steps=1, seed=0, device="cpu"):
+    # The defect smearing layer of NEO-REX as main_pt_obc.py builds it (--nf-layer-type smearing, hyper
+    # smearing in class mode), with `steps` smearing steps; its hypernetwork perturbed so that rho depends on
+    # the coupling and differs between the classes
+    flags = ("--cpu --algorithm neorex --D 4 --T 4 --L 6 --N 3 --beta 6 --defect-size 1 --time-slice 2 "
+             "--space-slice 2 --parameter-min 0 --parameter-max 1 --batch-size 2 --nf-layer-type smearing "
+             f"--use-hyper-smearing --hyper-smearing-mode class --hyper-rho-init {rho_init} "
+             "--hyper-no-normalize-by-nstep").split()
+    with mock.patch.object(sys, "argv", ["main_pt_obc", *flags]):
+        args = PT_OBC.parse_args()
+    defect = Defect(args.D, args.T, args.L, args.defect_size, args.time_slice, args.space_slice)
+    with mock.patch.object(PT_OBC, "FlowPars", functools.partial(FlowPars, smearing_steps_per_layer=steps)):
+        pars = PT_OBC._build_neorex_flow_pars(args, torch.device(device), create_mask(args.D, args.T, args.L).to(device),
+                                              defect)
+    torch.manual_seed(seed)
+    layer = PT_OBC.DefectSNFProtocolLayer(pars).to(device)
+    _perturb(layer, perturbation, seed)
+    return layer
+
+
+def _smooth_links(shape, spread, seed):
+    # SU(3) links exp(iH), H traceless hermitian of size ~spread: closer to a thermalized lattice than Haar
+    g = torch.Generator().manual_seed(seed)
+    A = torch.randn(*shape, 3, 3, dtype=torch.cdouble, generator=g)
+    H = 0.5 * (A + A.conj().transpose(-1, -2))
+    H = H - torch.diagonal(H, dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(3, dtype=torch.cdouble)
+    return torch.linalg.matrix_exp(1j * spread * H)
+
+
+def _fused(smearing, on=True):
+    smearing.use_fused_kernels = on
+    smearing.fused_emulate = on
+    smearing.fused_strict = on
+
+
+class LayerTest(unittest.TestCase):
+    """Whole smearing layers with Smearing.use_fused_kernels on and off (instance attributes here; the program
+    sets the class attribute)."""
+
+    @classmethod
+    def setUpClass(cls):
+        _cpu_backend_or_skip()
+
+    def setUp(self):
+        self.bc = torch.tensor([0.2, 0.7], dtype=torch.double)
+        self.delta = torch.tensor([0.5, -0.5], dtype=torch.double)
+
+    def _rho_range(self, layer):
+        smearing = layer.layer.smearing
+        rho = smearing.hyper_smearing(beta=self.bc, delta_beta=self.delta)
+        active = rho[rho != 0].abs()
+        return active.min().item(), active.max().item()
+
+    def _compare_layer(self, layer, x, name, inverse_iterations=10):
+        smearing = layer.layer.smearing
+        with torch.no_grad():
+            _fused(smearing, False)
+            y0, ld0 = layer(x, self.bc, self.delta)
+            xi0, ldi0 = layer.inverse(y0, self.bc, self.delta, fixed_iterations=inverse_iterations)
+            self.assertIsNone(smearing.fused_used)
+            _fused(smearing, True)
+            y1, ld1 = layer(x, self.bc, self.delta)
+            self.assertEqual(smearing.fused_used, "cpu")
+            xi1, ldi1 = layer.inverse(y0, self.bc, self.delta, fixed_iterations=inverse_iterations)
+            self.assertEqual(smearing.fused_used, "cpu")
+            stats = smearing.last_inverse_stats
+            _fused(smearing, False)
+        self.assertEqual(set(stats["iterations"]), {inverse_iterations})
+        self.assertGreater((y0 - x).abs().max().item(), 1e-5)
+        dy, dld = (y1 - y0).abs().max().item(), (ld1 - ld0).abs().max().item()
+        dxi, dldi = (xi1 - xi0).abs().max().item(), (ldi1 - ldi0).abs().max().item()
+        back = (xi1 - x).abs().max().item()
+        lo, hi = self._rho_range(layer)
+        # the largest c1 of the torch forward (above C1_SERIES its first pass is repeated with the closed forms)
+        with torch.no_grad(), sj.DeferredChecks() as checks:
+            layer._run_blocks("forward", layer.flow_pars.defect.cut_defect(x, buffer=layer.flow_pars.patch_buffer),
+                              self.bc, self.delta)
+        _report(f"{name}, |rho| in [{lo:.1e}, {hi:.1e}], max c1 {checks.c1_max.item():.2g}, log J "
+                f"[{', '.join(f'{v:.3g}' for v in ld0.tolist())}]: forward map {dy:.1e}, log J {dld:.1e}; "
+                f"inverse map {dxi:.1e}, log J {dldi:.1e}; inverse(forward) - 1 {back:.1e}")
+        for what, d in (("forward map", dy), ("forward log J", dld), ("inverse map", dxi), ("inverse log J", dldi)):
+            self.assertLessEqual(d, TOL_LAYER, f"{name}: {what} deviates by {d:.2e}")
+        self.assertLessEqual(back, 1e-11)
+        return y0
+
+    def test_neorex_defect_layer(self):
+        cases = (
+            ("rho ~1e-3, 1 step", 1e-3, 1e-4, 1, 10),
+            ("rho ~0.02, 1 step", 0.02, 0.005, 1, 10),
+            ("rho ~0.02, 2 steps", 0.02, 0.005, 2, 10),
+            ("rho ~0.1, 1 step", 0.1, 0.02, 1, 30),
+            ("rho ~0.3, 1 step", 0.3, 0.05, 1, 80),
+        )
+        for name, rho_init, perturbation, steps, iterations in cases:
+            for config in ("haar", "smooth"):
+                with self.subTest(case=name, config=config):
+                    layer = _neorex_layer(rho_init, perturbation, steps=steps, seed=1)
+                    self.assertEqual(layer.layer.smearing.hyper_smearing.mode, "class")
+                    if config == "haar":
+                        x = sun.SUN_haar((2, 4, 4, 6, 6, 6, 3), dtype=torch.cdouble,
+                                         generator=torch.Generator().manual_seed(2))
+                    else:
+                        x = _smooth_links((2, 4, 4, 6, 6, 6), 0.3, seed=2)
+                    self._compare_layer(layer, x, f"NEO-REX class layer, {name}, {config}", iterations)
+
+    def test_neorex_defect_layer_heavy_smearing_forward(self):
+        """|rho| ~ 3: c1 >= C1_SERIES on part of the links, where the torch forward repeats its call with the
+        closed forms and the kernel takes them link by link (the inverse would need more iterations)."""
+        layer = _neorex_layer(6.0, 0.3, seed=1)
+        smearing = layer.layer.smearing
+        x = sun.SUN_haar((2, 4, 4, 6, 6, 6, 3), dtype=torch.cdouble, generator=torch.Generator().manual_seed(2))
+        small = layer.flow_pars.defect.cut_defect(x, buffer=layer.flow_pars.patch_buffer)
+        with torch.no_grad():
+            with sj.DeferredChecks() as checks:
+                layer._run_blocks("forward", small, self.bc, self.delta)
+            y0, ld0 = layer(x, self.bc, self.delta)
+            _fused(smearing)
+            y1, ld1 = layer(x, self.bc, self.delta)
+            self.assertEqual(smearing.fused_used, "cpu")
+            _fused(smearing, False)
+        c1_max = checks.c1_max.item()
+        dy, dld = (y1 - y0).abs().max().item(), ((ld1 - ld0).abs() / ld0.abs()).max().item()
+        lo, hi = self._rho_range(layer)
+        _report(f"NEO-REX class layer, heavy smearing, |rho| in [{lo:.2g}, {hi:.2g}], max c1 {c1_max:.2g}: forward map "
+                f"{dy:.1e}, log J {dld:.1e} relative")
+        self.assertGreater(c1_max, sj.C1_SERIES)
+        self.assertLessEqual(dy, TOL_LAYER)
+        self.assertLessEqual(dld, 1e-13)
+
+    def test_whole_lattice_hyper_smearing(self):
+        from test.test_cnf_adapters import _flow_pars
+        pars = _flow_pars("hyper-smearing")
+        pars.mask = create_mask(2, 4, 4)
+        layer = CouplingLayer(pars, torch.zeros(pars.rho_shape, dtype=torch.double), time=1.0)
+        _perturb(layer.smearing.hyper_smearing, 0.05, seed=3)
+        x = sun.SUN_haar((2, 2, 4, 4, 3), dtype=torch.cdouble, generator=torch.Generator().manual_seed(3))
+        beta = torch.tensor([0.3, 0.8], dtype=torch.double)
+        smearing = layer.smearing
+        with torch.no_grad():
+            y0, _, ld0 = layer(x, pars, None, beta=beta)
+            xi0, _, ldi0 = layer.inverse(y0, pars, None, beta=beta)
+            _fused(smearing)
+            y1, _, ld1 = layer(x, pars, None, beta=beta)
+            xi1, _, ldi1 = layer.inverse(y0, pars, None, beta=beta)
+            self.assertEqual(smearing.fused_used, "cpu")
+        deviations = [(a - b).abs().max().item() for a, b in ((y1, y0), (ld1, ld0), (xi1, xi0), (ldi1, ldi0))]
+        _report("whole-lattice hyper smearing D=2: forward map, log J, inverse map, log J: "
+                + ", ".join(f"{d:.1e}" for d in deviations))
+        self.assertLessEqual(max(deviations), TOL_LAYER)
+
+    def test_torch_paths(self):
+        """Flag off: torch, fused_used untouched. Grad mode with rho requiring grad (the hypernetwork being
+        trained), the CPU without the emulation and the adaptive inverse: torch, the same numbers as with the
+        flag off. Grad mode with nothing requiring grad: the kernels. A failed residual check repeats the inverse
+        with the adaptive torch iteration."""
+        layer = _neorex_layer(0.05, 0.02, seed=4)
+        smearing = layer.layer.smearing
+        x = _smooth_links((2, 4, 4, 6, 6, 6), 0.3, seed=4)
+        self.assertFalse(Smearing.use_fused_kernels)
+        with torch.no_grad():
+            y0, ld0 = layer(x, self.bc, self.delta)
+            xa0, lda0 = layer.inverse(y0, self.bc, self.delta, fixed_iterations=0)
+        self.assertIsNone(smearing.fused_used)
+        # grad mode, rho from the trainable hypernetwork: autograd records the torch step
+        _fused(smearing)
+        y1, ld1 = layer(x, self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "torch")
+        self.assertTrue(ld1.requires_grad)
+        self.assertTrue(torch.equal(y1.detach(), y0) and torch.equal(ld1.detach(), ld0))
+        x1, ldi1 = layer.inverse(y0, self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "torch")
+        self.assertTrue(ldi1.requires_grad)
+        # grad mode with no input requiring grad (main_pt_obc.py runs much without torch.no_grad()): the
+        # kernels, the numbers of the kernels under no_grad
+        with torch.no_grad():
+            y_k, ld_k = layer(x, self.bc, self.delta)
+            x_k, ldi_k = layer.inverse(y0, self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "cpu")
+        for parameter in layer.parameters():
+            parameter.requires_grad_(False)
+        self.assertTrue(torch.is_grad_enabled())
+        y2, ld2 = layer(x, self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "cpu")
+        x2, ldi2 = layer.inverse(y0, self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "cpu")
+        self.assertFalse(ld2.requires_grad or ldi2.requires_grad)
+        self.assertTrue(torch.equal(y2, y_k) and torch.equal(ld2, ld_k) and torch.equal(x2, x_k) and torch.equal(ldi2, ldi_k))
+        # ... and torch again when the configurations require grad
+        y3, ld3 = layer(x.clone().requires_grad_(), self.bc, self.delta)
+        self.assertEqual(smearing.fused_used, "torch")
+        self.assertTrue(ld3.requires_grad)
+        for parameter in layer.parameters():
+            parameter.requires_grad_(True)
+        with torch.no_grad():
+            # the adaptive inverse
+            xa1, lda1 = layer.inverse(y0, self.bc, self.delta, fixed_iterations=0)
+            self.assertEqual(smearing.fused_used, "torch")
+            self.assertTrue(torch.equal(xa1, xa0) and torch.equal(lda1, lda0))
+            # a failed check of the fixed-iteration inverse with the kernels: the adaptive torch inverse
+            with mock.patch.object(sj.DeferredChecks, "resolve", return_value=(True, 1.0)):
+                xf, ldf = layer.inverse(y0, self.bc, self.delta)
+            self.assertEqual(smearing.fused_used, "torch")
+            self.assertTrue(torch.equal(xf, xa0) and torch.equal(ldf, lda0))
+            # the CPU without the emulation: torch, silently
+            smearing.fused_emulate = False
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                y2, ld2 = layer(x, self.bc, self.delta)
+            self.assertEqual(smearing.fused_used, "torch")
+            self.assertTrue(torch.equal(y2, y0) and torch.equal(ld2, ld0))
+        _fused(smearing, False)
+
+
+@unittest.skipUnless(CUDA, "needs a GPU")
+class CudaGraph(unittest.TestCase):
+    """main_pt_obc --cuda-graphs --fused-kernels: the defect smearing layer captured with the kernel launches
+    inside, replayed against the eager torch layer; the times of the eager torch, eager fused and captured fused
+    forward and inverse are printed."""
+
+    @staticmethod
+    def _timed(fn, repeats=10):
+        import time
+        fn()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(repeats):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) / repeats * 1e3
+
+    def test_captured_layer_with_the_kernels_matches_eager_torch(self):
+        from neoqcd.cnf_io import build_cnf
+        from test.test_cnf_adapters import _defect_config
+        ok, why = fs.backend_status("cuda")
+        if not ok:
+            self.skipTest(f"no CUDA build of the smearing kernels: {why}")
+        device = torch.device("cuda")
+        _, pars, _ = build_cnf(_defect_config(batch_size=16, D=4, T=8, L=8, defect_size=2, time_slice=4,
+                                              space_slice=3, hyper_smearing_mode="class"), device="cuda")
+        torch.manual_seed(1)
+        eager, graphed = PT_OBC.DefectSNFProtocolLayer(pars).to(device), PT_OBC.DefectSNFProtocolLayer(pars).to(device)
+        fused_eager = PT_OBC.DefectSNFProtocolLayer(pars).to(device)
+        with torch.no_grad():
+            for parameter in eager.layer.smearing.hyper_smearing.mlp.parameters():
+                parameter.add_(0.02 * torch.randn_like(parameter))
+        graphed.load_state_dict(eager.state_dict())
+        fused_eager.load_state_dict(eager.state_dict())
+        graphed.use_cuda_graphs = True
+        for layer in (graphed, fused_eager):
+            layer.layer.smearing.use_fused_kernels = True
+            layer.layer.smearing.fused_strict = True
+        shape = (16, 4, 8, 8, 8, 8)
+        x = _smooth_links(shape, 0.3, seed=1).to(device)
+        bc = torch.linspace(0.1, 0.8, 16, dtype=torch.float64, device=device)
+        delta = torch.full_like(bc, 1 / 28)
+        with torch.no_grad():
+            for trial in range(2):  # the second replay must see the new inputs
+                if trial:
+                    x = _smooth_links(shape, 0.3, seed=2).to(device)
+                    bc = bc.flip(0)
+                y_e, ld_e = eager(x, bc, delta)
+                y_g, ld_g = graphed(x, bc, delta)
+                self.assertTrue(graphed.use_cuda_graphs, "capture failed and fell back to eager")
+                self.assertEqual(graphed.layer.smearing.fused_used, "cuda")
+                self.assertLess((y_g - y_e).abs().max().item(), TOL_LAYER)
+                self.assertLess((ld_g - ld_e).abs().max().item(), 1e-11)
+                xi_e, ldi_e = eager.inverse(y_e, bc, delta)
+                xi_g, ldi_g = graphed.inverse(y_e, bc, delta)
+                self.assertTrue(graphed.use_cuda_graphs, "capture failed and fell back to eager")
+                self.assertEqual(graphed.layer.smearing.fused_used, "cuda")
+                self.assertLess((xi_g - xi_e).abs().max().item(), TOL_LAYER)
+                self.assertLess((ldi_g - ldi_e).abs().max().item(), 1e-11)
+                self.assertLess((xi_g - x).abs().max().item(), 1e-10)
+            self.assertEqual(len(graphed._graphs), 2)
+            times = {name: (self._timed(lambda: layer(x, bc, delta)), self._timed(lambda: layer.inverse(y_e, bc, delta)))
+                     for name, layer in (("torch eager", eager), ("fused eager", fused_eager), ("fused graph", graphed))}
+            self.assertEqual(fused_eager.layer.smearing.fused_used, "cuda")
+        _report("defect layer 8^4, batch 16, forward / inverse ms: "
+                + ", ".join(f"{name} {f:.2f} / {i:.2f}" for name, (f, i) in times.items()))
 
 
 # The CUDA runtime as far as the kernel sources use it, for clang's CUDA front end without a CUDA toolkit
