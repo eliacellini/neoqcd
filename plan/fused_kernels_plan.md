@@ -55,3 +55,62 @@ Not covered: the residual layer (no kernel in snf_SUN).
   `--chdir=<worktree>` and `PYTHONPATH=<worktree>/src` (the venv's editable install points at the
   production checkout's src). Production checkout untouched until the merge.
 - Fused and torch paths are statistically, not bitwise, equivalent.
+
+## Results (2026-11-17, head 15684db)
+All on Leonardo (A100, cineca-ai 4.1.1, torch 2.0), 16^4, defect size 3, 8 ranks, batch 64,
+K = 8, h = 1, the production configuration of phase A; s/step at steady state.
+
+| | main 3eecc1b | fused-kernels | gain |
+|---|---|---|---|
+| O-REX | 5.27 | 0.394 | 13x |
+| NEO-REX smearing class | 6.13 | 0.528 | 11.6x |
+
+How the time came down (NEO-REX smearing class, s/step):
+- 6.13: main.
+- 1.58: fused HBOR (phase 1). The equilibrium sweep went 3.49 -> 0.215.
+- 1.26: fused stout step and inverse (phase 2).
+- 1.13: S_halo without host syncs (3f360a3).
+- 0.74: protocol box (1215a72, `--protocol-box`).
+- 0.61: fewer syncs and S_halo from gather tables (92946f3, 7a28c7f).
+- 0.53: fused plaquette for the replica history (15684db).
+
+Phase 3, what was added:
+- `--protocol-box` (utils.ProtocolBox). The protocol of a swap runs on a box around the defect: the
+  patch with a one-site frame, the cut of the flow and the halo of the action change, which is
+  6 x 9^3 sites at 16^4. The box is cut once per swap and written back into the accepted chains.
+  With the same random numbers it equals the whole-lattice protocol to 1e-12 (test/test_protocol_box.py).
+- `fused.plaquette` (snf_plaquette in the HBOR library). It is used for the replica-history plaquette
+  with `--fused-kernels`.
+- Host syncs removed:
+  - S_halo bounding boxes;
+  - HBOR branch choice;
+  - down.any() per protocol step;
+  - the CPU zero in DeferredChecks.resolve.
+  S_halo now evaluates all halo plaquettes from gather tables.
+- The smearing graph captures the map and its inverse together, so no capture lands mid-run.
+- NEO-REX evaluation calls the flow without DDP; load_flow now broadcasts the buffers too, which it
+  did not before.
+- `--replica-history-save-minutes` (default 10). The history was recompressed every log step, a cost
+  that grew linearly with the run: +50% per step at 3000 steps.
+- `--profile-python`: cProfile of the profiled steps; record_function labels for the parts of a swap.
+- Fixes found on the way:
+  - Wilson_action computed float32 link factors for an integer defect mask;
+  - DefectBox cut the defect mask with the indexing of a configuration;
+  - plaquette_SUN rolled the whole configuration tensor.
+
+Validation (fused + box against torch on main, same seeds):
+- O-REX 8^4 K = 2, 3000 steps: work z = -0.10; Crooks chi2 5.1/7.
+- NEO-REX smearing class 8^4 K = 2, 1000 steps: every pair agrees; Crooks max 1.5 sigma.
+- 16^4 runs:
+  - O-REX: links bit-identical along the phase 3 commits.
+  - NEO-REX: the work changes at ~1e-11 from the summation order of S_halo; acceptance, labels and
+    plaquettes are identical.
+- GPU tests: 44 OK.
+
+Left out (diminishing returns):
+- the CUDA graph of the protocol MCMC on the box (O-REX, ~-0.05 s/step);
+- resolving the smearing graph checks once per swap instead of 32 times. NEO-REX ~-0.1 s/step; a
+  failed check must then repeat the swap with the same random numbers.
+
+The equilibrium sweep (0.215 s, the fused HBOR kernel on the whole lattice, near memory bandwidth)
+is now 40-55% of the step. Production use: add `--fused-kernels --protocol-box --cuda-graphs`.
