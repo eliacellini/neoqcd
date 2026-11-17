@@ -29,6 +29,7 @@ from neoqcd.flow import FlowPars
 from neoqcd.mcmc import DefectMCMCAdapter, HBOR, quiesce_for_capture
 import neoqcd.fused as fused
 import neoqcd.fused_smearing as fused_smearing
+import neoqcd.topology as topology
 from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.replica_history import rung_indices, summarize_history
 from neoqcd.smearing import DefectCouplingLayer, ResidualNormalizingFlows, Smearing
@@ -913,6 +914,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-save-replica-history", dest="save_replica_history", action="store_false")
     parser.add_argument(
+        "--topology-every",
+        type=int,
+        default=0,
+        help="Measure the topological charge every this many steps (0: never), after --cooling-steps sweeps "
+        "of Wilson cooling, with the clover definition (neoqcd.topology, as in the SNF paper); stored in "
+        "replica_history.npz and summarized in run_meta.json (chi and tau_int(Q^2) of the periodic replica, "
+        "the top rung). With --fused-kernels the cooling and the charge run through kernels.",
+    )
+    parser.add_argument("--cooling-steps", type=int, default=60, help="Wilson cooling sweeps before Q (SNF paper: 60)")
+    parser.add_argument(
+        "--topology-replicas",
+        choices=("top", "all"),
+        default="top",
+        help="Measure Q on the chains of the top rung (the periodic replica, bc = parameter-max) only, or on every "
+        "chain of every rung (batch-size cooled configurations per rank instead of ~batch-size/n_rep).",
+    )
+    parser.add_argument(
         "--replica-history-save-minutes",
         type=float,
         default=10.0,
@@ -1583,6 +1601,13 @@ def main(args: argparse.Namespace) -> None:
     history_labels = []  # rank 0: (world_size, batch) rung index of every chain slot after each step
     history_plaquette = []  # rank 0: (world_size, batch) plaquette of every chain slot after each step
     history_defect_action = []  # rank 0: (world_size, batch) dS/dc of every chain slot at its coupling
+    history_topology = []  # rank 0: (world_size, batch) Q after cooling (NaN where not measured), --topology-every
+    history_topology_steps = []  # rank 0: index of the step after which each Q was measured
+    topology_every = int(args.topology_every)
+    if topology_every < 0 or int(args.cooling_steps) < 0:
+        raise ValueError("--topology-every and --cooling-steps must be non-negative")
+    if topology_every > 0 and not bool(args.save_replica_history):
+        raise ValueError("--topology-every stores Q in the replica history: drop --no-save-replica-history")
     history_path = out_dir / "replica_history.npz"
     # dS/dc on the bc-dependent plaquettes, for the metric of the optimal ladder (main/optimal_ladder.py).
     defect_probe = None
@@ -1604,6 +1629,9 @@ def main(args: argparse.Namespace) -> None:
             defect_action=np.stack(history_defect_action, axis=0),
             parameter_ladder=parameter_ladder.detach().cpu().numpy().astype(np.float64),
             swap_every=np.asarray(int(args.swap_every)),
+            **({"topological_charge": np.stack(history_topology, axis=0),
+                "topology_steps": np.asarray(history_topology_steps, dtype=np.int64),
+                "cooling_steps": np.asarray(int(args.cooling_steps))} if history_topology else {}),
         )
 
     last_log_elapsed = 0.0
@@ -1758,6 +1786,24 @@ def main(args: argparse.Namespace) -> None:
                 history_labels.append(rung_indices(pt.parameter_matrix, parameter_ladder).cpu().numpy())
                 history_plaquette.append(torch.stack(gather_list, dim=0).cpu().numpy())
                 history_defect_action.append(torch.stack(defect_gather, dim=0).cpu().numpy())
+            if topology_every > 0 and (step + 1) % topology_every == 0:
+                # Q of the chains of the top rung (the periodic replica), or of every chain: NaN elsewhere
+                local_charge = torch.full((int(cfgs.shape[0]),), float("nan"), dtype=torch.float64, device=cfgs.device)
+                if args.topology_replicas == "all":
+                    chosen = torch.arange(int(cfgs.shape[0]), device=cfgs.device)
+                else:
+                    chosen = torch.nonzero(pt.local_parameters == parameter_ladder[-1], as_tuple=False).squeeze(-1)
+                if int(chosen.numel()) > 0:
+                    # cooling works on its own copy: no index_select copy when every chain is measured
+                    subset = cfgs if args.topology_replicas == "all" else cfgs.index_select(0, chosen)
+                    local_charge[chosen] = topology.topological_charge(
+                        subset, int(args.cooling_steps), use_kernels=bool(args.fused_kernels)
+                    ).to(dtype=torch.float64)
+                charge_gather = [torch.zeros_like(local_charge) for _ in range(world_size)] if rank == 0 else None
+                dist.gather(local_charge, gather_list=charge_gather, dst=0)
+                if rank == 0:
+                    history_topology.append(torch.stack(charge_gather, dim=0).cpu().numpy())
+                    history_topology_steps.append(len(history_labels) - 1)
 
         link_accepted_step = _normalize_metric_list(stats.get("link_accepted"), n_links, 0)
         link_proposed_step = _normalize_metric_list(stats.get("link_proposed"), n_links, 0)
@@ -2151,6 +2197,9 @@ def main(args: argparse.Namespace) -> None:
                     np.stack(history_plaquette, axis=0),
                     world_size,
                     defect_action=np.stack(history_defect_action, axis=0),
+                    topology=np.stack(history_topology, axis=0) if history_topology else None,
+                    topology_steps=np.asarray(history_topology_steps, dtype=np.int64),
+                    volume=int(args.T) * int(args.L) ** (int(args.D) - 1),
                 )
                 history["defect_action"]["parameter_ladder"] = [
                     float(v) for v in parameter_ladder.detach().cpu().tolist()
@@ -2170,6 +2219,16 @@ def main(args: argparse.Namespace) -> None:
                     f"gamma_status={top['status']}  replica_history_path={history_path}",
                     flush=True,
                 )
+                if "topology_top" in history:
+                    topo = history["topology_top"]
+                    print(
+                        f"topology_top: measurements={topo['measurements']}  every={topo['every']}  "
+                        f"cooling_steps={int(args.cooling_steps)}  Q={topo['Q']['value']:.4f}+-{topo['Q']['error']:.1e}  "
+                        f"chi={topo['chi']:.3e}+-{topo['chi_error']:.1e}  "
+                        f"tau_int_Q2_steps={topo['tau_int_Q2_steps']:.1f}+-{topo['tau_int_Q2_steps_error']:.1f}  "
+                        f"gamma_status={topo['Q2']['status']}",
+                        flush=True,
+                    )
             except Exception as err:  # noqa: BLE001 - diagnostics must not fail the run
                 history = {"path": str(history_path), "error": f"{type(err).__name__}: {err}"}
                 print(f"replica_history_error={history['error']}", flush=True)

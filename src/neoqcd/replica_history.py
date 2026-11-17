@@ -167,14 +167,38 @@ def rung_moments(labels: np.ndarray, values: np.ndarray, n_rungs: int, discard_f
     return result
 
 
+def topology_summary(labels: np.ndarray, charge: np.ndarray, steps: np.ndarray, rung: int, volume: int) -> dict:
+    """Q of the walker on `rung` at the measurement steps (charge (n, W, B), measured after steps[i]; NaN
+    where not measured): <Q>, <Q^2> with its tau_int, chi = <Q^2>/V, tau_int in measurements and in REX
+    steps (times the spacing of the measurements)."""
+    steps = np.asarray(steps, dtype=np.int64)
+    series = replica_observable_series(np.asarray(labels)[steps], np.asarray(charge, dtype=np.float64), rung)
+    q2 = tau_int(series ** 2)
+    spacing = int(np.median(np.diff(steps))) if steps.size > 1 else 1
+    return {
+        "measurements": int(series.shape[0]),
+        "every": spacing,
+        "Q": tau_int(series),
+        "Q2": q2,
+        "chi": q2["value"] / float(volume),
+        "chi_error": q2["error"] / float(volume),
+        "tau_int_Q2_steps": q2["tau_int"] * spacing,
+        "tau_int_Q2_steps_error": q2["tau_int_error"] * spacing,
+    }
+
+
 def summarize_history(
     labels: np.ndarray,
     plaquette: np.ndarray | None,
     n_rungs: int,
     defect_action: np.ndarray | None = None,
+    topology: np.ndarray | None = None,
+    topology_steps: np.ndarray | None = None,
+    volume: int | None = None,
 ) -> dict:
     """JSON-ready summary: round trips, flux, plaquette tau_int on the bottom and top rungs and, when
-    given, the mean and variance of the defect action on every rung."""
+    given, the mean and variance of the defect action on every rung and the topological charge of the
+    walker on the top rung (topology_summary)."""
     trips = round_trips(labels, n_rungs)
     summary = {
         "steps": int(labels.shape[0]),
@@ -190,4 +214,6 @@ def summarize_history(
             summary[f"plaquette_{name}"] = tau_int(replica_observable_series(labels, plaquette, rung))
     if defect_action is not None:
         summary["defect_action"] = rung_moments(labels, defect_action, n_rungs)
+    if topology is not None and len(topology) > 0:
+        summary["topology_top"] = topology_summary(labels, topology, topology_steps, n_rungs - 1, int(volume))
     return summary
