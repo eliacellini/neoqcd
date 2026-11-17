@@ -264,6 +264,10 @@ class Wilson_action:
     def from_plaquettes(self, plaquettes, defect):
         retr = plaquettes[0].new_zeros(plaquettes[0].shape)
         has_defect = self._uses_defect()
+        # The link factors in the precision of the plaquettes: the defect mask of
+        # Defect.create_defect_mask is an integer tensor, and integer * Python float gives float32
+        if has_defect:
+            defect = defect.to(dtype=plaquettes[0].dtype)
         kappa = defect[0] + defect[1] * self.defect_par if has_defect else None
         for (mu, nu), plaq_retr in zip(
             ((mu, nu) for nu in range(1, self.D) for mu in range(nu)), plaquettes

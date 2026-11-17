@@ -75,5 +75,21 @@ class HierarchicalDefectTest(unittest.TestCase):
         self.assertLess((sun.SUN_mul(sun.SUN_dagger(full), full) - identity).abs().max().item(), 1e-12)
 
 
+class WilsonActionPrecisionTest(unittest.TestCase):
+    def test_link_factors_of_an_integer_defect_mask_are_double(self):
+        # Defect.create_defect_mask is an int64 tensor: int64 * Python float would give float32 link
+        # factors (relative error ~3e-8 on bc = 0.3)
+        from neoqcd.theory import Wilson_action
+        from neoqcd.utils import Defect
+        T, L = 4, 4
+        torch.manual_seed(0)
+        defect = Defect(4, T, L, dsize=2, time_slice=1, space_slice=1).create_defect_mask()
+        self.assertEqual(defect.dtype, torch.int64)
+        pars = SimpleNamespace(N=3, D=4, device=torch.device("cpu"))
+        cfgs = sun.SUN_haar((2, 4, T, L, L, L, 3), dtype=torch.cdouble)
+        action = Wilson_action(pars, 6.0, 0.3)
+        self.assertTrue(torch.equal(action(cfgs, defect), action(cfgs, defect.double())))
+
+
 if __name__ == "__main__":
     unittest.main()
