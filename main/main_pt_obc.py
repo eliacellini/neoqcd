@@ -843,9 +843,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Save the rung of every chain slot and its plaquette after each step to replica_history.npz "
-        "(rewritten every --log-every steps), and report round trips and the plaquette tau_int in run_meta.json.",
+        "(rewritten during the run, see --replica-history-save-minutes, and at the end), and report round "
+        "trips and the plaquette tau_int in run_meta.json.",
     )
     parser.add_argument("--no-save-replica-history", dest="save_replica_history", action="store_false")
+    parser.add_argument(
+        "--replica-history-save-minutes",
+        type=float,
+        default=10.0,
+        help="Rewrite replica_history.npz during the run at most once per this many wall-clock minutes, at a "
+        "log step (0: at every log step, as before). Each rewrite compresses the whole history so far, so "
+        "rewriting it every --log-every steps made the cost per step grow with the steps done (+50%% at "
+        "3000 steps of 8^4). The history is written at the end of the run in any case, a stop by "
+        "--max-run-minutes included; the rewrites only cover a job killed before the end.",
+    )
     parser.add_argument("--main-dir", type=str, default=os.getcwd(), help="Project/output root directory")
     parser.add_argument("--output-dir", type=str, default=None, help="If set, use this directory for logs")
     parser.add_argument("--run-name", type=str, default="")
@@ -1515,6 +1526,7 @@ def main(args: argparse.Namespace) -> None:
         )
 
     last_log_elapsed = 0.0
+    history_saved_t = time.time()  # last rewrite of replica_history.npz during the run
     # Optional profile of whole REX steps on rank 0: the phases are labelled with record_function so
     # that the table attributes the time to the equilibrium sweep, the swap step and the bookkeeping.
     profiler = None
@@ -1829,8 +1841,9 @@ def main(args: argparse.Namespace) -> None:
                         float(gpu_memory.get("gpu_memory/total_gb", float("nan"))),
                     ]
                 )
-            if history_labels:
+            if history_labels and time.time() - history_saved_t >= 60.0 * float(args.replica_history_save_minutes):
                 save_replica_history()
+                history_saved_t = time.time()
         if region is not None:
             region.__exit__(None, None, None)
             phase_seconds["bookkeeping"] = phase_seconds.get("bookkeeping", 0.0) + _phase_clock() - phase_t0
