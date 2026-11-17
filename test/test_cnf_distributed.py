@@ -79,7 +79,62 @@ def _main_worker(rank, world_size, port, argv):
     module.main(argv)
 
 
+def _fused_worker(rank, world_size, port, argv, emulate, count_file):
+    # main_cnf_rex.py with the kernel of the HB+OR sweeps in its CPU emulation (--fused-kernels turns it on;
+    # HBOR.fused_emulate lets it run on CPU tensors), counting the sweeps the kernel ran
+    _environment(rank, world_size, port)
+    import neoqcd.fused as fused
+    from neoqcd.mcmc import HBOR
+    HBOR.fused_emulate = bool(emulate)
+    original, calls = fused.hbor_call, [0]
+
+    def counted(*args, **kwargs):
+        out = original(*args, **kwargs)
+        calls[0] += out is not None
+        return out
+
+    fused.hbor_call = counted
+    spec = importlib.util.spec_from_file_location("main_cnf_rex", ROOT / "main" / "main_cnf_rex.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main(argv)
+    Path(f"{count_file}.rank{rank}").write_text(str(calls[0]))
+
+
 class DistributedPathGradientTest(unittest.TestCase):
+    def test_training_with_the_fused_sweeps_equals_the_torch_one(self):
+        # The defect smearing class of the 16^4 trainings (SU(3), D = 4: the kernel applies), two ranks,
+        # same seed: the kernel changes only the sampling sweeps, which agree with the torch ones to
+        # rounding, so the losses and the swap decisions of every epoch agree too.
+        with tempfile.TemporaryDirectory() as directory:
+            base = ["--architecture", "defect-hyper-smearing", "--hyper-smearing-mode", "class", "--domain", "defect",
+                    "--D", "4", "--T", "6", "--L", "6", "--beta", "6", "--defect-size", "1", "--time-slice", "3",
+                    "--space-slice", "2", "--parameter-min", "0.9", "--parameter-max", "1", "--replicas", "2",
+                    "--batch-size", "2", "--orsteps", "1", "--mcmc-steps", "1", "--warmup", "2", "--epochs", "3",
+                    "--save-every", "3", "--swap-parity", "even_odd", "--lr", "1e-2", "--seed", "11"]
+            runs = {}
+            for name, extra in (("torch", []), ("fused", ["--fused-kernels"])):
+                out = Path(directory) / name
+                count = Path(directory) / f"{name}.count"
+                mp.spawn(_fused_worker, args=(2, _free_port(), [*base, *extra, "--output-dir", str(out)],
+                                              name == "fused", str(count)), nprocs=2, join=True)
+                lines = [json.loads(line) for line in (out / "metrics.jsonl").read_text().splitlines()]
+                calls = sum(int(Path(f"{count}.rank{r}").read_text()) for r in range(2))
+                runs[name] = (lines, calls)
+            (torch_lines, torch_calls), (fused_lines, fused_calls) = runs["torch"], runs["fused"]
+            self.assertEqual(torch_calls, 0)
+            self.assertGreater(fused_calls, 0)
+            self.assertEqual(len(torch_lines), 3)
+            for a, b in zip(torch_lines, fused_lines):
+                self.assertEqual(a["epoch"], b["epoch"])
+                self.assertEqual(a["swap_acceptance_by_edge"], b["swap_acceptance_by_edge"])
+                for key in ("losses_by_rung", "pinn_by_rung"):
+                    x, y = torch.tensor(a[key], dtype=torch.float64), torch.tensor(b[key], dtype=torch.float64)
+                    self.assertTrue(bool(torch.isfinite(x).all()), key)
+                    torch.testing.assert_close(y, x, rtol=1e-8, atol=1e-12, msg=key)
+            self.assertGreater(max(abs(v) for v in torch_lines[-1]["pinn_by_rung"]), 0.0)
+            self.assertGreater(max(line["swap_acceptance"] for line in torch_lines), 0.0)  # swaps were decided
+
     def test_gradient_equals_the_single_process_one(self):
         mp.spawn(_gradient_worker, args=(3, _free_port()), nprocs=3, join=True)
 
