@@ -216,8 +216,20 @@ SNF_HD bool snf_overrelax(SnfC<T> sa, SnfC<T> sb, SnfC<T>* c0, SnfC<T>* c1) {
     return true;
 }
 
+// Wilson cooling of the subgroup (topology.cool_torch): the SU(2) element V = W^dagger, W = R / k, that
+// maximizes Re Tr(V R); no change for k = 0
+template <typename T>
+SNF_HD bool snf_cool(SnfC<T> sa, SnfC<T> sb, SnfC<T>* c0, SnfC<T>* c1) {
+    const T k2 = ((sa.re * sa.re + sa.im * sa.im) + sb.re * sb.re) + sb.im * sb.im;
+    if (!(k2 > 0)) return false;
+    const T scale = (T)1 / sqrt(k2);
+    *c0 = c_scale(scale, c_conj(sa));
+    *c1 = c_scale(scale, c_neg(sb));
+    return true;
+}
+
 // One link: sample b, site x = sites[i] of the mask of direction mu, tid = b n + i. MODE 0: heat
-// bath, 1: overrelaxation.
+// bath, 1: overrelaxation, 2: cooling.
 template <typename T, int MODE, bool DEFECT>
 SNF_HD void snf_link(const SnfArgs& a, int mu, const int64_t* sites, int64_t n, int64_t tid) {
     typedef SnfC<T> C;
@@ -293,7 +305,8 @@ SNF_HD void snf_link(const SnfArgs& a, int mu, const int64_t* sites, int64_t n, 
         const C sb = c_scale((T)0.5, c_sub(R01, c_conj(R10)));
         C c0, c1;
         const bool apply = MODE == 0 ? snf_heatbath<T>(sa, sb, q + 6 * phb * rstride, rstride, beta, &c0, &c1)
-                                     : snf_overrelax<T>(sa, sb, &c0, &c1);
+                         : MODE == 1 ? snf_overrelax<T>(sa, sb, &c0, &c1)
+                                     : snf_cool<T>(sa, sb, &c0, &c1);
         if (!apply) continue;
         // mcmc.SU2_left_multiply_SU3
         SNF_UNROLL
@@ -406,8 +419,167 @@ __global__ void __launch_bounds__(SNF_THREADS) snf_plaquette_kernel(const SnfPla
 }
 #endif
 
+// topology.cool: `steps` sweeps of Wilson cooling over the masks m = 0 .. 2D - 1, the standard action
+template <typename T>
+static int snf_cooling(const SnfArgs& a, int steps, void* stream) {
+    int err = 0;
+    for (int s = 0; s < steps && !err; ++s)
+        for (int m = 0; m < SNF_MASKS && !err; ++m) err = snf_mask<T, 2, false>(a, m, stream);
+    return err;
+}
+
+// The clover topological charge density at one site (topology.clover_charge_torch):
+// C_{mu nu} = the four plaquettes around x in the (mu, nu) plane, A = (C - C^dagger) - Tr(C - C^dagger) / 3,
+// F = A / (8 i), q = [Tr F01 F23 - Tr F02 F13 + Tr F03 F12] / (4 pi^2) = -[Tr A01 A23 - ...] / (256 pi^2).
+// "x + d" is the site of coordinate c_d - 1, "x - d" the one of c_d + 1, as in snf_link.
+template <typename T>
+SNF_HD void snf_clover_a(SnfC<T> A[9], const SnfC<T>* field, int32_t V, int mu, int nu, int32_t x,
+                         const int32_t fwd[SNF_D], const int32_t bwd[SNF_D]) {
+    typedef SnfC<T> C;
+    C L[9], M[9], P[9], S[9];
+    const C* Umu = field + (int64_t)mu * V * 9;
+    const C* Unu = field + (int64_t)nu * V * 9;
+    const int32_t pm = fwd[mu], pn = fwd[nu], mm = bwd[mu], mn = bwd[nu];
+    // leaf 1: U_mu(x) U_nu(x+mu) U_mu^dag(x+nu) U_nu^dag(x)
+    m_load(L, Umu + (int64_t)x * 9);
+    m_load(M, Unu + (int64_t)(x + pm) * 9);
+    m_mul<T, false, false>(P, L, M);
+    m_load(M, Umu + (int64_t)(x + pn) * 9);
+    m_mul<T, false, true>(L, P, M);
+    m_load(M, Unu + (int64_t)x * 9);
+    m_mul<T, false, true>(S, L, M);
+    // leaf 2: U_nu(x) U_mu^dag(x+nu-mu) U_nu^dag(x-mu) U_mu(x-mu)
+    m_load(L, Unu + (int64_t)x * 9);
+    m_load(M, Umu + (int64_t)(x + pn + mm) * 9);
+    m_mul<T, false, true>(P, L, M);
+    m_load(M, Unu + (int64_t)(x + mm) * 9);
+    m_mul<T, false, true>(L, P, M);
+    m_load(M, Umu + (int64_t)(x + mm) * 9);
+    m_mul<T, false, false>(P, L, M);
+    SNF_UNROLL
+    for (int e = 0; e < 9; ++e) S[e] = c_add(S[e], P[e]);
+    // leaf 3: U_mu^dag(x-mu) U_nu^dag(x-mu-nu) U_mu(x-mu-nu) U_nu(x-nu)
+    m_load(L, Umu + (int64_t)(x + mm) * 9);
+    m_load(M, Unu + (int64_t)(x + mm + mn) * 9);
+    m_mul<T, true, true>(P, L, M);
+    m_load(M, Umu + (int64_t)(x + mm + mn) * 9);
+    m_mul<T, false, false>(L, P, M);
+    m_load(M, Unu + (int64_t)(x + mn) * 9);
+    m_mul<T, false, false>(P, L, M);
+    SNF_UNROLL
+    for (int e = 0; e < 9; ++e) S[e] = c_add(S[e], P[e]);
+    // leaf 4: U_nu^dag(x-nu) U_mu(x-nu) U_nu(x-nu+mu) U_mu^dag(x)
+    m_load(L, Unu + (int64_t)(x + mn) * 9);
+    m_load(M, Umu + (int64_t)(x + mn) * 9);
+    m_mul<T, true, false>(P, L, M);
+    m_load(M, Unu + (int64_t)(x + mn + pm) * 9);
+    m_mul<T, false, false>(L, P, M);
+    m_load(M, Umu + (int64_t)x * 9);
+    m_mul<T, false, true>(P, L, M);
+    SNF_UNROLL
+    for (int e = 0; e < 9; ++e) S[e] = c_add(S[e], P[e]);
+    // A = (C - C^dagger) - Tr(C - C^dagger) / 3
+    SNF_UNROLL
+    for (int i = 0; i < 3; ++i) {
+        SNF_UNROLL
+        for (int k = 0; k < 3; ++k) A[3 * i + k] = c_sub(S[3 * i + k], c_conj(S[3 * k + i]));
+    }
+    const SnfC<T> tr3 = c_scale((T)1 / (T)3, c_add(c_add(A[0], A[4]), A[8]));
+    A[0] = c_sub(A[0], tr3);
+    A[4] = c_sub(A[4], tr3);
+    A[8] = c_sub(A[8], tr3);
+}
+
+// Re Tr(A B)
+template <typename T> SNF_HD T snf_retr_mul(const SnfC<T> A[9], const SnfC<T> B[9]) {
+    T r = 0;
+    SNF_UNROLL
+    for (int i = 0; i < 3; ++i) {
+        SNF_UNROLL
+        for (int j = 0; j < 3; ++j) r += A[3 * i + j].re * B[3 * j + i].re - A[3 * i + j].im * B[3 * j + i].im;
+    }
+    return r;
+}
+
+template <typename T>
+SNF_HD void snf_charge_site(const SnfPlaqArgs& a, int64_t tid) {
+    typedef SnfC<T> C;
+    const int64_t b = tid / a.volume;
+    const int32_t x = (int32_t)(tid - b * a.volume);
+    const int32_t V = (int32_t)a.volume;
+    const C* field = static_cast<const C*>(a.links) + b * ((int64_t)SNF_D * V * 9);
+    int32_t fwd[SNF_D], bwd[SNF_D];
+    int32_t stride = 1;
+    SNF_UNROLL
+    for (int d = SNF_D - 1; d >= 0; --d) {
+        const int32_t L = (int32_t)a.extent[d];
+        const int32_t c = (x / stride) % L;
+        fwd[d] = c == 0 ? (L - 1) * stride : -stride;
+        bwd[d] = c == L - 1 ? -(L - 1) * stride : stride;
+        stride *= L;
+    }
+    C A[9], B[9];
+    snf_clover_a<T>(A, field, V, 0, 1, x, fwd, bwd);
+    snf_clover_a<T>(B, field, V, 2, 3, x, fwd, bwd);
+    T total = snf_retr_mul<T>(A, B);
+    snf_clover_a<T>(A, field, V, 0, 2, x, fwd, bwd);
+    snf_clover_a<T>(B, field, V, 1, 3, x, fwd, bwd);
+    total -= snf_retr_mul<T>(A, B);
+    snf_clover_a<T>(A, field, V, 0, 3, x, fwd, bwd);
+    snf_clover_a<T>(B, field, V, 1, 2, x, fwd, bwd);
+    total += snf_retr_mul<T>(A, B);
+    const T pi = (T)3.141592653589793;
+    static_cast<T*>(a.out)[tid] = -total / ((T)256 * pi * pi);
+}
+
+#ifdef __CUDACC__
+template <typename T>
+__global__ void __launch_bounds__(SNF_THREADS) snf_charge_kernel(const SnfPlaqArgs a) {
+    const int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < a.batch * a.volume) snf_charge_site<T>(a, tid);
+}
+#endif
+
 extern "C" {
 int snf_args_size(void) { return (int)sizeof(SnfArgs); }
+
+// `steps` sweeps of Wilson cooling of the links of a->sites (in place). Returns 0 on success, -1 for an
+// unsupported dtype, a cudaError_t code otherwise.
+int snf_cool(const SnfArgs* a, int steps, void* stream) {
+#ifdef __CUDACC__
+    int previous = -1;
+    int err = (int)cudaGetDevice(&previous);
+    if (err) return err;
+    if (previous != a->device && (err = (int)cudaSetDevice(a->device))) return err;
+#endif
+    int code = a->dtype == 0 ? snf_cooling<double>(*a, steps, stream) : -1;
+#ifdef __CUDACC__
+    if (previous != a->device) cudaSetDevice(previous);
+#endif
+    return code;
+}
+
+// The clover charge density of every site of every sample, one thread per site.
+int snf_topological_charge(const SnfPlaqArgs* a, void* stream) {
+    if (a->dtype != 0) return -1;
+    const int64_t total = a->batch * a->volume;
+    if (total == 0) return 0;
+#ifdef __CUDACC__
+    int previous = -1;
+    int err = (int)cudaGetDevice(&previous);
+    if (err) return err;
+    if (previous != a->device && (err = (int)cudaSetDevice(a->device))) return err;
+    const int64_t blocks = (total + SNF_THREADS - 1) / SNF_THREADS;
+    snf_charge_kernel<double><<<(unsigned)blocks, SNF_THREADS, 0, (cudaStream_t)stream>>>(*a);
+    err = (int)cudaGetLastError();
+    if (previous != a->device) cudaSetDevice(previous);
+    return err;
+#else
+    (void)stream;
+    for (int64_t tid = 0; tid < total; ++tid) snf_charge_site<double>(*a, tid);
+    return 0;
+#endif
+}
 int snf_plaq_args_size(void) { return (int)sizeof(SnfPlaqArgs); }
 
 // The plaquette sums of every site of every sample, one thread per site. Returns 0 on success, -1 for
@@ -457,6 +629,8 @@ int snf_init(int device) {
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, false>);
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, true>);
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_plaquette_kernel<double>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 2, false>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_charge_kernel<double>);
     if (previous != device) cudaSetDevice(previous);
     return err;
 #else
@@ -653,6 +827,10 @@ class _Backend:
         lib.snf_plaq_args_size.restype = ctypes.c_int
         lib.snf_plaquette.argtypes = [ctypes.POINTER(_PlaqArgs), ctypes.c_void_p]
         lib.snf_plaquette.restype = ctypes.c_int
+        lib.snf_cool.argtypes = [ctypes.POINTER(_Args), ctypes.c_int, ctypes.c_void_p]
+        lib.snf_cool.restype = ctypes.c_int
+        lib.snf_topological_charge.argtypes = [ctypes.POINTER(_PlaqArgs), ctypes.c_void_p]
+        lib.snf_topological_charge.restype = ctypes.c_int
         lib.snf_error_string.argtypes = [ctypes.c_int]
         lib.snf_error_string.restype = ctypes.c_char_p
         if lib.snf_plaq_args_size() != ctypes.sizeof(_PlaqArgs):
@@ -699,6 +877,16 @@ class _Backend:
         code = self._lib.snf_plaquette(ctypes.byref(args), stream)
         if code != 0:
             raise RuntimeError(f'fused plaquette ({self.target}) failed: code {code}: {self.error_string(code)}')
+
+    def run_cool(self, args, steps, stream):
+        code = self._lib.snf_cool(ctypes.byref(args), int(steps), stream)
+        if code != 0:
+            raise RuntimeError(f'fused cooling ({self.target}) failed: code {code}: {self.error_string(code)}')
+
+    def run_charge(self, args, stream):
+        code = self._lib.snf_topological_charge(ctypes.byref(args), stream)
+        if code != 0:
+            raise RuntimeError(f'fused charge ({self.target}) failed: code {code}: {self.error_string(code)}')
 
 
 def _load(backend_class, target, device):
@@ -908,19 +1096,35 @@ def plaquette(cfgs, N=3, emulate=False):
     traffic for 64 chains at 16^4; main_pt_obc.py measures it for the replica history every step).
     None when the kernel does not apply: not SU(3) in D = 4 complex128, gradients, the CPU without
     `emulate`, or no kernel library (then one warning)."""
-    if (cfgs.dim() != 8 or int(cfgs.shape[1]) != 4 or int(N) != 3 or tuple(cfgs.shape[-2:]) != (3, 3)
-            or cfgs.dtype != torch.complex128 or (torch.is_grad_enabled() and cfgs.requires_grad)):
+    if int(N) != 3:
         return None
+    out = _site_kernel(cfgs, emulate, 'run_plaquette', 'fused plaquette: {}; using sun.plaquette_SUN')
+    return None if out is None else out.mean(dim=1) / 6.0 / float(N)
+
+
+def _site_backend(cfgs, emulate, warning):
+    # The library for a kernel over the sites of SU(3) configurations in D = 4 (complex128, no gradients),
+    # or None (then one warning if the library is missing)
+    if (cfgs.dim() != 8 or int(cfgs.shape[1]) != 4 or tuple(cfgs.shape[-2:]) != (3, 3)
+            or cfgs.dtype != torch.complex128 or (torch.is_grad_enabled() and cfgs.requires_grad)):
+        return None, None
     if cfgs.device.type == 'cuda':
         target = 'cuda'
     elif cfgs.device.type == 'cpu' and emulate:
         target = 'cpu'
     else:
-        return None
+        return None, None
     try:
-        backend = load_backend(target, cfgs.device)
+        return load_backend(target, cfgs.device), target
     except BackendUnavailable as exc:
-        _warn_once(f'fused plaquette: {exc}; using sun.plaquette_SUN')
+        _warn_once(warning.format(exc))
+        return None, None
+
+
+def _site_kernel(cfgs, emulate, method, warning):
+    # One value per site and sample, (B, V) float64, from the kernel `method` of the library (SnfPlaqArgs)
+    backend, target = _site_backend(cfgs, emulate, warning)
+    if backend is None:
         return None
     links = cfgs.detach().contiguous()
     batch, volume = int(links.shape[0]), int(torch.Size(links.shape[2:6]).numel())
@@ -933,5 +1137,47 @@ def plaquette(cfgs, N=3, emulate=False):
     a.dtype = 0
     a.device = links.device.index if links.device.index is not None else 0
     stream = torch.cuda.current_stream(links.device).cuda_stream if target == 'cuda' else None
-    backend.run_plaquette(a, stream)
-    return out.mean(dim=1) / 6.0 / float(N)
+    getattr(backend, method)(a, stream)
+    return out
+
+
+def clover_charge(cfgs, emulate=False):
+    """topology.clover_charge_torch through one kernel (snf_topological_charge): the clover topological
+    charge of each configuration, (B,) float64. None when the kernel does not apply (see plaquette)."""
+    out = _site_kernel(cfgs, emulate, 'run_charge', 'fused clover charge: {}; using topology.clover_charge_torch')
+    return None if out is None else out.sum(dim=1)
+
+
+_COOLING_LINKS = {}
+
+
+def cooling(cfgs, steps, emulate=False):
+    """topology.cool_torch through the kernel (snf_cool, MODE 2 of snf_link): `steps` sweeps of Wilson
+    cooling of every link (checkerboard masks m = eo + 2 mu in order, SU(2) subgroups 0, 1, 2), on a copy.
+    None when the kernel does not apply."""
+    backend, target = _site_backend(cfgs, emulate, 'fused cooling: {}; using topology.cool_torch')
+    if backend is None:
+        return None
+    T, L = int(cfgs.shape[2]), int(cfgs.shape[3])
+    if tuple(cfgs.shape[3:6]) != (L, L, L):
+        return None  # the checkerboard masks of create_mask: T x L^3
+    key = (T, L, str(cfgs.device))
+    links = _COOLING_LINKS.get(key)
+    if links is None:
+        from neoqcd.utils import create_mask
+        links = sun.MaskedLinks(create_mask(4, T, L).to(cfgs.device), 4)
+        _COOLING_LINKS[key] = links
+    out = cfgs.detach().contiguous().clone()
+    a = _Args()
+    a.links, a.rand, a.kappa, a.beta = out.data_ptr(), None, None, None
+    for m, sites in enumerate(links.sites):
+        a.sites[m], a.n[m] = sites.data_ptr(), sites.numel()
+    check_int32(links.V * 4, 'links of the lattice')
+    a.batch, a.volume = int(out.shape[0]), links.V
+    a.extent[:] = out.shape[2:6]
+    a.kappa_bstride = a.beta_bstride = 0
+    a.orsteps, a.has_defect, a.reverse, a.dtype = 0, 0, 0, 0
+    a.device = out.device.index if out.device.index is not None else 0
+    stream = torch.cuda.current_stream(out.device).cuda_stream if target == 'cuda' else None
+    backend.run_cool(a, steps, stream)
+    return out

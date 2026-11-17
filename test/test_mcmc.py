@@ -110,6 +110,23 @@ class LocalActionChangeTest(unittest.TestCase):
                 self.assertLess((got - ref).abs().max().item(), 1e-11)
 
 
+class CreateMaskTest(unittest.TestCase):
+    def test_vectorized_masks_equal_the_loop_over_sites(self):
+        def loop(D, T, L):
+            shape = (2 * D, D, T) + (L,) * (D - 1)
+            mask = torch.zeros(shape, dtype=int)
+            for mu in range(D):
+                for site in torch.cartesian_prod(*[torch.arange(n) for n in shape[2:]]).reshape(-1, D).tolist():
+                    mask[(sum(site) % 2 + 2 * mu, mu) + tuple(site)] = 1
+            return mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+
+        for D, T, L in ((2, 4, 3), (3, 2, 5), (4, 4, 3), (4, 3, 4)):
+            with self.subTest(D=D, T=T, L=L):
+                got, expected = create_mask(D, T, L), loop(D, T, L)
+                self.assertEqual(got.dtype, torch.int64)
+                self.assertTrue(torch.equal(got, expected))
+
+
 class PlaquetteTest(unittest.TestCase):
     def test_mean_plaquette_equals_the_loop_over_whole_rolled_configurations(self):
         # sun.plaquette_SUN through plaquette_retr against the former loop, on unequal extents

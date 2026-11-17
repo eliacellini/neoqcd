@@ -204,27 +204,16 @@ def betafromar0(ar0_input):
 ### mask utils
 
 def create_mask(D, T, L):
-    mask_shape = (2*D, D, T)
-    for i in range(1,D):
-        mask_shape += (L,)
-
-    mask = torch.zeros(mask_shape, dtype = int)
+    """Checkerboard masks of the link updates, (2D, 1, D, T, L, ..., 1, 1) int64: block m = eo + 2 mu selects
+    the links U_mu(x) of the sites of parity eo = (t + x + y + ...) mod 2. Built with tensor operations (a
+    Python loop over the sites took ~30 s at 30^4)."""
+    extent = (T,) + (L,) * (D - 1)
+    coords = torch.meshgrid(*[torch.arange(n) for n in extent], indexing="ij")
+    parity = sum(coords) % 2
+    mask = torch.zeros((2 * D, D) + extent, dtype=torch.int64)
     for mu in range(D):
-        for t in range(T):
-            for x in range(L):
-                if(D>2):
-                    for y in range(L):
-                        if(D>3):
-                            for z in range(L):
-                                parity = t + x + y + z
-                                mask[parity%2+mu*2,mu,t,x,y,z] = 1
-                        else:
-                            parity = t + x + y
-                            mask[parity%2+mu*2,mu,t,x,y] = 1
-                else:
-                    parity = t + x
-                    mask[parity%2+mu*2,mu,t,x] = 1
-
+        for eo in range(2):
+            mask[eo + 2 * mu, mu] = (parity == eo).to(torch.int64)
     return mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
 
 class Defect():
