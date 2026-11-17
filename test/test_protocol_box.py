@@ -264,7 +264,7 @@ class NEOREXProtocolBoxTest(unittest.TestCase):
 class MainProtocolBoxTest(unittest.TestCase):
     """main_pt_obc.py with --protocol-box on two ranks: O-REX, and NEO-REX training its smearing flow."""
 
-    def _run(self, extra):
+    def _run(self, extra, check=None):
         from test.test_cnf_neorex import _free_port, _multirank_worker
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -275,13 +275,22 @@ class MainProtocolBoxTest(unittest.TestCase):
                     "--protocol-patch-halfsize", "1", "--protocol-symmetric-updates", "--protocol-box", *extra]
             mp.spawn(_multirank_worker, args=(2, _free_port(), argv), nprocs=2, join=True)
             meta = json.loads((root / "run" / "run_meta.json").read_text(encoding="utf-8"))
+            if check is not None:
+                check(root / "run")
         swap = meta["swap"]
         self.assertEqual(swap["total_proposed"], sum(swap["link_proposed"]))
         self.assertGreater(swap["total_proposed"], 0)
         self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in meta["work"]["link_mean"]))
 
-    def test_orex(self):
-        self._run(["--algorithm", "orex", "--orex-protocol-steps", "2"])
+    def test_orex_with_the_step_profiles(self):
+        def check(run_dir):
+            self.assertIn("swap/mcmc", (run_dir / "step_profile.txt").read_text(encoding="utf-8"))
+            python = (run_dir / "step_cprofile.txt").read_text(encoding="utf-8")
+            self.assertIn("by tottime", python)
+            self.assertIn("_run_orex_protocol", python)
+
+        self._run(["--algorithm", "orex", "--orex-protocol-steps", "2", "--profile-steps", "1", "--profile-python"],
+                  check)
 
     def test_neorex_training_the_smearing_flow(self):
         self._run(["--algorithm", "neorex", "--nf-layer-type", "smearing", "--use-hyper-smearing",

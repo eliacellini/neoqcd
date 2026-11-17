@@ -879,6 +879,13 @@ def parse_args() -> argparse.Namespace:
         "write the operator tables and the time of each phase to <output-dir>/step_profile.txt.",
     )
     parser.add_argument(
+        "--profile-python",
+        action="store_true",
+        help="With --profile-steps, also run cProfile over the same steps on rank 0 and write the Python "
+        "functions by own and by cumulative time to <output-dir>/step_cprofile.txt: where the host time "
+        "goes outside the torch operators (cProfile slows Python calls, so the phases run slower).",
+    )
+    parser.add_argument(
         "--save-link-work-values",
         action="store_true",
         help="For O-REX/NEO-REX, save every proposed swap work by ladder link to link_work_values.npz.",
@@ -1592,6 +1599,7 @@ def main(args: argparse.Namespace) -> None:
     # Optional profile of whole REX steps on rank 0: the phases are labelled with record_function so
     # that the table attributes the time to the equilibrium sweep, the swap step and the bookkeeping.
     profiler = None
+    py_profiler = None  # cProfile of the same steps, --profile-python
     profile_first, profile_last = 1, int(args.profile_steps)  # steps [1, profile_steps]; step 0 warms up
     phase_seconds = {}
 
@@ -1624,6 +1632,10 @@ def main(args: argparse.Namespace) -> None:
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             profiler = torch.profiler.profile(activities=activities, record_shapes=False)
             profiler.__enter__()
+            if bool(args.profile_python):
+                import cProfile
+                py_profiler = cProfile.Profile()
+                py_profiler.enable()
         phase_t0 = _phase_clock() if profiling else None
         region = torch.profiler.record_function("equilibrium_sweep") if profiling else None
         if region is not None:
@@ -1910,6 +1922,8 @@ def main(args: argparse.Namespace) -> None:
             region.__exit__(None, None, None)
             phase_seconds["bookkeeping"] = phase_seconds.get("bookkeeping", 0.0) + _phase_clock() - phase_t0
         if profiler is not None and step == profile_last:
+            if py_profiler is not None:
+                py_profiler.disable()
             profiler.__exit__(None, None, None)
             averages = profiler.key_averages()
             n_prof = profile_last - profile_first + 1
@@ -1928,6 +1942,14 @@ def main(args: argparse.Namespace) -> None:
             print("step_profile_phases=" + json.dumps({k: round(v / n_prof, 4) for k, v in phase_seconds.items()})
                   + f"  step_profile_path={out_dir / 'step_profile.txt'}", flush=True)
             profiler = None
+            if py_profiler is not None:
+                import pstats
+                with open(out_dir / "step_cprofile.txt", "w", encoding="utf-8") as handle:
+                    for key in ("tottime", "cumulative"):
+                        handle.write(f"# Python functions by {key} time, {n_prof} REX steps on rank 0 (cProfile)\n")
+                        pstats.Stats(py_profiler, stream=handle).sort_stats(key).print_stats(60)
+                print(f"step_cprofile_path={out_dir / 'step_cprofile.txt'}", flush=True)
+                py_profiler = None
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []
