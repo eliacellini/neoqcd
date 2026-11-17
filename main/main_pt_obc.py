@@ -1740,7 +1740,11 @@ def main(args: argparse.Namespace) -> None:
         if bool(args.save_replica_history):
             # The plaquette of each local chain (whole lattice, Re Tr / N), gathered to rank 0 and
             # stored with the rung its slot carries now, so the carrier of any rung can be followed.
-            local_plaquette = plaquette_SUN(cfgs, args.D, args.N).to(dtype=torch.float64)
+            # one kernel with --fused-kernels (sun.plaquette_SUN where it does not apply)
+            local_plaquette = fused.plaquette(cfgs, args.N) if bool(args.fused_kernels) else None
+            if local_plaquette is None:
+                local_plaquette = plaquette_SUN(cfgs, args.D, args.N)
+            local_plaquette = local_plaquette.to(dtype=torch.float64)
             gather_list = (
                 [torch.zeros_like(local_plaquette) for _ in range(world_size)] if rank == 0 else None
             )

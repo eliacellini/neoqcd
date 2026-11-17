@@ -349,8 +349,89 @@ static int snf_update(const SnfArgs& a, void* stream) {
     return err;
 }
 
+// Arguments of snf_plaquette (mirrored by the ctypes structure _PlaqArgs in fused.py)
+struct SnfPlaqArgs {
+    const void* links;               // (B, D, V, 3, 3) complex: the configurations
+    void* out;                       // (B, V) real: the sum over the planes of Re Tr P at each site
+    int64_t batch, volume;           // B, V
+    int64_t extent[SNF_D];           // extents (T, L, L, L)
+    int32_t dtype, device;           // dtype 0: complex128
+};
+
+// sun.plaquette_SUN at one site, before the average: for nu = 1 .. D - 1 and mu < nu in that order,
+// sun.plaquette_retr: A = U_mu(x) U_nu(x + mu), B = U_nu(x) U_mu(x + nu), Re Tr(A B^dagger) =
+// sum_e Re(A_e conj(B_e)), with "x + d" the site of coordinate c_d - 1 as in snf_link
+template <typename T>
+SNF_HD void snf_plaquette_site(const SnfPlaqArgs& a, int64_t tid) {
+    typedef SnfC<T> C;
+    const int64_t b = tid / a.volume;
+    const int32_t x = (int32_t)(tid - b * a.volume);
+    const int32_t V = (int32_t)a.volume;
+    const C* field = static_cast<const C*>(a.links) + b * ((int64_t)SNF_D * V * 9);
+    int32_t fwd[SNF_D];
+    int32_t stride = 1;
+    SNF_UNROLL
+    for (int d = SNF_D - 1; d >= 0; --d) {
+        const int32_t L = (int32_t)a.extent[d];
+        const int32_t c = (x / stride) % L;
+        fwd[d] = c == 0 ? (L - 1) * stride : -stride;
+        stride *= L;
+    }
+    T total = 0;
+    SNF_UNROLL
+    for (int nu = 1; nu < SNF_D; ++nu) {
+        SNF_UNROLL
+        for (int mu = 0; mu < nu; ++mu) {
+            C U[9], W[9], A[9], B[9];
+            m_load(U, field + ((int64_t)mu * V + x) * 9);
+            m_load(W, field + ((int64_t)nu * V + x + fwd[mu]) * 9);
+            m_mul<T, false, false>(A, U, W);
+            m_load(U, field + ((int64_t)nu * V + x) * 9);
+            m_load(W, field + ((int64_t)mu * V + x + fwd[nu]) * 9);
+            m_mul<T, false, false>(B, U, W);
+            T r = A[0].re * B[0].re + A[0].im * B[0].im;
+            SNF_UNROLL
+            for (int e = 1; e < 9; ++e) r += A[e].re * B[e].re + A[e].im * B[e].im;
+            total = (nu == 1 && mu == 0) ? r : total + r;
+        }
+    }
+    static_cast<T*>(a.out)[tid] = total;
+}
+
+#ifdef __CUDACC__
+template <typename T>
+__global__ void __launch_bounds__(SNF_THREADS) snf_plaquette_kernel(const SnfPlaqArgs a) {
+    const int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < a.batch * a.volume) snf_plaquette_site<T>(a, tid);
+}
+#endif
+
 extern "C" {
 int snf_args_size(void) { return (int)sizeof(SnfArgs); }
+int snf_plaq_args_size(void) { return (int)sizeof(SnfPlaqArgs); }
+
+// The plaquette sums of every site of every sample, one thread per site. Returns 0 on success, -1 for
+// an unsupported dtype, a cudaError_t code otherwise.
+int snf_plaquette(const SnfPlaqArgs* a, void* stream) {
+    if (a->dtype != 0) return -1;
+    const int64_t total = a->batch * a->volume;
+    if (total == 0) return 0;
+#ifdef __CUDACC__
+    int previous = -1;
+    int err = (int)cudaGetDevice(&previous);
+    if (err) return err;
+    if (previous != a->device && (err = (int)cudaSetDevice(a->device))) return err;
+    const int64_t blocks = (total + SNF_THREADS - 1) / SNF_THREADS;
+    snf_plaquette_kernel<double><<<(unsigned)blocks, SNF_THREADS, 0, (cudaStream_t)stream>>>(*a);
+    err = (int)cudaGetLastError();
+    if (previous != a->device) cudaSetDevice(previous);
+    return err;
+#else
+    (void)stream;
+    for (int64_t tid = 0; tid < total; ++tid) snf_plaquette_site<double>(*a, tid);
+    return 0;
+#endif
+}
 
 int snf_is_cuda(void) {
 #ifdef __CUDACC__
@@ -375,6 +456,7 @@ int snf_init(int device) {
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 0, true>);
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, false>);
     if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_kernel<double, 1, true>);
+    if (!err) err = (int)cudaFuncGetAttributes(&attr, (const void*)snf_plaquette_kernel<double>);
     if (previous != device) cudaSetDevice(previous);
     return err;
 #else
@@ -433,6 +515,18 @@ class _Args(ctypes.Structure):
         ('dtype', ctypes.c_int32),
         ('device', ctypes.c_int32),
         ('pad', ctypes.c_int32),
+    ]
+
+class _PlaqArgs(ctypes.Structure):
+    # ctypes mirror of SnfPlaqArgs
+    _fields_ = [
+        ('links', ctypes.c_void_p),
+        ('out', ctypes.c_void_p),
+        ('batch', ctypes.c_int64),
+        ('volume', ctypes.c_int64),
+        ('extent', ctypes.c_int64 * 4),
+        ('dtype', ctypes.c_int32),
+        ('device', ctypes.c_int32),
     ]
 
 # ----------------------------------------------------------------------------------------------
@@ -556,8 +650,14 @@ class _Backend:
         lib.snf_init.restype = ctypes.c_int
         lib.snf_hbor.argtypes = [ctypes.POINTER(_Args), ctypes.c_void_p]
         lib.snf_hbor.restype = ctypes.c_int
+        lib.snf_plaq_args_size.restype = ctypes.c_int
+        lib.snf_plaquette.argtypes = [ctypes.POINTER(_PlaqArgs), ctypes.c_void_p]
+        lib.snf_plaquette.restype = ctypes.c_int
         lib.snf_error_string.argtypes = [ctypes.c_int]
         lib.snf_error_string.restype = ctypes.c_char_p
+        if lib.snf_plaq_args_size() != ctypes.sizeof(_PlaqArgs):
+            raise BackendUnavailable(f'argument layout mismatch (plaquette): library {lib.snf_plaq_args_size()} '
+                                     f'bytes, ctypes {ctypes.sizeof(_PlaqArgs)}')
         if lib.snf_args_size() != ctypes.sizeof(_Args):
             raise BackendUnavailable(f'argument layout mismatch: library {lib.snf_args_size()} bytes, '
                                      f'ctypes {ctypes.sizeof(_Args)}')
@@ -594,6 +694,11 @@ class _Backend:
         code = self._lib.snf_hbor(ctypes.byref(args), stream)
         if code != 0:
             raise RuntimeError(f'fused HBOR ({self.target}) failed: code {code}: {self.error_string(code)}')
+
+    def run_plaquette(self, args, stream):
+        code = self._lib.snf_plaquette(ctypes.byref(args), stream)
+        if code != 0:
+            raise RuntimeError(f'fused plaquette ({self.target}) failed: code {code}: {self.error_string(code)}')
 
 
 def _load(backend_class, target, device):
@@ -794,3 +899,39 @@ def hbor_call(hbor, cfgs, mask, defect, rand=None, reverse=False):
         flat.index_copy_(1, updated, sun.SU3_unitarize(flat.index_select(1, updated)))
     hbor.fused_used = backend.target
     return flat.reshape(cfgs.shape)
+
+
+def plaquette(cfgs, N=3, emulate=False):
+    """sun.plaquette_SUN through one kernel: the mean plaquette Re Tr P / N of each configuration over the
+    sites and the D(D-1)/2 planes, (B,) float64, the same products per site (rounding aside). One read of
+    the links instead of the rolled copies and broadcast products of plaquette_SUN (~90 GB of memory
+    traffic for 64 chains at 16^4; main_pt_obc.py measures it for the replica history every step).
+    None when the kernel does not apply: not SU(3) in D = 4 complex128, gradients, the CPU without
+    `emulate`, or no kernel library (then one warning)."""
+    if (cfgs.dim() != 8 or int(cfgs.shape[1]) != 4 or int(N) != 3 or tuple(cfgs.shape[-2:]) != (3, 3)
+            or cfgs.dtype != torch.complex128 or (torch.is_grad_enabled() and cfgs.requires_grad)):
+        return None
+    if cfgs.device.type == 'cuda':
+        target = 'cuda'
+    elif cfgs.device.type == 'cpu' and emulate:
+        target = 'cpu'
+    else:
+        return None
+    try:
+        backend = load_backend(target, cfgs.device)
+    except BackendUnavailable as exc:
+        _warn_once(f'fused plaquette: {exc}; using sun.plaquette_SUN')
+        return None
+    links = cfgs.detach().contiguous()
+    batch, volume = int(links.shape[0]), int(torch.Size(links.shape[2:6]).numel())
+    check_int32(4 * volume, 'links of the lattice')
+    out = torch.empty((batch, volume), dtype=torch.float64, device=links.device)
+    a = _PlaqArgs()
+    a.links, a.out = links.data_ptr(), out.data_ptr()
+    a.batch, a.volume = batch, volume
+    a.extent[:] = links.shape[2:6]
+    a.dtype = 0
+    a.device = links.device.index if links.device.index is not None else 0
+    stream = torch.cuda.current_stream(links.device).cuda_stream if target == 'cuda' else None
+    backend.run_plaquette(a, stream)
+    return out.mean(dim=1) / 6.0 / float(N)

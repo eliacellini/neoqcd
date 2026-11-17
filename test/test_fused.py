@@ -188,6 +188,29 @@ class FusedHBORTest(unittest.TestCase):
             hbor(cfgs.clone().requires_grad_(True), pars.mask, None)
         self.assertEqual(hbor.fused_used, "cpu")
 
+    def test_plaquette_kernel_equals_plaquette_SUN(self):
+        # unequal extents, links close to the identity (a plaquette far from zero)
+        g = torch.Generator().manual_seed(3)
+        A = torch.randn(3, 4, 4, 5, 6, 3, 3, 3, dtype=torch.cdouble, generator=g)
+        H = 0.5 * (A + A.conj().transpose(-1, -2))
+        H = H - torch.diagonal(H, dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(3, dtype=torch.cdouble)
+        cfgs = torch.linalg.matrix_exp(0.5j * H)
+        expected = sun.plaquette_SUN(cfgs, 4, 3)
+        self.assertGreater(expected.min().item(), 0.1)
+        for device in DEVICES:
+            with self.subTest(device=device):
+                x = cfgs.to(device)
+                got = fused.plaquette(x, 3, emulate=True)
+                self.assertEqual(tuple(got.shape), (3,))
+                self.assertEqual(got.dtype, torch.float64)
+                self.assertLess((got.cpu() - expected).abs().max().item(), 1e-14)
+                self.assertLess((sun.plaquette_SUN(x, 4, 3).cpu() - expected).abs().max().item(), 1e-14)
+        # not applicable: the torch function stays the reference
+        self.assertIsNone(fused.plaquette(cfgs, 3))  # CPU without the emulation
+        self.assertIsNone(fused.plaquette(cfgs.to(torch.complex64), 3, emulate=True))
+        with torch.enable_grad():
+            self.assertIsNone(fused.plaquette(cfgs.clone().requires_grad_(True), 3, emulate=True))
+
     def test_other_dtype_falls_back_with_a_warning(self):
         pars = _pars(4, 4, "cpu")
         hbor = HBOR(pars, beta=6.0)
