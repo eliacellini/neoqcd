@@ -142,12 +142,17 @@ runner. NEO-REX computes **full** action differences for this field rather than
 the cropped-layer halo shortcut. Portable CNF checkpoints are distinct from
 the wrapper's `--neorex-load-flow` checkpoints.
 
-In an O-REX/NEO-REX swap the heatbath runs at both ends of the protocol, and a
+In an O-REX/NEO-REX swap of K steps the heatbath runs at the K - 1 interior
+points of the protocol only (g_1 P_1 g_2 ... P_{K-1} g_K, a palindrome), and a
 chain moving down the ladder applies the inverse of the step its partner takes
 going up (`inverse` of each layer: fixed-point iteration for smearing and
 residual layers, backward integration for a CNF). The two protocols are then
 each other's time reversal, as detailed balance of the swap requires; for a
-CNF the inverse, like the logdet, carries the CF4 integration error.
+CNF the inverse, like the logdet, carries the CF4 integration error. A heatbath
+at either end would not change the distribution of the work, so it is left out:
+O-REX at K = 1 is standard REX. `--algorithm trex` is NEO-REX without heatbath
+(transformed replica exchange): the swap is the flow alone, K layers, trained
+online end-to-end in the work.
 
 ### Evaluating a field with its finite layer
 

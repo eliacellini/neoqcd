@@ -1,4 +1,4 @@
-"""Exact detailed balance of the O-REX and NEO-REX swap kernels on a three-state toy.
+"""Exact detailed balance of the O-REX, NEO-REX and TREX swap kernels on a three-state toy.
 
 Every stochastic update is enumerated over its outcomes, so the swap kernel is
 built exactly from the production protocol loops and checked against the joint
@@ -128,15 +128,17 @@ def _tensor(value):
     return torch.tensor([float(value)], dtype=torch.float64)
 
 
-def _wrapper(mcmc, steps):
+def _wrapper(mcmc, steps, trex=False):
+    # trex: no stochastic blocks, the protocol is the flow alone
     return NEOREXProtocolWrapper(
-        _Shift(), mcmc, steps, stochastic_update=mcmc, stochastic_steps_per_step=1, parameter_name="bc"
+        _Shift(), mcmc, steps, stochastic_update=None if trex else mcmc, stochastic_steps_per_step=1,
+        parameter_name="bc",
     )
 
 
-def _neorex(mcmc, steps):
+def _neorex(mcmc, steps, trex=False):
     pt = object.__new__(NEOREX)
-    pt.ddp_flow = _Local(_wrapper(mcmc, steps))
+    pt.ddp_flow = _Local(_wrapper(mcmc, steps, trex))
     pt.B, pt.rank, pt.world_size = 1, 0, 1
     pt.device, pt.param_dtype = torch.device("cpu"), torch.float64
     return pt
@@ -149,42 +151,93 @@ class SwapDetailedBalanceTests(unittest.TestCase):
         flux = joint[:, None] * kernel
         torch.testing.assert_close(flux, flux.T, atol=1e-12, rtol=0)
 
+    def _orex(self, steps):
+        pt = object.__new__(OutOfEquilibriumParallelTempering)
+        pt.config = OREXPTConfig(
+            batch_size=1, parameter_min=LAMBDA_A, parameter_max=LAMBDA_B,
+            parameter_name="bc", orex_protocol_steps=steps,
+        )
+        pt.B, pt.device, pt.param_dtype, pt.parameter_name = 1, torch.device("cpu"), torch.float64, "bc"
+
+        def run(mcmc, x0, start, target):
+            return pt._run_orex_protocol(
+                _tensor(x0), mcmc, _tensor(start), _tensor(target), torch.tensor([True])
+            )
+
+        return run
+
+    def _loop(self, name, steps, trex=False):
+        def run(mcmc, x0, start, target):
+            out = getattr(_neorex(mcmc, steps, trex), name)(
+                _tensor(x0), _tensor(start), _tensor(target), torch.tensor([True])
+            )
+            return out[0], out[1]
+
+        return run
+
+    def _wrapped(self, steps, trex=False):
+        def run(mcmc, x0, start, target):
+            return _wrapper(mcmc, steps, trex)(_tensor(x0), _tensor(start), _tensor(target))
+
+        return run
+
     def test_orex_protocol(self):
-        for steps in (1, 3):
+        for steps in (1, 2, 3):
             with self.subTest(steps=steps):
-                pt = object.__new__(OutOfEquilibriumParallelTempering)
-                pt.config = OREXPTConfig(
-                    batch_size=1, parameter_min=LAMBDA_A, parameter_max=LAMBDA_B,
-                    parameter_name="bc", orex_protocol_steps=steps,
-                )
-                pt.B, pt.device, pt.param_dtype, pt.parameter_name = 1, torch.device("cpu"), torch.float64, "bc"
-
-                def run(mcmc, x0, start, target):
-                    return pt._run_orex_protocol(
-                        _tensor(x0), mcmc, _tensor(start), _tensor(target), torch.tensor([True])
-                    )
-
-                self.assertDetailedBalance(run)
+                self.assertDetailedBalance(self._orex(steps))
 
     def test_neorex_wrapper(self):
-        for steps in (1, 2):
+        for steps in (1, 2, 3):
             with self.subTest(steps=steps):
-                def run(mcmc, x0, start, target):
-                    return _wrapper(mcmc, steps)(_tensor(x0), _tensor(start), _tensor(target))
-
-                self.assertDetailedBalance(run)
+                self.assertDetailedBalance(self._wrapped(steps))
 
     def test_neorex_distributed_protocol_loops(self):
         for name in ("_eval_flow_local_protocol", "_train_flow_local_protocol"):
-            with self.subTest(loop=name):
-                def run(mcmc, x0, start, target):
-                    out = getattr(_neorex(mcmc, 2), name)(
-                        _tensor(x0), _tensor(start), _tensor(target), torch.tensor([True])
-                    )
-                    return out[0], out[1]
+            for steps in (2, 3):
+                with self.subTest(loop=name, steps=steps):
+                    self.assertDetailedBalance(self._loop(name, steps))
 
-                self.assertDetailedBalance(run)
+    def test_trex(self):
+        """No stochastic blocks: the swap is proposed by the flow alone (transformed replica exchange)."""
+        for steps in (1, 2, 3):
+            with self.subTest(loop="wrapper", steps=steps):
+                self.assertDetailedBalance(self._wrapped(steps, trex=True))
+            for name in ("_eval_flow_local_protocol", "_train_flow_local_protocol"):
+                with self.subTest(loop=name, steps=steps):
+                    self.assertDetailedBalance(self._loop(name, steps, trex=True))
 
+
+class InteriorUpdatesTests(unittest.TestCase):
+    """The protocol updates at the K - 1 interior points only."""
+
+    def _calls(self, run, steps, start=LAMBDA_A, target=LAMBDA_B):
+        mcmc = _ScriptedMetropolis()
+        run(steps)(mcmc, 1, start, target)
+        return mcmc.calls
+
+    def test_updates_per_chain(self):
+        tests = SwapDetailedBalanceTests()
+        runs = {
+            "orex": tests._orex,
+            "wrapper": tests._wrapped,
+            "eval": lambda k: tests._loop("_eval_flow_local_protocol", k),
+            "train": lambda k: tests._loop("_train_flow_local_protocol", k),
+            "trex": lambda k: tests._wrapped(k, trex=True),
+        }
+        for name, run in runs.items():
+            for steps in (1, 2, 5):
+                for start, target in ((LAMBDA_A, LAMBDA_B), (LAMBDA_B, LAMBDA_A)):
+                    with self.subTest(protocol=name, steps=steps, down=start > target):
+                        expected = 0 if name == "trex" else steps - 1
+                        self.assertEqual(self._calls(run, steps, start, target), expected)
+
+    def test_orex_with_one_step_is_rex(self):
+        run = SwapDetailedBalanceTests()._orex(1)
+        for x0 in STATES:
+            x, work = run(_ScriptedMetropolis(), x0, LAMBDA_A, LAMBDA_B)
+            self.assertEqual(int(x.item()), x0)
+            self.assertAlmostEqual(float(work.item()), float(_action(torch.tensor(x0), LAMBDA_B)
+                                                              - _action(torch.tensor(x0), LAMBDA_A)), places=14)
 
 if __name__ == "__main__":
     unittest.main()

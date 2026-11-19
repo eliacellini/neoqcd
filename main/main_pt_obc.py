@@ -46,6 +46,11 @@ from neoqcd.utils import (
     translate_periodic_replica,
 )
 
+# Algorithms whose swap runs a flow (NEO-REX; TREX is NEO-REX without stochastic updates), and those
+# whose swap runs a nonequilibrium protocol.
+FLOW_ALGORITHMS = ("neorex", "trex")
+NONEQ_ALGORITHMS = ("orex", "neorex", "trex")
+
 
 @dataclass
 class RunState:
@@ -130,7 +135,7 @@ def _resolve_neorex_flow_checkpoint_path(args: argparse.Namespace, spec: str):
 def _neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> dict:
     nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
     return {
-        "algorithm": "neorex",
+        "algorithm": str(args.algorithm),
         "nf_layer_type": nf_layer_kind,
         "smearing_jacobian_version": LOGDET_VERSION if nf_layer_kind == "smearing" else None,
         "explicit_backward": bool(args.explicit_backward),
@@ -764,7 +769,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standard PT on OBC/defect coupling for SU(3)")
     parser.add_argument("--cpu", action="store_true", help="Force CPU + gloo backend")
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--algorithm", type=str, default="pt", choices=["pt", "orex", "neorex"])
+    parser.add_argument("--algorithm", type=str, default="pt", choices=["pt", "orex", "neorex", "trex"],
+                        help="trex: NEO-REX with no stochastic updates, the swap is proposed by the flow alone "
+                             "(transformed replica exchange); --neorex-* flags apply")
 
     # Lattice / theory
     parser.add_argument("--D", type=int, default=4)
@@ -1187,7 +1194,7 @@ def _normalize_metric_list(values, n_links: int, fill: float):
 
 
 def _default_wandb_run_name(args: argparse.Namespace, world_size: int) -> str:
-    if args.algorithm == "neorex":
+    if args.algorithm in FLOW_ALGORITHMS:
         nsteps = int(args.neorex_protocol_steps)
     elif args.algorithm == "orex":
         nsteps = int(args.orex_protocol_steps)
@@ -1205,12 +1212,12 @@ def _default_wandb_run_name(args: argparse.Namespace, world_size: int) -> str:
 
 def main(args: argparse.Namespace) -> None:
     run_t0 = time.time()
-    if args.algorithm == "neorex" and args.nf_layer_type == "cnf":
+    if args.algorithm in FLOW_ALGORITHMS and args.nf_layer_type == "cnf":
         args.neorex_eval_flow = True
     state = setup_runtime(args)
     rank, world_size, device = state.rank, state.world_size, state.device
     effective_acceptance_rule = (
-        "exact" if args.algorithm in {"orex", "neorex"} else args.acceptance_rule
+        "exact" if args.algorithm in NONEQ_ALGORITHMS else args.acceptance_rule
     )
 
     parameter_min = args.parameter_min
@@ -1440,11 +1447,13 @@ def main(args: argparse.Namespace) -> None:
         protocol_box = _protocol_box(args, defect, protocol_patch, None, device, rank)
         protocol_mcmc = orex_mcmc if protocol_box is None else orex_mcmc.on_box(protocol_box)
         pt.protocol_box = protocol_box
-    elif args.algorithm == "neorex":
+    elif args.algorithm in FLOW_ALGORITHMS:
         if int(args.neorex_protocol_steps) <= 0:
-            raise ValueError("For --algorithm neorex set --neorex-protocol-steps >= 1")
+            raise ValueError(f"For --algorithm {args.algorithm} set --neorex-protocol-steps >= 1")
         if int(args.neorex_heatbath_steps_per_step) < 0:
             raise ValueError("--neorex-heatbath-steps-per-step must be >= 0")
+        if args.algorithm == "trex" and int(args.neorex_heatbath_steps_per_step) != 0:
+            raise ValueError("--algorithm trex has no stochastic updates: drop --neorex-heatbath-steps-per-step")
 
         nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
         neorex_flow_pars = None if nf_layer_kind == "cnf" else _build_neorex_flow_pars(args, device, mask, defect)
@@ -1601,7 +1610,7 @@ def main(args: argparse.Namespace) -> None:
     for adapter in (orex_mcmc, protocol_mcmc):
         if adapter is not None:
             adapter._batch_hbor.use_cuda_graphs = bool(args.cuda_graphs)
-    if args.algorithm == "neorex" and type(nf_layer) is DefectSNFProtocolLayer:
+    if args.algorithm in FLOW_ALGORITHMS and type(nf_layer) is DefectSNFProtocolLayer:
         nf_layer.use_cuda_graphs = bool(args.cuda_graphs)
         nf_layer.graph_logdet = str(args.graph_logdet)
     if bool(args.fused_kernels):
@@ -1791,7 +1800,7 @@ def main(args: argparse.Namespace) -> None:
             "rng": {"cpu": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None},
         }
-        if args.algorithm == "neorex":
+        if args.algorithm in FLOW_ALGORITHMS:
             state_of_rank.update(flow=pt.flow.state_dict(), optimizer=pt.optimizer.state_dict(),
                                  consecutive_nan=int(pt.consecutive_nan_grad_updates))
         _atomic_torch_save(state_of_rank, target / f"rank{rank}.pt")
@@ -1821,7 +1830,7 @@ def main(args: argparse.Namespace) -> None:
             pt._pt_step = int(rank_state["pt_step"])
         if rank == 0:
             pt.parameter_matrix.copy_(rank_state["parameter_matrix"].to(pt.parameter_matrix.device))
-        if args.algorithm == "neorex":
+        if args.algorithm in FLOW_ALGORITHMS:
             pt.flow.load_state_dict(rank_state["flow"])
             pt.optimizer.load_state_dict(rank_state["optimizer"])
             pt.consecutive_nan_grad_updates = int(rank_state["consecutive_nan"])
@@ -1929,7 +1938,7 @@ def main(args: argparse.Namespace) -> None:
             if args.algorithm == "orex":
                 protocol_mcmc.set_parameter(pt.local_parameters, parameter_name="bc")
                 cfgs, stats = pt.step(cfgs, protocol_mcmc)
-            elif args.algorithm == "neorex":
+            elif args.algorithm in FLOW_ALGORITHMS:
                 train_flow = (
                     (not bool(args.neorex_eval_flow))
                     and ((args.train_steps <= 0) or ((step + 1) <= args.train_steps))
@@ -1955,7 +1964,7 @@ def main(args: argparse.Namespace) -> None:
                 for k in range(n_links):
                     total_link_accepted[k] += int(link_acc_step[k])
                     total_link_proposed[k] += int(link_prop_step[k])
-                if args.algorithm in {"orex", "neorex"}:
+                if args.algorithm in NONEQ_ALGORITHMS:
                     total_work_sum += float(stats.get("work_sum", 0.0))
                     total_work_sum_sq += float(stats.get("work_sum_sq", 0.0))
                     total_work_count += int(stats.get("work_count", 0))
@@ -1976,7 +1985,7 @@ def main(args: argparse.Namespace) -> None:
                             arr = np.asarray(values, dtype=np.float64)
                             if arr.size:
                                 saved_link_work_values[k].append(arr.reshape(-1, args.batch_size))
-                if args.algorithm == "neorex":
+                if args.algorithm in FLOW_ALGORITHMS:
                     flow_loss = float(stats.get("flow_loss", float("nan")))
                     flow_loss_count = int(stats.get("flow_loss_count", 0))
                     if flow_loss_count > 0 and math.isfinite(flow_loss):
@@ -2128,14 +2137,14 @@ def main(args: argparse.Namespace) -> None:
             step_flow_applied_updates = 0
             step_flow_skipped_updates = 0
             step_flow_consecutive_nan = 0
-            if args.algorithm in {"orex", "neorex"}:
+            if args.algorithm in NONEQ_ALGORITHMS:
                 step_work_count = int(stats.get("work_count", 0))
                 step_work_mean, step_work_sem = _mean_sem_from_moments(
                     float(stats.get("work_sum", 0.0)),
                     float(stats.get("work_sum_sq", 0.0)),
                     step_work_count,
                 )
-            if args.algorithm == "neorex":
+            if args.algorithm in FLOW_ALGORITHMS:
                 step_flow_loss = float(stats.get("flow_loss", float("nan")))
                 step_flow_applied_updates = int(stats.get("applied_updates", 0))
                 step_flow_skipped_updates = int(stats.get("skipped_nan_grad_updates", 0))
@@ -2244,7 +2253,7 @@ def main(args: argparse.Namespace) -> None:
 
     saved_flow_paths = []
     saved_flow_metadata_paths = []
-    if args.algorithm == "neorex":
+    if args.algorithm in FLOW_ALGORITHMS:
         final_flow_path = out_dir / f"neorex_flow_final_nsteps{int(args.neorex_protocol_steps)}.pt"
         pt.save_flow(str(final_flow_path))
         saved_flow_paths.append(str(final_flow_path))
@@ -2331,14 +2340,14 @@ def main(args: argparse.Namespace) -> None:
                 key.removeprefix("gpu_memory/"): float(value)
                 for key, value in final_gpu_memory.items()
             }
-        if args.algorithm == "neorex":
+        if args.algorithm in FLOW_ALGORITHMS:
             meta["neorex_flow_checkpoint"] = {
                 "load_mode": neorex_flow_load_mode,
                 "load_path": neorex_flow_load_path,
                 "saved_paths": saved_flow_paths,
                 "metadata_paths": saved_flow_metadata_paths,
             }
-        if args.algorithm in {"orex", "neorex"}:
+        if args.algorithm in NONEQ_ALGORITHMS:
             run_work_mean, run_work_sem = _mean_sem_from_moments(
                 total_work_sum,
                 total_work_sum_sq,
@@ -2403,7 +2412,7 @@ def main(args: argparse.Namespace) -> None:
                 np.savez_compressed(link_work_path, **payload)
                 meta["work"]["link_work_values_path"] = str(link_work_path)
                 print(f"link_work_values_path={link_work_path}", flush=True)
-        if args.algorithm == "neorex":
+        if args.algorithm in FLOW_ALGORITHMS:
             run_flow_loss = (
                 total_flow_loss_sum / total_flow_loss_count
                 if total_flow_loss_count > 0
@@ -2470,7 +2479,7 @@ def main(args: argparse.Namespace) -> None:
             wandb_run.summary["swap/link_acceptance"] = [
                 float(v) for v in final_link_acceptance
             ]
-            if args.algorithm in {"orex", "neorex"}:
+            if args.algorithm in NONEQ_ALGORITHMS:
                 wandb_run.summary["work/link_mean"] = [
                     float(v) for v in final_link_work_mean
                 ]

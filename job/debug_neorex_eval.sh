@@ -14,10 +14,14 @@
 
 # O-REX against NEO-REX with PG-trained defect fields, on the 8-rung defect ladder of the
 # training (chains from the job/thermalize_defect.sh cache). Every swap runs K protocol
-# steps, each with one MCMC update (1 HB + 4 OR) and, for NEO-REX, the flow layer.
+# steps: the flow layer (NEO-REX) and one MCMC update (1 HB + 4 OR) at each of the K - 1
+# interior points.
 # Smearing and residual fields are copied into their finite layer; CloverChair is a CNF.
-# Usage: METHODS="pt orex smearing:CKPT residual:CKPT clover:CKPT" K=4 STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
+# Usage: METHODS="pt orex smearing:CKPT residual:CKPT clover:CKPT trex:CKPT trextrain:CKPT" K="2 4" STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
+# K may list several values: every method runs once per value.
 # "pt" is standard REX (instantaneous swaps, exact action differences); K does not enter it.
+# "trex" is the smearing field with --algorithm trex: the swap is the flow alone (K layers, no MCMC);
+# "trextrain" trains it further online (end-to-end in the work) for TRAIN_STEPS steps, then evaluates.
 # Lattice and defect default to 8^4, L_d = 2 at time slice 4, space slice 3; set NT, NS (time and
 # space extent), DSIZE, TSLICE, SSLICE, THERMAL (thermalization steps) for other geometries: the
 # flow conversion below must see the same geometry as the run, so pass them here, not as flags.
@@ -54,7 +58,7 @@ for entry in ${METHODS:?set METHODS}; do
   name="${entry%%:*}"; ckpt="${entry#*:}"
   case "$name" in
     pt)       ALG=(--algorithm pt --acceptance-rule exact) ;;
-    orex)     ALG=(--algorithm orex --orex-protocol-steps "$K" --orex-mcmc-steps-per-step 1) ;;
+    orex)     ALG=(--algorithm orex --orex-mcmc-steps-per-step 1) ;;
     smearing) ALG=(--algorithm neorex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}"
                    --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
                    --hyper-rho-eps 0 --hyper-rho-max 0) ;;
@@ -62,21 +66,39 @@ for entry in ${METHODS:?set METHODS}; do
                    --residual-n-pt 1 --residual-mask-mod 4 --residual-mode "${RESIDUAL_MODE:-shared}" --residual-quadratic --residual-include-imag
                    --residual-coeff-max 0) ;;
     clover)   ALG=(--algorithm neorex --nf-layer-type cnf --cnf-checkpoint "$ckpt" --cnf-integration-steps "$CNF_STEPS") ;;
+    trex|trextrain)
+              ALG=(--algorithm trex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}"
+                   --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
+                   --hyper-rho-eps 0 --hyper-rho-max 0) ;;
     *) echo "unknown method $name" >&2; exit 2 ;;
   esac
-  if [[ "$name" != orex && "$name" != pt ]]; then
-    ALG+=(--neorex-protocol-steps "$K" --neorex-heatbath-steps-per-step 1)
-  fi
-  if [[ "$name" == smearing || "$name" == residual ]]; then
-    # The copy into the finite layer is a small CPU step.
-    srun -N1 -n1 python main/convert_cnf_to_smearing_flow.py neorex "$ckpt" "$OUT/${name}_neorex.pt" -- \
-      "${COMMON[@]}" "${ALG[@]}"
-    ALG+=(--neorex-load-flow "$OUT/${name}_neorex.pt" --neorex-eval-flow)
-  fi
-  MASTER_PORT=$((29500 + (SLURM_JOB_ID + ${#name}) % 1000))
-  ARGS=("${COMMON[@]}" "${ALG[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${K}" "$@")
-  # SLURM_NODEID must expand on each node, not on the batch host.
-  srun bash -c "python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
-    --nproc_per_node=$NPROC --rdzv_id=${SLURM_JOB_ID}_${name} --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    main/main_pt_obc.py ${ARGS[*]}"
+  KS="$K"
+  [[ "$name" == pt ]] && KS="${K%% *}"  # K does not enter standard REX: one run
+  for k in $KS; do
+    RUN=("${ALG[@]}")
+    if [[ "$name" == trex || "$name" == trextrain ]]; then
+      RUN+=(--neorex-protocol-steps "$k")
+    elif [[ "$name" != orex && "$name" != pt ]]; then
+      RUN+=(--neorex-protocol-steps "$k" --neorex-heatbath-steps-per-step 1)
+    elif [[ "$name" == orex ]]; then
+      RUN+=(--orex-protocol-steps "$k")
+    fi
+    if [[ "$name" == smearing || "$name" == residual || "$name" == trex || "$name" == trextrain ]]; then
+      # The copy into the finite layer is a small CPU step.
+      srun -N1 -n1 python main/convert_cnf_to_smearing_flow.py neorex "$ckpt" "$OUT/${name}_K${k}_neorex.pt" -- \
+        "${COMMON[@]}" "${RUN[@]}"
+      RUN+=(--neorex-load-flow "$OUT/${name}_K${k}_neorex.pt")
+      if [[ "$name" == trextrain ]]; then
+        RUN+=(--train-steps "${TRAIN_STEPS:-100}")
+      else
+        RUN+=(--neorex-eval-flow)
+      fi
+    fi
+    MASTER_PORT=$((29500 + (SLURM_JOB_ID + ${#name} + 7 * k) % 1000))
+    ARGS=("${COMMON[@]}" "${RUN[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${k}" "$@")
+    # SLURM_NODEID must expand on each node, not on the batch host.
+    srun bash -c "python -m torch.distributed.run --nnodes=$SLURM_NNODES --node_rank=\$SLURM_NODEID \
+      --nproc_per_node=$NPROC --rdzv_id=${SLURM_JOB_ID}_${name}_${k} --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+      main/main_pt_obc.py ${ARGS[*]}"
+  done
 done
