@@ -151,8 +151,7 @@ each other's time reversal, as detailed balance of the swap requires; for a
 CNF the inverse, like the logdet, carries the CF4 integration error. A heatbath
 at either end would not change the distribution of the work, so it is left out:
 O-REX at K = 1 is standard REX. `--algorithm trex` is NEO-REX without heatbath
-(transformed replica exchange): the swap is the flow alone, K layers, trained
-online end-to-end in the work.
+(transformed replica exchange): the swap is the flow alone, K layers.
 
 ### Evaluating a field with its finite layer
 

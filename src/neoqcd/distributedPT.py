@@ -1145,7 +1145,6 @@ class NEOREXProtocolWrapper(nn.Module):
                 x_curr,
                 parameter_0,
                 parameter_1,
-                any_down=any_down,
             )
             work = work + dwork
             x_curr = self._run_stochastic_blocks(x_next, parameter_1) if n < self.n_protocol_steps - 1 else x_next
@@ -1412,8 +1411,6 @@ class NEOREX(OutOfEquilibriumParallelTempering):
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         module = self.ddp_flow.module
-        if not module.has_stochastic_blocks:
-            return self._train_flow_end_to_end(x, start_betas, target_betas, active)
         n_steps = int(module.n_protocol_steps)
         points = _protocol_points(start_betas, target_betas, n_steps)
         total_work = torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)
@@ -1429,8 +1426,6 @@ class NEOREX(OutOfEquilibriumParallelTempering):
             "skipped_nan_grad_updates": 0,
         }
 
-        # Blockwise training: each flow step is trained on its own work, with no gradient through
-        # the stochastic blocks.
         for n in range(n_steps):
             beta_0, beta_1 = points[n], points[n + 1]
 
@@ -1444,45 +1439,17 @@ class NEOREX(OutOfEquilibriumParallelTempering):
 
             total_work = total_work + dwork.detach().to(dtype=self.param_dtype)
             # stochastic blocks at the interior points only (palindromic protocol)
-            if n < n_steps - 1:
+            if n < n_steps - 1 and module.has_stochastic_blocks:
                 x_curr = self._run_stochastic_blocks_active(module, x_next.detach(), beta_1, active_idx)
             else:
                 x_curr = x_next.detach()
 
-        self._add_flow_loss_link_stats(total_stats, total_work, active)
-        return x_curr, total_work, total_stats
-
-    def _train_flow_end_to_end(
-        self,
-        x: torch.Tensor,
-        start_betas: torch.Tensor,
-        target_betas: torch.Tensor,
-        active: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        # TREX: without stochastic blocks the protocol is a pure flow, and it is trained on the
-        # gradient of its whole work. The K steps run inside one DDP forward (the wrapper's), so
-        # DDP sees one forward and one backward per swap; one optimizer step per swap.
-        any_down = bool((target_betas < start_betas).any())
-        x_out_all, work_all = self.ddp_flow(x.detach(), start_betas, target_betas, any_down=any_down)
-        zero_anchor = work_all.sum() * 0.0
-        work = torch.where(active, work_all.to(dtype=self.param_dtype),
-                           torch.zeros(x.shape[0], device=x.device, dtype=self.param_dtype)) + zero_anchor
-        step_stats = self._train_flow_from_work(work, active)
-        x_out = torch.where(self._sample_mask_view(active, x), x_out_all.detach(), x.detach())
-        total_work = work.detach()
-        total_stats = {
-            "applied_updates": int(step_stats.get("applied_updates", 0)),
-            "skipped_nan_grad_updates": int(step_stats.get("skipped_nan_grad_updates", 0)),
-        }
-        self._add_flow_loss_link_stats(total_stats, total_work, active)
-        return x_out, total_work, total_stats
-
-    def _add_flow_loss_link_stats(self, total_stats: dict, total_work: torch.Tensor, active: torch.Tensor):
         link_loss_sum, link_loss_count = self._flow_loss_link_moments(total_work.detach(), active)
         total_stats["_flow_loss_link_sum"] = link_loss_sum
         total_stats["_flow_loss_link_count"] = link_loss_count
         total_stats["_flow_loss_sum"] = float(sum(link_loss_sum))
         total_stats["_flow_loss_count"] = int(sum(link_loss_count))
+        return x_curr, total_work, total_stats
 
     def _train_flow_from_work(self, local_work: torch.Tensor, active: torch.Tensor) -> dict:
         n_links = max(0, self.world_size - 1)

@@ -17,11 +17,10 @@
 # steps: the flow layer (NEO-REX) and one MCMC update (1 HB + 4 OR) at each of the K - 1
 # interior points.
 # Smearing and residual fields are copied into their finite layer; CloverChair is a CNF.
-# Usage: METHODS="pt orex smearing:CKPT residual:CKPT clover:CKPT trex:CKPT trextrain:CKPT" K="2 4" STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
+# Usage: METHODS="pt orex smearing:CKPT residual:CKPT clover:CKPT trex:CKPT" K="2 4" STEPS=300 [BATCH=8] sbatch job/debug_neorex_eval.sh [extra main_pt_obc.py flags]
 # K may list several values: every method runs once per value.
 # "pt" is standard REX (instantaneous swaps, exact action differences); K does not enter it.
-# "trex" is the smearing field with --algorithm trex: the swap is the flow alone (K layers, no MCMC);
-# "trextrain" trains it further online (end-to-end in the work) for TRAIN_STEPS steps, then evaluates.
+# "trex" is the smearing field with --algorithm trex: the swap is the flow alone (K layers, no MCMC).
 # Lattice and defect default to 8^4, L_d = 2 at time slice 4, space slice 3; set NT, NS (time and
 # space extent), DSIZE, TSLICE, SSLICE, THERMAL (thermalization steps) for other geometries: the
 # flow conversion below must see the same geometry as the run, so pass them here, not as flags.
@@ -66,7 +65,7 @@ for entry in ${METHODS:?set METHODS}; do
                    --residual-n-pt 1 --residual-mask-mod 4 --residual-mode "${RESIDUAL_MODE:-shared}" --residual-quadratic --residual-include-imag
                    --residual-coeff-max 0) ;;
     clover)   ALG=(--algorithm neorex --nf-layer-type cnf --cnf-checkpoint "$ckpt" --cnf-integration-steps "$CNF_STEPS") ;;
-    trex|trextrain)
+    trex)
               ALG=(--algorithm trex --nf-layer-type smearing --use-hyper-smearing --hyper-smearing-mode "${SMEARING_MODE:-per_link}"
                    --hyper-hidden-dim 16 --hyper-depth 2 --hyper-scale-by-delta --hyper-no-normalize-by-nstep
                    --hyper-rho-eps 0 --hyper-rho-max 0) ;;
@@ -76,23 +75,18 @@ for entry in ${METHODS:?set METHODS}; do
   [[ "$name" == pt ]] && KS="${K%% *}"  # K does not enter standard REX: one run
   for k in $KS; do
     RUN=("${ALG[@]}")
-    if [[ "$name" == trex || "$name" == trextrain ]]; then
+    if [[ "$name" == trex ]]; then
       RUN+=(--neorex-protocol-steps "$k")
     elif [[ "$name" != orex && "$name" != pt ]]; then
       RUN+=(--neorex-protocol-steps "$k" --neorex-heatbath-steps-per-step 1)
     elif [[ "$name" == orex ]]; then
       RUN+=(--orex-protocol-steps "$k")
     fi
-    if [[ "$name" == smearing || "$name" == residual || "$name" == trex || "$name" == trextrain ]]; then
+    if [[ "$name" == smearing || "$name" == residual || "$name" == trex ]]; then
       # The copy into the finite layer is a small CPU step.
       srun -N1 -n1 python main/convert_cnf_to_smearing_flow.py neorex "$ckpt" "$OUT/${name}_K${k}_neorex.pt" -- \
         "${COMMON[@]}" "${RUN[@]}"
-      RUN+=(--neorex-load-flow "$OUT/${name}_K${k}_neorex.pt")
-      if [[ "$name" == trextrain ]]; then
-        RUN+=(--train-steps "${TRAIN_STEPS:-100}")
-      else
-        RUN+=(--neorex-eval-flow)
-      fi
+      RUN+=(--neorex-load-flow "$OUT/${name}_K${k}_neorex.pt" --neorex-eval-flow)
     fi
     MASTER_PORT=$((29500 + (SLURM_JOB_ID + ${#name} + 7 * k) % 1000))
     ARGS=("${COMMON[@]}" "${RUN[@]}" --steps "$STEPS" --main-dir "$PWD" --output-dir "$OUT/${name}_K${k}" "$@")
