@@ -43,8 +43,12 @@ n_rep for REX. Every run measures tau_int(Q^2) and is long enough for the standa
 - REX on the optimal ladder: A = erfc(Lambda / (2 (n_rep - 1))).
 - O-REX and NEO-REX: <W> = k_h V_def / ((n_rep - 1)^2 n_step^alpha), A = erfc(sqrt(<W>) / 2). At 16^4
   alpha = 0.901 (O-REX) and 0.839 (class), and the (n_rep - 1)^2 factorization holds (n4, n6, n8).
-- Cost per REX step: C = n + 2 (n-1) [(K+1) v + K v_NF]. At fixed acceptance its minimum is at
-  K* = alpha / (4 (1 - alpha/2) v), independent of A.
+- Cost per REX step: C = n + 2 (n-1) [(K-1) v + K v_NF]: the protocol updates the patch at the K - 1
+  interior points only (merge of interior-trex, 19/11; before, at the K + 1 points with both ends, which
+  left the acceptance unchanged). O-REX at K = 1 is REX, C = n. At fixed acceptance the O-REX minimum
+  is at K* = alpha (1 - 2v) / (2 v (2 - alpha)) ~ alpha / (4 (1 - alpha/2) v) for v << 1, independent
+  of A. The numbers below come from the K + 1 model: at these K they change by at most a few percent
+  (K* ~ 30 -> 29.5 in GPU time; n4 K50 costs 2% less).
 - O-REX:
   - in updates, v = V_patch / V = 0.0017 (h = 1): K* ~ 240, n_rep 2-3;
   - in GPU time, v = 10.4 ms / 0.76 s = 0.0135 (the box kernels are launch-bound, 8x V_patch / V):
@@ -60,10 +64,12 @@ n_rep for REX. Every run measures tau_int(Q^2) and is long enough for the standa
       torch (main b6ade22): `--topology-every`, `--cooling-steps`, `--topology-replicas top|all`.
 - [x] Resume of interrupted runs (main 0b66eab): `--save-resume`, `--resume`, `--resume-dir`
       (default `$SCRATCH/neoqcd_resume`); bitwise equal to an uninterrupted run on GPU.
-- [ ] PG training with `--fused-kernels` validated: job 64706032 (500 epochs, 16^4), queued 17/11.
+- [x] PG training with `--fused-kernels` validated (debug job 64772900, 18/11): 173 epochs against the
+      reference 63254793 with the same learning-rate curve; PINN, loss, swap acceptance per edge and
+      gradient norm agree within noise; 3.9 s per epoch against 9.1 (sweep 0.94 s against 6.08).
 - [ ] NEO-REX flow at 30^4, beta 6.4 (C1).
-- Roberto pulls main into his own directory for the runs; the Leonardo production checkout is updated
-  separately.
+- Roberto pulls main into his own directory for the runs; the Leonardo production checkout is at main
+  c0e2389 (18/11).
 
 ## Run settings (all runs)
 - **Length:** ~60k steps. One REX step is one standard update (1 HB + 4 OR) of every replica, so on the
