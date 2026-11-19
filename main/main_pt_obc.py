@@ -135,7 +135,7 @@ def _resolve_neorex_flow_checkpoint_path(args: argparse.Namespace, spec: str):
 def _neorex_flow_metadata(args: argparse.Namespace, saved_path: str) -> dict:
     nf_layer_kind = str(args.nf_layer_type or "smearing").lower()
     return {
-        "algorithm": str(args.algorithm),
+        "algorithm": "neorex",
         "nf_layer_type": nf_layer_kind,
         "smearing_jacobian_version": LOGDET_VERSION if nf_layer_kind == "smearing" else None,
         "explicit_backward": bool(args.explicit_backward),
