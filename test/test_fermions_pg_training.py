@@ -7,7 +7,10 @@ on `ParallelTempering` + `FermionREXTarget` (Gloo ranks on the CPU).
   links; statistical, 2D 4 x 4);
 - distributed (3 Gloo ranks, NEOQCD_SKIP_GLOO=1 skips): the field is broadcast, the all-reduced
   gradient equals the single-process gradient of the gathered chains, phi and labels, and a run
-  resumed from the rank shards repeats the uninterrupted one bitwise.
+  resumed from the rank shards repeats the uninterrupted one bitwise;
+- the cost split of an epoch (4D 4 x 6^3, Haar links, defect-hyper-smearing field, reference and fast): the
+  trajectory costs 2 n_steps + 1 force solves (Omelyan) plus one action solve, the loss exactly two;
+  NEOQCD_TEST_VERBOSE=1 prints the times and CG iterations of trajectory, gauge loss and fermion loss.
 CPU, complex128.
 """
 
@@ -21,7 +24,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from neoqcd.fermions._gauge_cnf import CloverChairLinkDrift
+from neoqcd.fermions._gauge import SUN_haar, Defect
+from neoqcd.fermions._gauge_cnf import CloverChairLinkDrift, build_cnf
 from neoqcd.fermions.lattice import Geometry
 from neoqcd.fermions.pg import DistributedFermionCNFREXTrainer, FermionCNFREXTrainer, fermion_path_gradient_loss
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson
@@ -123,6 +127,46 @@ class SingleProcessTrainerTest(unittest.TestCase):
                 print(f"rung {k}: <S_pf>/n = {mean:.4f} +- {err:.4f} ({v.numel()} values)")
             self.assertLess(abs(mean - 1.0), 4.0 * err)
             self.assertLess(err, 0.03)
+
+
+class CostSplitTest(unittest.TestCase):
+    """Solve counts of an epoch, and (verbose) its cost split on a small 4D lattice."""
+
+    def test_epoch_cost_split(self):
+        geometry = Geometry(4, 4, 6, 3)
+        config = dict(architecture="defect-hyper-smearing", domain="defect", D=4, T=4, L=6, beta=5.6, defect_size=1,
+                      time_slice=2, space_slice=2, parameter_min=0.0, parameter_max=1.0, batch_size=2, hidden_dim=16,
+                      depth=2, rho_init=1e-3, residual_n_pt=0, residual_mask_mod=2, orsteps=0,
+                      hyper_smearing_mode="per_link", time_normalization="unit_interval")
+        mask = Defect(4, 4, 6, 1, 2, 2).create_defect_mask().to(torch.float64)
+        n_steps = 2
+        # Haar links: a disordered configuration (from a cold start every chain stays at U = 1, where
+        # the field and xi_f vanish); the cost per solve is what matters here, not the acceptance
+        U = SUN_haar(geometry.link_shape(4)[:-1], generator=torch.Generator().manual_seed(4))
+        for fast in (False, True):
+            with self.subTest(fast=fast):
+                torch.manual_seed(1)
+                field, _, field_mask = build_cnf(config)
+                with torch.no_grad():  # a field away from its (zero-velocity) start
+                    for p in field.parameters():
+                        p.add_(0.05 * torch.randn_like(p))
+                trainer = FermionCNFREXTrainer(
+                    field, torch.optim.Adam(field.parameters(), lr=1e-3), geometry=geometry, beta=5.6, kappa=0.153,
+                    defect_mask=mask, ladder=[0.0, 1.0], batch_size=2, tau=0.25, n_steps=n_steps, n_gauge_substeps=2,
+                    seed=2, U=U, field_defect_mask=field_mask, **(dict(fast=True) if fast else {}))
+                for epoch in range(1):
+                    m = trainer.step()
+                    self.assertEqual(m["trajectory_solves"], (2 * n_steps + 1) + 1)
+                    self.assertEqual(m["loss_solves"], 2)
+                    self.assertEqual(m["unconverged_solves"], 0)
+                    if VERBOSE:
+                        print(f"fast={fast} epoch {epoch}: trajectory {m['sweep_s']:.2f} s ({m['trajectory_solves']} "
+                              f"solves, {m['trajectory_cg_iter']} CG it, {m['trajectory_cg_applications']} applications)"
+                              f"; loss {m['loss_s']:.2f} s = gauge {m['gauge_loss_s']:.2f} s + fermion "
+                              f"{m['fermion_loss_s']:.2f} s ({m['loss_solves']} solves, {m['loss_cg_iter']} CG it, "
+                              f"{m['loss_cg_applications']} applications) + backward to the weights; "
+                              f"V Var xi_g {m['pinn_gauge_by_rung']}, xi_f {m['pinn_fermion_by_rung']}, "
+                              f"cov {m['pinn_cov_by_rung']}, S_pf/n {m['spf_per_component_by_rung']}")
 
 
 # ---- distributed --------------------------------------------------------------------------------
