@@ -66,9 +66,10 @@ commits by atomically rewriting checkpoint_step.json to (n, new slot). A kill at
 marker on a complete set of files of one step on every rank; the previous generation stays intact
 until the next commit overwrites it.
 
-`ParallelTempering` exposes no state_dict (main_pt_obc.py has no resume); its state is the
-parameter matrix on rank 0, the step counter `_pt_step` (alternating parity) and the scattered local
-parameters, restored here by setting the first two and calling `_scatter_parameters()`.
+`ParallelTempering` exposes no state_dict (the --save-resume / --resume of main_pt_obc.py save the
+same three pieces in their own checkpoints); its state is the parameter matrix on rank 0, the step
+counter `_pt_step` (alternating parity) and the scattered local parameters, restored here by setting
+the first two and calling `_scatter_parameters()`.
 
 Start and resume (decided on rank 0, shared by all ranks). The run owns only the files named above
 (and the temporary files of their atomic writes); anything else in --out is never read, blocks
