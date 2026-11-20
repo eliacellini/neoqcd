@@ -362,6 +362,13 @@ class _HopArgs(ctypes.Structure):
 _DTYPE_CODE = {torch.complex128: 0, torch.complex64: 1}
 
 
+def _raw(t):
+    """t as plain contiguous memory for a raw pointer: lazy conjugate and negative bits resolved
+    (a neg view such as torch._neg_view(x) shares x's memory un-negated), strides, storage offsets
+    and expanded (stride 0) dimensions materialised. A no-op for a plain contiguous tensor."""
+    return t.resolve_conj().resolve_neg().contiguous()
+
+
 # ---- build and load ------------------------------------------------------------------------------
 class BackendUnavailable(RuntimeError):
     """The requested kernel backend cannot be built or loaded here (the message says why)."""
@@ -676,10 +683,24 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
         return args
 
     def _hop_kernel(self, psi, t, dagger=False, scale=None, add=None):
-        """Compiled hop: out = scale * H psi + add (scale (B,) or (1,) real, add a field; both optional)."""
+        """Compiled hop: out = scale * H psi + add (scale (B,) or (1,) real, add a field; both optional).
+
+        The kernel reads raw memory and writes a fresh tensor, so it is not differentiable: with
+        grad mode on, an input that requires grad (psi, add, the links, the scale) is an error
+        rather than a silently detached result (use kernel "fast" / "loop", or torch.no_grad()).
+        Inputs may be any strided view: lazy conjugate and negative bits are resolved and the
+        memory made contiguous before the pointers are taken."""
         self._check(psi)
-        psi = psi.resolve_conj().contiguous()
         links = self._kernel_links(t)
+        if torch.is_grad_enabled():
+            needs = [name for name, v in (("psi", psi), ("add", add), ("links", links), ("scale", scale))
+                     if v is not None and v.requires_grad]
+            if needs:
+                raise RuntimeError(f"FusedHalfLatticeWilson ({self.kernel} kernel) is not differentiable, but "
+                                   f"{', '.join(needs)} require(s) grad with grad mode on: use kernel='fast' or "
+                                   "'loop' for autograd, or call it under torch.no_grad()")
+        psi = _raw(psi)
+        links = _raw(links)
         B = psi.shape[0]
         if tuple(psi.shape[1:]) != tuple(self.field_shape[1:]):
             raise ValueError(f"field of shape {tuple(psi.shape)} does not match {self.field_shape}")
@@ -687,18 +708,21 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
             raise ValueError(f"field on {psi.device}, operator on {links.device}")
         if links.shape[0] != 1 and links.shape[0] != B:
             raise ValueError(f"field batch {B} does not match the link batch {links.shape[0]}")
-        out = torch.empty_like(psi)
+        out = torch.empty_like(psi, memory_format=torch.contiguous_format)
         a = _HopArgs.from_buffer_copy(self._args_template(t, dagger))
         a.out, a.psi, a.links, a.nbr = out.data_ptr(), psi.data_ptr(), links.data_ptr(), self._nbr32[t].data_ptr()
         a.batch = B
         if scale is not None:
+            scale = _raw(scale)
             if scale.shape[0] not in (1, B):
                 raise ValueError(f"scale of shape {tuple(scale.shape)} for batch {B}")
             a.scale = scale.data_ptr()
             a.scale_batch_stride = 0 if scale.shape[0] == 1 else 1
         if add is not None:
+            if add.device != psi.device:
+                raise ValueError(f"add on {add.device}, field and operator on {psi.device}")
             self._check(add)
-            add = add.resolve_conj().contiguous()
+            add = _raw(add)
             if add.shape != psi.shape:
                 raise ValueError(f"add of shape {tuple(add.shape)} differs from {tuple(psi.shape)}")
             a.add = add.data_ptr()

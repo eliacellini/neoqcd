@@ -190,6 +190,97 @@ class _KernelEquality:
         bc = b.conj()
         self.assertLess(rel(op.normal(bc), ref.normal(bc.resolve_conj())), 1e-14)
 
+    @staticmethod
+    def _views(x):
+        """(name, view): the values of x as a non-contiguous tensor, at a storage offset, with a
+        lazy conjugate bit, a negative bit or both (memory != values), and an expanded (stride 0)
+        batch (the values of sample 0 for every sample). The kernel reads raw memory."""
+        B = x.shape[0]
+        buf = torch.zeros((B + 1,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
+        buf[1:] = x
+        out = [("strided", x.transpose(2, 3).contiguous().transpose(2, 3)),
+               ("offset", buf[1:]),
+               ("conj", x.conj().resolve_conj().conj()),  # memory conj(x), conj bit set
+               ("neg", torch._neg_view(-x)),  # memory -x, neg bit set
+               ("neg_conj", torch._neg_view((-x).conj().resolve_conj()).conj())]  # memory -conj(x)
+        if B > 1:
+            out.append(("expanded", x[:1].expand_as(x)))
+        return out
+
+    def test_strided_offset_expanded_and_lazy_inputs(self):
+        """Fields (and the fused `add`) given as non-contiguous, offset, expanded, conj- or
+        neg-bit views give the result of their materialised values (1e-14)."""
+        dev = torch.device(self.device)
+        geo = G46
+        k = kappas(0.11, 0.13)
+        U = links(geo, 2, 50).to(dev)
+        psi = field(geo, 2, 51).to(dev)
+        e, o = to_half(psi, geo, 0), to_half(psi, geo, 1)
+        ref = HalfLatticeWilson(U, k, geo)
+        op = self.make(U, k, geo, -1.0)
+        for dtype in (C, C64):
+            r, f = ref.to(dtype), op.to(dtype)
+            for (name, ve), (_, vo) in zip(self._views(e.to(dtype)), self._views(o.to(dtype))):
+                plain_e = ve.resolve_conj().resolve_neg().clone()
+                plain_o = vo.resolve_conj().resolve_neg().clone()
+                cases = [("hop0", lambda m, a, b: m.hop(b, 0)), ("hop1_dag", lambda m, a, b: m.hop(a, 1, True)),
+                         ("apply", lambda m, a, b: m.apply(a)), ("normal", lambda m, a, b: m.normal(a)),
+                         ("prepare_rhs_half", lambda m, a, b: m.prepare_rhs_half(a, b)),
+                         ("reconstruct_odd", lambda m, a, b: m.reconstruct_odd(a, b))]
+                for case, fn in cases:
+                    with self.subTest(dtype=dtype, view=name, case=case):
+                        want = fn(r, plain_e, plain_o)
+                        self.assertLess(rel(fn(f, ve, vo), want), TOL[dtype])
+                        # the view as the only odd input of the fused axpy (`add` of the kernel)
+                        if case == "reconstruct_odd":
+                            self.assertLess(rel(fn(f, plain_e, vo), want), TOL[dtype])
+
+    def test_non_contiguous_add_of_the_kernel(self):
+        """The compiled hop with scale and add given as views: out = scale H psi + add."""
+        if self.kernel not in ("cpu", "cuda"):
+            self.skipTest("compiled kernels only")
+        dev = torch.device(self.device)
+        geo = G4s
+        k = kappas(0.12, 0.13)
+        U = links(geo, 2, 52).to(dev)
+        psi = field(geo, 2, 53).to(dev)
+        e, o = to_half(psi, geo, 0), to_half(psi, geo, 1)
+        ref = HalfLatticeWilson(U, k, geo)
+        op = self.make(U, k, geo, -1.0)
+        for name, add in self._views(e):
+            with self.subTest(view=name):
+                plain = add.resolve_conj().resolve_neg().clone()
+                want = ref.hop(o, 0).mul_(ref._k).add_(plain)
+                got = op._hop_kernel(o, 0, scale=op._scale_k, add=add)
+                self.assertLess(rel(got, want), 1e-14)
+
+    def test_compiled_hop_refuses_autograd_and_foreign_add(self):
+        """The compiled kernel writes through raw pointers: with grad mode on, inputs that require
+        grad are an error (not a silently detached output); `add` on another device is an error."""
+        if self.kernel not in ("cpu", "cuda"):
+            self.skipTest("compiled kernels only")
+        dev = torch.device(self.device)
+        geo = G4s
+        U = links(geo, 2, 54).to(dev)
+        x = to_half(field(geo, 2, 55), geo).to(dev)
+        op = self.make(U, 0.12, geo, -1.0)
+        xg = x.clone().requires_grad_(True)
+        with self.assertRaisesRegex(RuntimeError, "not differentiable.*psi"):
+            op.hop(xg, 1)
+        with self.assertRaisesRegex(RuntimeError, "not differentiable.*add"):
+            op.reconstruct_odd(x, xg)
+        with torch.no_grad():  # no graph is being recorded: allowed
+            self.assertLess(rel(op.hop(xg, 1), HalfLatticeWilson(U, 0.12, geo).hop(x, 1)), 1e-14)
+        Ug = U.clone().requires_grad_(True)
+        op_g = self.make(Ug, 0.12, geo, -1.0)  # gathered in grad mode: the links require grad
+        with self.assertRaisesRegex(RuntimeError, "not differentiable.*links"):
+            op_g.normal(x)
+        with torch.no_grad():
+            self.assertLess(rel(op_g.normal(x), HalfLatticeWilson(U, 0.12, geo).normal(x)), 1e-14)
+        foreign = torch.device("meta") if dev.type == "cpu" else torch.device("cpu")
+        with self.assertRaisesRegex(ValueError, "add on"):
+            op._hop_kernel(x, 1, scale=op._scale_k, add=x.to(foreign))
+
 
 class LoopKernelTest(_KernelEquality, unittest.TestCase):
     kernel = "loop"
