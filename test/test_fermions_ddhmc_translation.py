@@ -119,8 +119,8 @@ class TranslationSymmetryTest(unittest.TestCase):
         """det D (modulus and phase of the dense even-odd matrix of exact.py, built from the links
         independently of WilsonDirac) and the Wilson gauge action are unchanged by translations
         across the time boundary and in all directions, for time_sign = -1 and +1; the twist is
-        felt (log|det| differs between -1 and +1), so the check is not empty. 4^4 and 8 x 4^3
-        SU(2), Haar links."""
+        felt (log|det| differs between -1 and +1 on 4^4), so the check is not empty. 4^4 and
+        8 x 4^3 SU(2), Haar links."""
         kappa, beta = 0.15, 2.0
         for G, seed in ((Geometry(4, 4, 4, 2), 111), (Geometry(4, 8, 4, 2), 112)):
             U, gen = haar_links(G, 1, seed)
@@ -141,7 +141,10 @@ class TranslationSymmetryTest(unittest.TestCase):
                 say(f"{G.lattice} time_sign {ts:+.0f}: log|det D| {la.tolist()}, phase {sign.tolist()}")
                 self.assertLess((la - la[0]).abs().max().item(), 1e-10)
                 self.assertLess((sign - sign[0]).abs().max().item(), 1e-10)
-            self.assertGreater(abs(logabs[-1.0] - logabs[1.0]), 1e-3)
+            # the twist is felt through loops winding in time, length >= T: 0.18 on 4^4, only
+            # ~0.006 on 8 x 4^3 at this kappa, so the bound is on T = 4
+            if G.T == 4:
+                self.assertGreater(abs(logabs[-1.0] - logabs[1.0]), 1e-2)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -267,33 +270,37 @@ class LuscherSchemeTest(unittest.TestCase):
                 self.assertAlmostEqual(p0, never, places=12)
 
     def test_long_run_balance(self):
-        """100 cycles of DDHMC.next_shifts on 16^4 with 8^4 blocks: every link is visited
-        100 f times on average for both schemes; the spread of the visit counts across links is
-        clearly smaller with "luscher" than with "random", and so is the shortfall of the least
-        visited links (appendix C)."""
+        """100 cycles of DDHMC.next_shifts on 16^4 with 8^4 blocks, 8 chains (each with its own
+        random vectors): every link is visited 100 f times on average for both schemes; the spread
+        of the visit counts across links (pooled over the chains) is clearly smaller with
+        "luscher" than with "random", and the least visited link of a chain has more visits
+        (appendix C). Over seeds 120-139 the spread ratio is 0.60-0.73 and the gain of the minimum
+        3.3-6.9 visits, so the bounds 0.8 and 2 do not depend on the random stream."""
         G = Geometry(4, 16, 16, 2)
         bd = BlockDecomposition(G, 8)
         ham = DDHMCHamiltonian(2.0, 0.12, bd)
-        n_cycles = 100
+        n_cycles, B = 100, 8
         out = {}
         for tr in ("random", "luscher"):
             hmc = DDHMC(G, ham, tau=0.5, n_steps=1, translation=tr)
             gen = torch.Generator().manual_seed(131)
-            pos = torch.zeros(4, dtype=torch.long)
-            c = torch.zeros(bd.active_links.shape, dtype=torch.long)
+            pos = torch.zeros(B, 4, dtype=torch.long)
+            c = torch.zeros((B,) + bd.active_links.shape, dtype=torch.long)
             for _ in range(n_cycles):
-                pos = pos + hmc.next_shifts(1, gen)[0]
-                c += torch.roll(bd.active_links, shifts=tuple(-int(x) for x in pos), dims=(1, 2, 3, 4)).long()
-            out[tr] = c.double()
+                pos = pos + hmc.next_shifts(B, gen)
+                for b in range(B):
+                    c[b] += torch.roll(bd.active_links, shifts=tuple(-int(x) for x in pos[b]), dims=(1, 2, 3, 4)).long()
+            out[tr] = c.double().reshape(B, -1)
         f = bd.expected_active_fraction()
         for tr, c in out.items():
-            self.assertAlmostEqual(c.mean().item(), n_cycles * f, places=9)
-        sd = {tr: c.std().item() for tr, c in out.items()}
-        lo = {tr: c.min().item() for tr, c in out.items()}
-        say(f"100 cycles, 8^4 blocks: visits mean {n_cycles * f:.2f}, std random {sd['random']:.2f} / "
-            f"luscher {sd['luscher']:.2f}, min random {lo['random']:.0f} / luscher {lo['luscher']:.0f}")
+            self.assertLess((c.mean(1) - n_cycles * f).abs().max().item(), 1e-9)
+        sd = {tr: c.var(1).mean().sqrt().item() for tr, c in out.items()}
+        lo = {tr: c.min(1).values.mean().item() for tr, c in out.items()}
+        say(f"100 cycles, 8^4 blocks, 8 chains: visits mean {n_cycles * f:.2f}, spread random {sd['random']:.2f} / "
+            f"luscher {sd['luscher']:.2f}, least visited link (chain mean) random {lo['random']:.2f} / "
+            f"luscher {lo['luscher']:.2f}")
         self.assertLess(sd["luscher"], 0.8 * sd["random"])
-        self.assertGreater(lo["luscher"], lo["random"])
+        self.assertGreater(lo["luscher"], lo["random"] + 2.0)
 
 
 # ---------------------------------------------------------------------------------------------

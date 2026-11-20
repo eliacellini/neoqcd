@@ -611,9 +611,10 @@ are never active. Per period of n cycles (exact over v; tests):
 | variance of the visits (with n random v) | 0.15 (0.17) | 0.34 (0.56) | 0.42 (0.93) | 0.45 (1.24) | 0.56 (1.25) |
 
 No link is missed in a period for cubic blocks from 10⁴ to 20⁴ either. In 2D with 6×6 blocks
-(fig. 9: three grids) every link is active in every period. Over 100 cycles with 8⁴ blocks the
-spread of the visit counts across links is 3.3 against 4.6 with random vectors, and the least
-visited link has 26 visits against 22.
+(fig. 9: three grids) every link is active in every period. Over 100 cycles with 8⁴ blocks
+(mean 36.9 visits) the spread of the visit counts across links is 3.1 against 4.9 with random
+vectors, and the least visited link has 26 visits against 20 (8 chains; the spread ratio is
+0.60–0.73 over 20 seeds).
 
 **Naming.** The code's labels are colour-mirrored with respect to the paper. The code takes the
 Schur complement on Ω*, and its "∂Ω*" (`exterior_boundary`) is the set of white sites with a
@@ -651,7 +652,7 @@ repo convention.
 - The `next_shifts` sequence (random, then (2,2,2,2) three times for 8⁴), and the restart on a new
   batch size.
 - The per-period visiting distribution against the analytic count (3/64 and 1/3 above).
-- The 100-cycle balance against random vectors.
+- The 100-cycle balance against random vectors (8 chains).
 - 12 `"luscher"` cycles: ⟨e^{−ΔH}⟩ = 1, and inactive links bitwise equal to the translated input.
 
 **Limits.**
