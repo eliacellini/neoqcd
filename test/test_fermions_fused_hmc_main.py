@@ -203,8 +203,10 @@ class CudaDriverTest(unittest.TestCase):
                     MAIN.main(base + ["--md-kernels", md, "--out", str(out)])
                     for x, y in zip(_rows(ref), _rows(out)):
                         self.assertLess(abs(float(x["dH"]) - float(y["dH"])), 1e-9)
-                        for col in ("accepted", "solves", "cg_iter"):
+                        for col in ("accepted", "solves"):
                             self.assertEqual(x[col], y[col], col)
+                        # rounding may move a solve's count by one at the convergence boundary
+                        self.assertLessEqual(abs(int(x["cg_iter"]) - int(y["cg_iter"])), int(x["solves"]))
                     info = json.loads((out / "run_meta.json").read_text())["run"]["md_kernels"]
                     self.assertEqual(info["target"], "cuda")
 

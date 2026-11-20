@@ -488,8 +488,11 @@ class _CGEquality(_Target):
                     step = self.step()
                     r1 = lean_cg(op.normal, b, tol=tol, max_iter=400, check_every=every, info=i1, step=step)
                     self.assertGreater(step.calls, 10)
-                    self.assertTrue(torch.equal(r0.iterations, r1.iterations))
-                    self.assertEqual(i0["loop_iterations"], i1["loop_iterations"])
+                    # the same counts (the CPU emulation is deterministic here; on the GPU a rounding
+                    # difference at the convergence boundary may move a count by one)
+                    slack = 0 if self.device == "cpu" else 1
+                    self.assertLessEqual((r0.iterations - r1.iterations).abs().max().item(), slack)
+                    self.assertLessEqual(abs(i0["loop_iterations"] - i1["loop_iterations"]), slack * every)
                     self.assertLess(rel(r1.x, r0.x), xtol)
                     self.assertTrue(bool(i1["converged"].all()))
                     self.assertLess(r1.residual.max().item(), 10 * max(tol, 1e3 * torch.finfo(r1.residual.dtype).eps))
@@ -522,8 +525,12 @@ class _CGEquality(_Target):
         nan[2] = b1[0]
         r2 = lean_cg(op2.normal, nan, tol=1e-12, max_iter=400, step=self.step())
         alone = lean_cg(HalfLatticeWilson(op.U[:1], 0.11, G46).normal, b1, tol=1e-12, max_iter=400, step=self.step())
-        self.assertTrue(torch.equal(r2.x[0], alone.x[0]))
-        self.assertTrue(torch.equal(r2.x[2], alone.x[0]))
+        if self.device == "cpu":
+            self.assertTrue(torch.equal(r2.x[0], alone.x[0]))
+            self.assertTrue(torch.equal(r2.x[2], alone.x[0]))
+        else:  # torch's CUDA sum of the partials may reduce a (3, n) and a (1, n) tensor in another order
+            self.assertLess(rel(r2.x[0], alone.x[0]), 1e-12)
+            self.assertLess(rel(r2.x[2], alone.x[0]), 1e-12)
         self.assertFalse(bool(torch.isfinite(r2.residual[1])))
 
     def test_unwritable_inputs_return_none(self):
@@ -562,7 +569,8 @@ class _CGEquality(_Target):
                 self.assertLess((term.action(U) - fast.action(U)).abs().max().item(), 1e-8)
                 self.assertEqual(term.cg_kernel_used, self.target)
                 self.assertLess(rel(term.force(U), fast.force(U)), 1e-9)
-                self.assertEqual(term.stats["cg_iterations"], fast.stats["cg_iterations"])
+                slack = 0 if self.device == "cpu" else term.stats["solves"]
+                self.assertLessEqual(abs(term.stats["cg_iterations"] - fast.stats["cg_iterations"]), slack)
 
 
 class CpuCGTest(_CGEquality, unittest.TestCase):
@@ -719,6 +727,22 @@ class CudaSourceTest(unittest.TestCase):
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 self.assertEqual(res.returncode, 0, f"{side}: {res.stderr}")
                 self.assertNotIn("warning", res.stderr, f"{side}: {res.stderr}")
+
+
+class HostSourceTest(unittest.TestCase):
+    def test_host_compiler_has_no_warnings(self):
+        """The host build of MD_KERNEL_SOURCE (the CPU emulation) compiles with -Wall -Wextra without a
+        warning (a duplicate 'static' is an error for some GCC versions)."""
+        cxx = F._find_cxx()
+        if cxx is None:
+            self.skipTest("no host C++ compiler")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "md.cpp"
+            src.write_text(M.MD_KERNEL_SOURCE)
+            res = subprocess.run([cxx, "-std=c++14", "-Wall", "-Wextra", "-fsyntax-only", str(src)],
+                                 capture_output=True, text=True, timeout=300)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("warning", res.stderr, res.stderr)
 
 
 # device declarations of the libm functions the kernels call (cuda_runtime.h provides them under nvcc)

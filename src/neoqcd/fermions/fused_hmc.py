@@ -124,6 +124,7 @@ MD_KERNEL_SOURCE = r"""
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #define MD_HD __host__ __device__ __forceinline__
+#define MD_HDM __host__ __device__ __forceinline__  // member functions
 #define MD_UNROLL _Pragma("unroll")
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 11 || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 7))
 #define MD_GRID_CONSTANT __grid_constant__
@@ -132,6 +133,7 @@ MD_KERNEL_SOURCE = r"""
 #endif
 #else
 #define MD_HD static inline
+#define MD_HDM inline  // member functions (no second 'static')
 #define MD_UNROLL
 #endif
 
@@ -450,7 +452,7 @@ static int md_launch(const ARGS& a, int64_t total, void* stream) {
 #endif
 
 template <typename T, int D, int N, bool WEIGHTED, bool KICK, bool MOVE> struct MdGaugeFn {
-    static MD_HD void run(const NqGaugeArgs& a, int64_t tid) { md_gauge_link<T, D, N, WEIGHTED, KICK, MOVE>(a, tid); }
+    static MD_HDM void run(const NqGaugeArgs& a, int64_t tid) { md_gauge_link<T, D, N, WEIGHTED, KICK, MOVE>(a, tid); }
 };
 
 template <typename T, int D, int N, bool WEIGHTED>
@@ -595,7 +597,7 @@ MD_HD void md_fforce_link(const NqFermionForceArgs& a, int64_t tid) {
 }
 
 template <typename T, int D, int N, bool KICK> struct MdFermionForceFn {
-    static MD_HD void run(const NqFermionForceArgs& a, int64_t tid) { md_fforce_link<T, D, N, KICK>(a, tid); }
+    static MD_HDM void run(const NqFermionForceArgs& a, int64_t tid) { md_fforce_link<T, D, N, KICK>(a, tid); }
 };
 
 static int md_fforce_dispatch(const NqFermionForceArgs& a, void* stream) {
@@ -684,7 +686,7 @@ MD_HD void md_cg_p(const NqCGArgs& a, int64_t tid) {
 }
 
 template <typename T, int OP> struct MdCGFn {
-    static MD_HD void run(const NqCGArgs& a, int64_t tid) {
+    static MD_HDM void run(const NqCGArgs& a, int64_t tid) {
         if (OP == 0) md_cg_dot<T>(a, tid);
         else if (OP == 1) md_cg_xr<T>(a, tid);
         else md_cg_p<T>(a, tid);
@@ -706,7 +708,7 @@ static int md_cg_dispatch(const NqCGArgs& a, void* stream) {
 }
 
 template <typename T, int N, bool KICK, bool MOVE> struct MdUpdateFn {
-    static MD_HD void run(const NqUpdateArgs& a, int64_t tid) { md_update_link<T, N, KICK, MOVE>(a, tid); }
+    static MD_HDM void run(const NqUpdateArgs& a, int64_t tid) { md_update_link<T, N, KICK, MOVE>(a, tid); }
 };
 
 template <typename T, int N>
