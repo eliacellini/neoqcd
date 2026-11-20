@@ -707,9 +707,11 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
     `action.ParametricFastTwoFlavourWilson`.
     The operator (and its complex64 copy) is cached per links tensor (identity and `_version`)
     and per value of every parameter that defines it (kappa, time_sign, colour_product, geometry),
-    so changing `term.kappa` or `term.time_sign` between calls takes effect. Writes through
-    `U.data`, `U.detach()` views or numpy views do not bump `U._version` and are NOT detected
-    (stale operator): unsupported, as for the eta^dagger eta cache.
+    so changing `term.kappa` or `term.time_sign` between calls takes effect. In-place writes
+    through U or any view of it, `U.detach()` included (a detached tensor shares the version
+    counter), bump `U._version` and give a new operator. Writes through `U.data` or a numpy view
+    (`U.numpy()`) do not bump it and are NOT detected (stale operator): unsupported, as for the
+    eta^dagger eta cache.
     """
 
     def __init__(self, kappa, geometry, time_sign=-1.0, even_odd=True, solver_tol=1e-10, action_tol=None,

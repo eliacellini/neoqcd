@@ -735,6 +735,22 @@ class FastTermTest(unittest.TestCase):
         op = fast.operator(U2)
         self.assertIs(fast.operator(U2), op)  # unchanged parameters: still cached
 
+    def test_operator_cache_sees_detach_writes_not_data_writes(self):
+        """What the docstring of FastTwoFlavourWilson states: an in-place write through U.detach()
+        (shared version counter) or a view gives a new operator; writes through U.data or
+        U.numpy() do not bump U._version and keep the (then stale, unsupported) cached operator."""
+        geo = G4s
+        U = links(geo, 2, 105)
+        term = FastTwoFlavourWilson(0.12, geo)
+        for name, write, detected in (("detach", lambda: U.detach().mul_(1.0), True),
+                                      ("view", lambda: U[:, 0].mul_(1.0), True),
+                                      ("data", lambda: U.data.mul_(1.0), False),
+                                      ("numpy", lambda: U.numpy().__imul__(1.0), False)):
+            with self.subTest(write=name):
+                op = term.operator(U)
+                write()
+                self.assertEqual(term.operator(U) is not op, detected)
+
     def test_convergence_policy(self):
         """on_unconverged: raise (default) names kind, residual and samples; warn once per kind;
         ignore counts (item 4, fast term, double and mixed)."""
