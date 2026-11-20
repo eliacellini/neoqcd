@@ -77,7 +77,50 @@ def build_nf_halo_plaquette_masks(flow_pars, defect_mask: torch.Tensor, device=N
                 _plaquette_support_from_links(changed_links, mu, nu)
                 | _plaquette_support_from_links(defect_links, mu, nu)
             )
-    return masks
+    return HaloPlaquetteMasks(masks)
+
+
+class HaloPlaquetteMasks(dict):
+    """The plaquette masks of build_nf_halo_plaquette_masks, keyed by (mu, nu), with their bounding
+    boxes found once here: S_halo would otherwise read them back from the device at every call (two
+    host syncs per dimension and orientation, ~1500 per NEO-REX step at K = 8)."""
+
+    def __init__(self, masks):
+        super().__init__(masks)
+        self.bboxes = {key: _bbox_slices(mask.to(dtype=torch.bool)) for key, mask in masks.items()}
+        self._tables = {}
+
+    def tables(self, defect_mask: torch.Tensor, D: int, device, dtype):
+        """The halo plaquettes of every orientation as gather tables, built once per device:
+
+        - index (4, P): flat link indices (mu * V + x) of U_mu(x), U_nu(x - mu), U_mu(x - nu), U_nu(x)
+          of each anchor x of the masks, x - e = roll(+1) as in sun.pstaple;
+        - a, b (4, P): the link factors kappa = a + b * bc of those links (defect_mask[0], [1]).
+
+        S_halo then evaluates all of them with a few batched operations instead of about 25 small
+        ones per orientation."""
+        key = (str(device), dtype, id(defect_mask), defect_mask.data_ptr(), defect_mask._version)
+        entry = self._tables.get(key)
+        if entry is None:
+            first = next(iter(self.values()))
+            lattice = tuple(int(v) for v in first.shape)
+            volume = int(torch.Size(lattice).numel())
+            ids = torch.arange(volume, device=device).reshape(lattice)
+            rows = []
+            for nu in range(1, int(D)):
+                for mu in range(0, nu):
+                    mask = self[(mu, nu)].to(device=device, dtype=torch.bool)
+                    x = ids[mask]
+                    x_mmu = torch.roll(ids, 1, dims=mu)[mask]
+                    x_mnu = torch.roll(ids, 1, dims=nu)[mask]
+                    rows.append(torch.stack((mu * volume + x, nu * volume + x_mmu, mu * volume + x_mnu, nu * volume + x)))
+            index = torch.cat(rows, dim=1).contiguous()
+            factors = defect_mask.to(device=device, dtype=dtype).reshape(2, -1)
+            a = factors[0].index_select(0, index.flatten()).view(index.shape)
+            b = factors[1].index_select(0, index.flatten()).view(index.shape)
+            entry = (index, a, b)
+            self._tables[key] = entry
+        return entry
 
 
 def _bbox_slices(mask: torch.Tensor):
@@ -125,21 +168,41 @@ def S_halo(
     work_dtype = cfgs.real.dtype if torch.is_complex(cfgs) else cfgs.dtype
     batch_size = int(cfgs.shape[0])
     parameter = _as_parameter_vector(defect_par, batch_size, cfgs.device, work_dtype)
+    if isinstance(plaquette_masks, HaloPlaquetteMasks):
+        # All halo plaquettes at once from the gather tables; per plaquette the same products and
+        # link factors as the loop below (the sum over plaquettes runs in another order)
+        index, a, b = plaquette_masks.tables(defect_mask, int(D), cfgs.device, work_dtype)
+        U = sun.flat_links(cfgs, int(D)).index_select(1, index.flatten()).unflatten(1, tuple(index.shape))
+        U_mu, U_nu_rm, U_mu_rn, U_nu = U.unbind(1)
+        plaq = sun.SUN_mul(sun.SUN_mul(sun.SUN_mul(U_nu_rm, sun.SUN_dagger(U_mu_rn)), sun.SUN_dagger(U_nu)), U_mu)
+        retr = sun.SUN_trace(plaq).real
+        k = a.unsqueeze(0) + b.unsqueeze(0) * parameter.view(-1, 1, 1)
+        weight = k[:, 0] * k[:, 1] * k[:, 2] * k[:, 3]
+        return float(beta) * (1.0 - weight * retr / float(N)).sum(dim=1)
     defect = defect_mask.to(device=cfgs.device, dtype=work_dtype)
-    kappa = _kappa_for_parameter(defect, parameter)
+    p_view = parameter.view((batch_size,) + (1,) * int(D))
+    kappa = None  # the link factors of the whole lattice, only for a halo that wraps around it
+    bboxes = getattr(plaquette_masks, "bboxes", None)  # HaloPlaquetteMasks: no host sync
     out = torch.zeros(batch_size, dtype=work_dtype, device=cfgs.device)
     lattice_shape = tuple(int(v) for v in cfgs.shape[2:-2])
+
+    def kappa_on(direction, slices):
+        # kappa[(slice(None), direction) + slices] without the link factors of the whole lattice
+        local = defect[(slice(None), direction) + slices]
+        return local[0].unsqueeze(0) + local[1].unsqueeze(0) * p_view
 
     for nu in range(1, int(D)):
         for mu in range(0, nu):
             mask = plaquette_masks[(mu, nu)].to(device=cfgs.device, dtype=torch.bool)
-            bbox = _bbox_slices(mask)
+            bbox = bboxes[(mu, nu)] if bboxes is not None else _bbox_slices(mask)
             if bbox is None:
                 continue
 
             mu_shift = _shift_slices(bbox, mu, -1)
             nu_shift = _shift_slices(bbox, nu, -1)
             if not (_slices_inside(mu_shift, lattice_shape) and _slices_inside(nu_shift, lattice_shape)):
+                if kappa is None:
+                    kappa = _kappa_for_parameter(defect, parameter)
                 plaq = sun.SUN_mul(sun.pstaple(cfgs, mu, nu, int(D)), cfgs[:, mu])
                 retr = sun.SUN_trace(plaq).real
                 weight = (
@@ -165,10 +228,10 @@ def S_halo(
             )
             retr = sun.SUN_trace(plaq).real
             weight = (
-                kappa[(slice(None), mu) + bbox]
-                * kappa[(slice(None), nu) + mu_shift]
-                * kappa[(slice(None), mu) + nu_shift]
-                * kappa[(slice(None), nu) + bbox]
+                kappa_on(mu, bbox)
+                * kappa_on(nu, mu_shift)
+                * kappa_on(mu, nu_shift)
+                * kappa_on(nu, bbox)
             )
             local_mask = mask[bbox].to(dtype=work_dtype)
             term = (1.0 - weight * retr / float(N)) * local_mask
@@ -264,6 +327,10 @@ class Wilson_action:
     def from_plaquettes(self, plaquettes, defect):
         retr = plaquettes[0].new_zeros(plaquettes[0].shape)
         has_defect = self._uses_defect()
+        # The link factors in the precision of the plaquettes: the defect mask of
+        # Defect.create_defect_mask is an integer tensor, and integer * Python float gives float32
+        if has_defect:
+            defect = defect.to(dtype=plaquettes[0].dtype)
         kappa = defect[0] + defect[1] * self.defect_par if has_defect else None
         for (mu, nu), plaq_retr in zip(
             ((mu, nu) for nu in range(1, self.D) for mu in range(nu)), plaquettes

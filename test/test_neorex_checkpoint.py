@@ -43,6 +43,30 @@ def _fake_pt():
     return pt, flow
 
 
+class _BufferedFlow(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([1.0]))
+        self.register_buffer("table", torch.zeros(3))
+
+
+def _load_flow_worker(rank, world_size, init_file, checkpoint, out_dir):
+    # Every rank loads through NEOREX.load_flow: rank 0 reads the file, the others receive the state
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if os.uname().sysname == "Darwin" else "lo")
+    dist.init_process_group(backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        flow = _BufferedFlow()
+        flow.table.fill_(-7.0 * (rank + 1))  # a different buffer on every rank before loading
+        pt = object.__new__(MAIN.NEOREX)
+        pt.rank, pt.device, pt.flow = rank, torch.device("cpu"), flow
+        pt.ddp_flow = SimpleNamespace(module=flow, parameters=flow.parameters)
+        pt.load_flow(checkpoint)
+        torch.save({"weight": flow.weight.detach().clone(), "table": flow.table.clone()},
+                   os.path.join(out_dir, f"rank{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
 def _metadata_args():
     return SimpleNamespace(
         nf_layer_type="smearing",
@@ -132,6 +156,23 @@ def _real_neorex_pt(
 
 
 class NEOREXCheckpointTest(unittest.TestCase):
+    def test_load_flow_gives_every_rank_the_buffers_too(self):
+        # The evaluation calls the flow without DDP, so the buffers must not wait for DDP's forward
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = os.path.join(directory, "flow.pt")
+            reference = _BufferedFlow()
+            with torch.no_grad():
+                reference.weight.fill_(2.5)
+                reference.table.copy_(torch.tensor([1.0, 2.0, 3.0]))
+            torch.save(reference.state_dict(), checkpoint)
+            init_file = os.path.join(directory, "init")
+            mp.spawn(_load_flow_worker, args=(2, init_file, checkpoint, directory), nprocs=2, join=True)
+            for rank in range(2):
+                loaded = torch.load(os.path.join(directory, f"rank{rank}.pt"))
+                self.assertEqual(loaded["weight"].tolist(), [2.5], rank)
+                self.assertEqual(loaded["table"].tolist(), [1.0, 2.0, 3.0], rank)
+
     def test_cli_rejects_work_mode_for_builtin_layers(self):
         for layer_type in ("smearing", "residual"):
             args_list = [

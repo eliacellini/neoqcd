@@ -22,6 +22,7 @@ from neoqcd.cnf_training import CNFREXTrainer, DistributedCNFREXTrainer
 from neoqcd.distributedPT import NEOREXProtocolWrapper
 from neoqcd.ladder import parse_ladder, validate_ladder
 from neoqcd.mcmc import HBOR
+import neoqcd.fused as fused
 
 
 def parse_args(argv=None):
@@ -74,6 +75,13 @@ def parse_args(argv=None):
     p.add_argument("--profile-epoch", type=int, default=0,
                    help="Profile this epoch on rank 0 into OUTPUT_DIR/profile_epoch<N>.txt (0: never)")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--fused-kernels",
+        action="store_true",
+        help="Run the HB+OR sweeps through the fused CUDA kernel of neoqcd.fused (built with nvcc at the start "
+        "of the run, cached in $NEOQCD_KERNEL_CACHE). Statistically, not bitwise, equivalent to the torch "
+        "sweep; the torch sweep runs where the kernel does not apply (an input that needs gradients, CPU).",
+    )
     p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, help="Resume training or load a field for evaluation")
@@ -276,6 +284,10 @@ def main(argv=None):
     args = parse_args(argv)
     distributed = _distributed(args)
     rank, world_size, device = distributed if distributed else (0, 1, args.device)
+    if args.fused_kernels:
+        ok, where = fused.enable_hbor_kernel(device, rank=rank, world_size=world_size)
+        if rank == 0:
+            print(f"fused_kernels=on  hbor={'cuda' if ok else 'torch'}  hbor_library={where}", flush=True)
     torch.manual_seed(args.seed)
     if args.checkpoint:
         field, pars, mask, payload = load_cnf_checkpoint(args.checkpoint, device)
