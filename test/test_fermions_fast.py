@@ -542,6 +542,27 @@ class MixedPrecisionTest(unittest.TestCase):
         self.assertFalse(bool(info["stagnated"].any()))
         self.assertLess(res.residual.max().item(), 1e-10)
 
+    def test_worsening_step_is_undone(self):
+        """An outer step that increases the true residual is undone per sample. Sample 1's complex64
+        operator is 10x too small, so its correction overshoots: r -> r - 10 r = -9 r. Its x stays
+        bitwise the start x0, its residual the initial one, and it is marked stagnated; sample 0
+        (exact complex64 operator) converges as on its own (to round-off: dense BLAS products
+        of another batch size)."""
+        A, A64, b = clustered_system([1.0, 3.0], n=48, batch=2, seed=7)
+        w = torch.tensor([[1.0], [0.1]], dtype=torch.float32).to(C64)
+        A64_bad = lambda x: A64(x) * w  # noqa: E731
+        x0 = 0.1 * b.flip(-1)
+        r0 = torch.sqrt(_norm2(b - A(x0)) / _norm2(b))
+        info = {}
+        res = mixed_precision_cg(A, A64_bad, b, x0=x0, tol=1e-12, inner_tol=1e-6, info=info)
+        self.assertTrue(torch.equal(res.x[1], x0[1]))
+        self.assertEqual(res.residual[1].item(), r0[1].item())
+        self.assertEqual(info["stagnated"].tolist(), [False, True])
+        self.assertEqual(info["converged"].tolist(), [True, False])
+        alone = mixed_precision_cg(A, A64, b[:1], x0=x0[:1], tol=1e-12, inner_tol=1e-6)
+        self.assertLess(rel(res.x[:1], alone.x), 1e-12)
+        self.assertLess(res.residual[0].item(), 1e-12)
+
     def test_non_finite_sample_is_isolated(self):
         """A sample with a NaN (or inf) right-hand side does not hold up the batch, in
         mixed_precision_cg as in lean_cg: the healthy samples end bitwise as in a batch without it

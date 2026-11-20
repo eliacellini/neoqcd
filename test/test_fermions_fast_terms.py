@@ -187,6 +187,25 @@ class FastStaggeredPseudofermionTest(unittest.TestCase):
         self.assertEqual(fast.stats["solves"] - n, 3)
         self.assertLess(d1.abs().max().item(), 1e-9)
 
+    def test_action_solved_at_action_tol(self):
+        """Loose solver_tol, tight action_tol: the action solve reaches action_tol (S equal to the
+        reference to 1e-10), the force solve only solver_tol (double and mixed)."""
+        U, _ = haar_links(G2, 2, 27)
+        U2 = SUN_mul(expi(0.2 * random_algebra(U.shape, generator=torch.Generator().manual_seed(3))), U)
+        for precision in ("double", "mixed"):
+            with self.subTest(precision=precision):
+                kw = dict(solver_tol=1e-4, action_tol=1e-12, reuse_guess=False)
+                ref = StaggeredPseudofermion(masses(2), G2, **kw)
+                fast = FastStaggeredPseudofermion(masses(2), G2, precision=precision, **kw)
+                for term in (ref, fast):
+                    term.refresh(U, torch.Generator().manual_seed(6))
+                S_fast = fast.action(U2)
+                self.assertLess(fast.stats["last_residual"].max().item(), 1e-11)
+                self.assertLess(rel(S_fast, ref.action(U2)), 1e-10)
+                fast.force(U2)
+                self.assertGreater(fast.stats["last_residual"].max().item(), 1e-9)
+                self.assertLess(fast.stats["last_residual"].max().item(), 1e-3)
+
     def test_unconverged_policy(self):
         U, gen = haar_links(G2, 2, 24)
         fast = FastStaggeredPseudofermion(0.05, G2, max_iter=3)
@@ -247,6 +266,71 @@ class FastStaggeredPseudofermionTest(unittest.TestCase):
                 print(f"\n{geo.lattice} B=4 staggered M_ee {name}: {(time.perf_counter() - t0) / 10 * 1e3:.2f} ms")
 
 
+class FastTermsConvergencePolicyTest(unittest.TestCase):
+    """The convergence policy (pseudofermion module doc) of the fast ratio, heavy and staggered
+    terms, double and mixed, as test_fermions_fast checks it for FastTwoFlavourWilson: raise names
+    the solve kind and the samples, warn once per kind, ignore only counts; an action solve is
+    checked at action_tol and a force solve at solver_tol (never at the looser of the two)."""
+
+    CASES = (
+        # name, constructor, iteration cap leaving the residual between 10 action_tol and 10 solver_tol
+        ("FastRatioWilsonTerm", lambda **k: FastRatioWilsonTerm(0.20, 0.15, G2, **k), 8),
+        ("FastHeavyWilsonTerm", lambda **k: FastHeavyWilsonTerm(0.15, G2, **k), 8),
+        ("FastStaggeredPseudofermion", lambda **k: FastStaggeredPseudofermion(masses(2), G2, **k), 12),
+    )
+
+    def setUp(self):
+        self.U, _ = haar_links(G2, 2, 41)
+        self.U2 = SUN_mul(expi(0.2 * random_algebra(self.U.shape, generator=torch.Generator().manual_seed(2))), self.U)
+
+    def _term(self, make, precision, max_iter, **kw):
+        term = make(precision=precision, reuse_guess=False, **kw)
+        term.refresh(self.U, torch.Generator().manual_seed(5))  # the ratio refresh solves: full max_iter
+        term.max_iter, term.max_outer = max_iter, 2
+        return term
+
+    def test_policy(self):
+        for name, make, _ in self.CASES:
+            for precision in ("double", "mixed"):
+                with self.subTest(term=name, precision=precision):
+                    term = self._term(make, precision, 2)
+                    self.assertEqual(term.on_unconverged, "raise")
+                    with self.assertRaisesRegex(RuntimeError, rf"^{name} action: CG not converged, relative residual "
+                                                              r".* sample\(s\) \[0, 1\]"):
+                        term.action(self.U2)
+                    with self.assertRaisesRegex(RuntimeError, rf"^{name} force: CG not converged"):
+                        term.force(self.U2)
+                    self.assertEqual(term.stats["unconverged_solves"], 2)
+                    warn = self._term(make, precision, 2, on_unconverged="warn")
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        warn.action(self.U2)
+                        warn.action(self.U2)
+                        warn.force(self.U2)
+                    kinds = [str(w.message).split(":")[0] for w in caught if issubclass(w.category, UnconvergedSolveWarning)]
+                    self.assertEqual(kinds, [f"{name} action", f"{name} force"])
+                    self.assertEqual(warn.stats["unconverged_solves"], 3)
+                    quiet = self._term(make, precision, 2, on_unconverged="ignore")
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error")
+                        quiet.action(self.U2)
+                    self.assertEqual(quiet.stats["unconverged_solves"], 1)
+
+    def test_action_checked_at_action_tol_force_at_solver_tol(self):
+        """solver_tol 1e-2, action_tol 1e-12 and a cap that leaves the residual between them: the
+        action solve is unconverged (raise names it), the force solve with the same cap is not."""
+        for name, make, cap in self.CASES:
+            with self.subTest(term=name):
+                term = self._term(make, "double", cap, solver_tol=1e-2, action_tol=1e-12)
+                with self.assertRaisesRegex(RuntimeError, rf"^{name} action: CG not converged"):
+                    term.action(self.U2)
+                worst = term.stats["last_residual"].max().item()
+                self.assertTrue(1e-10 < worst < 1e-1, worst)
+                term.force(self.U2)  # same accuracy, within 10 solver_tol: silent
+                self.assertEqual(term.stats["unconverged_solves"], 1)
+                self.assertLess(term.stats["last_residual"].max().item(), 1e-1)
+
+
 # ---- stage 2: Hasenbusch ------------------------------------------------------------------------
 class FastHasenbuschTest(unittest.TestCase):
     def test_ratio_and_heavy_against_reference(self):
@@ -285,6 +369,29 @@ class FastHasenbuschTest(unittest.TestCase):
         self.assertAlmostEqual(ham.ratio.heavy_operator(U).kappa.item(), 0.1)
         self.assertIsNot(ham.heavy.operator(U), ham.ratio.heavy_operator(U))
         self.assertAlmostEqual(ham.heavy.operator(U).kappa.item(), 0.15)
+
+    def test_refresh_and_action_solved_at_action_tol(self):
+        """Loose solver_tol, tight action_tol (double and mixed): the ratio refresh's heavy solve
+        and the action solves of the ratio and heavy terms reach action_tol (phi and S equal to
+        the reference), the force solves only solver_tol."""
+        U, _ = haar_links(G2, 2, 36)
+        U2 = SUN_mul(expi(0.2 * random_algebra(U.shape, generator=torch.Generator().manual_seed(4))), U)
+        kw = dict(solver_tol=1e-4, action_tol=1e-12, reuse_guess=False)
+        for precision in ("double", "mixed"):
+            pairs = (("ratio", RatioWilsonTerm(0.20, 0.15, G2, **kw),
+                      FastRatioWilsonTerm(0.20, 0.15, G2, precision=precision, **kw)),
+                     ("heavy", HeavyWilsonTerm(0.15, G2, **kw), FastHeavyWilsonTerm(0.15, G2, precision=precision, **kw)))
+            for name, ref, fast in pairs:
+                with self.subTest(precision=precision, term=name):
+                    ref.refresh(U, torch.Generator().manual_seed(7))
+                    fast.refresh(U, torch.Generator().manual_seed(7))
+                    self.assertLess(rel(fast.phi, ref.phi), 1e-11)  # ratio: the heavy refresh solve at action_tol
+                    S_fast = fast.action(U2)
+                    self.assertLess(fast.stats["last_residual"].max().item(), 1e-11)
+                    self.assertLess(rel(S_fast, ref.action(U2)), 1e-10)
+                    fast.force(U2)
+                    self.assertGreater(fast.stats["last_residual"].max().item(), 1e-9)
+                    self.assertLess(fast.stats["last_residual"].max().item(), 1e-3)
 
     def test_refresh_guard(self):
         U, gen = haar_links(G2, 2, 33)
