@@ -744,6 +744,39 @@ class BuildCacheTest(unittest.TestCase):
         self.assertFalse(lib.exists())
 
 
+class BenchFallbackLogTest(unittest.TestCase):
+    def test_unavailable_compiled_kernel_is_one_log_line(self):
+        """main/bench_fermions.py: a compiled fused kernel that is unavailable (forced) gives one
+        WARNING line with the reason on stderr (--quiet or not), however many rows it skips."""
+        import contextlib
+        import csv
+        import importlib.util
+        import io
+        spec = importlib.util.spec_from_file_location("bench_fermions_fallback", ROOT / "main" / "bench_fermions.py")
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        reason = "no compiler (forced by the test)"
+
+        def unavailable(*args, **kwargs):
+            raise BackendUnavailable(reason)
+
+        argv = ["--device", "cpu", "--lattices", "2^4", "--batches", "1", "2", "--dtypes", "complex128",
+                "--target-time", "0", "--trials", "1", "--warmup", "1", "--min-repeats", "1", "--max-repeats", "1",
+                "--cg-iters", "2", "--cg-min-iters", "1", "--no-compile", "--no-profile", "--skip-legacy",
+                "--half-modes", "matmul", "--fused-kernels", "compiled", "compiled_soa", "--quiet"]
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(bench, "FusedHalfLatticeWilson", unavailable), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bench.main(argv + ["--out", tmp])
+            with open(Path(tmp) / "bench.csv", newline="") as handle:
+                skipped = [r for r in csv.DictReader(handle) if r["status"] == "skipped"]
+        self.assertEqual(len(skipped), 4)  # 2 layouts x 2 batches
+        lines = [line for line in err.getvalue().splitlines() if line.startswith("WARNING: fused kernel")]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertIn(reason, lines[0])
+
+
 class FusedTermTest(unittest.TestCase):
     def test_term_matches_fast_term(self):
         """Action and force of FusedTwoFlavourWilson equal FastTwoFlavourWilson (same draws)."""

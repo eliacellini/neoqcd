@@ -35,8 +35,9 @@ CUDA kernel when it builds, the --fast operator otherwise. It needs --fast and -
 without --kappa-heavy; an explicit "cuda" / "cpu" that cannot be built is an error (no silent
 fallback). --link-layout soa (default) | site picks the link layout of the compiled kernel. The
 requested and resolved kernel, the layout and the backend status are recorded in run_meta.json
-("run"."fused_kernel"); kernel and layout are part of the resume key (checkpoints without them
-count as --kernel off). --precision, --colour-product,
+("run"."fused_kernel"); a fallback of "auto" to the --fast operator (compiled kernel unavailable)
+is also one WARNING line on stderr with the reason, --quiet or not. Kernel and layout are part of
+the resume key (checkpoints without them count as --kernel off). --precision, --colour-product,
 --check-every, --inner-tol and --max-outer are rejected without --fast (the last two also
 without --precision mixed). All are recorded in run_meta.json ("parameters" and "run").
 
@@ -382,6 +383,21 @@ def resolve_fused_kernel(args, device, geometry):
                                            if resolved == "fast" else None)}
 
 
+def fused_kernel_log_line(info):
+    """(line, is_warning) for the log when --kernel runs the --fast operator instead of a compiled
+    kernel, else None. A compiled backend that was tried and is unavailable ("auto" on a CUDA
+    device: nvcc missing, build or load failure) is a warning: the run is several times slower
+    than with the kernel, and run_meta.json alone would not show it in the job log."""
+    if info is None or info["resolved"] != "fast":
+        return None
+    if info["fallback_reason"] is not None:
+        return (f"WARNING: --kernel {info['requested']}: the compiled kernel is unavailable "
+                f"({info['fallback_reason']}); running the --fast operator instead (colour product "
+                f"{info['colour_product_of_fallback']}), several times slower on a GPU"), True
+    return (f"--kernel {info['requested']}: no compiled kernel requested on this device; running the --fast "
+            f"operator (colour product {info['colour_product_of_fallback']})"), False
+
+
 # ---- runtime ------------------------------------------------------------------------------------
 def choose_device(name):
     if name == "cuda" or (name == "auto" and torch.cuda.is_available()):
@@ -685,6 +701,13 @@ def main(argv=None):
         writer = ObservableWriter(csv_path, OBS_FIELDS)
 
     fused_info = resolve_fused_kernel(args, device, geometry)
+    kernel_line = fused_kernel_log_line(fused_info)
+    if kernel_line is not None:
+        line, warning = kernel_line
+        if warning:  # in the job log whatever --quiet says
+            print(line, file=sys.stderr, flush=True)
+        else:
+            _log(args, line)
     ham, fermion = build_hamiltonian(args, geometry)
     integrator = args.integrator_levels
     hmc = HMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator)

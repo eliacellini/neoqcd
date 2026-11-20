@@ -1,13 +1,16 @@
 """End-to-end tests of main/main_hmc.py on 2D 4 x 4 SU(3) (a few seconds on a laptop CPU)."""
 
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -432,6 +435,35 @@ class MainHMCTest(unittest.TestCase):
             MAIN.main(WILSON + ["--fast", "--n-traj", "3", "--resume", "--out", str(out)])
         MAIN.main(WILSON + ["--n-traj", "3", "--resume", "--out", str(out)])
         self.assertEqual(MAIN.stored_solver_key({}, out / "missing.json"), ({"fast": False}, "defaults"))
+
+    def test_kernel_auto_fallback_is_one_log_line(self):
+        """--kernel auto that cannot use the compiled kernel (forced here: the CPU has none to
+        try) writes one WARNING line with the reason to stderr, --quiet or not, besides
+        run_meta.json; without a fallback reason (auto on the CPU) only an info line, not a warning."""
+        reason = "nvcc not found (forced by the test)"
+        out = self.tmp / "auto_fallback"
+        err = io.StringIO()
+        with mock.patch.object(MAIN.fused_mod, "resolve_kernel", lambda kernel, device, geometry, strict=False: ("fast", reason)), \
+                contextlib.redirect_stderr(err):
+            MAIN.main(WILSON + ["--fast", "--kernel", "auto", "--n-traj", "1", "--out", str(out)])
+        lines = [line for line in err.getvalue().splitlines() if "--kernel" in line]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertTrue(lines[0].startswith("WARNING: --kernel auto"), lines[0])
+        self.assertIn(reason, lines[0])
+        self.assertEqual(json.loads((out / "run_meta.json").read_text())["run"]["fused_kernel"]["fallback_reason"], reason)
+        self.assertIsNone(MAIN.fused_kernel_log_line(None))
+        info = {"requested": "auto", "resolved": "fast", "fallback_reason": None, "colour_product_of_fallback": "matmul"}
+        line, warning = MAIN.fused_kernel_log_line(info)
+        self.assertFalse(warning)
+        self.assertIn("matmul", line)
+        self.assertIsNone(MAIN.fused_kernel_log_line(dict(info, resolved="cuda", colour_product_of_fallback=None)))
+        out = self.tmp / "auto_cpu"
+        err, std = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(std):
+            MAIN.main([a for a in WILSON if a != "--quiet"] + ["--fast", "--kernel", "auto", "--n-traj", "1",
+                                                               "--out", str(out)])
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertEqual(sum("--kernel auto" in line for line in std.getvalue().splitlines()), 1)
 
     def test_hasenbusch_arguments_and_resume_key(self):
         for extra in (["--hasenbusch-layout", "shared"], ["--n-heavy-substeps", "2"], ["--n-ratio-substeps", "2"],

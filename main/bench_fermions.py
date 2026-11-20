@@ -418,6 +418,7 @@ class Bench:
         self.meta_compile = {}
         self.meta_kernels = {}
         self.meta_fast = {}
+        self.fused_unavailable = set()  # (kernel, reason) already reported in the log
 
     def emit(self, ctx, measurement, variant, status="ok", t=None, t_min=None, repeats=None,
              iterations=None, error=None, out_dtype=None, kernels=None, notes=""):
@@ -721,6 +722,10 @@ class Bench:
                 op = FusedHalfLatticeWilson(U, self.args.kappa, geo, kernel=kernel, strict=True, link_layout=layout)
             except BackendUnavailable as exc:
                 self.meta_fast[f"{key}:{variant}"] = f"skipped: {exc}"
+                if (kernel, str(exc)) not in self.fused_unavailable:  # one clear line in the log, --quiet or not
+                    self.fused_unavailable.add((kernel, str(exc)))
+                    print(f"WARNING: fused kernel {kernel!r} unavailable on {self.device} ({exc}); "
+                          f"its rows ({variant} and the other layouts) are skipped", file=sys.stderr, flush=True)
                 self.emit(ctx, "eo_normal", variant, status="skipped", notes=f"skipped: {_short(exc, 400)}")
                 continue
             try:
