@@ -7,7 +7,9 @@ the source (kernel, launch, device handling) are checked for syntax and semantic
 CUDA front end when available (`CudaSourceTest`).
 """
 
+import copy
 import os
+import pickle
 import shutil
 import socket
 import subprocess
@@ -603,6 +605,34 @@ class FusedTermTest(unittest.TestCase):
                 self.assertLess(rel(term.phi, fast.phi), 1e-14)
                 self.assertLess((term.action(U) - S_ref).abs().max().item(), 1e-8)
                 self.assertLess(rel(term.force(U), F_ref), 1e-9)
+
+    def test_deepcopy_and_pickle(self):
+        """copy.deepcopy / pickle of the operator and of the term (the ctypes handles are dropped
+        and re-acquired lazily): the copies give the original's results, bitwise."""
+        geo = G46
+        U = links(geo, 2, 62)
+        x = to_half(field(geo, 2, 63), geo)
+        kernels = ["fast", "loop"] + (["cpu"] if cpu_reason() is None else [])
+        for kernel in kernels:
+            with self.subTest(kernel=kernel):
+                op = FusedHalfLatticeWilson(U, kappas(0.12, 0.13), geo, kernel="auto" if kernel == "fast" else kernel)
+                want = op.normal(x)  # the argument templates exist now
+                want64 = op.to(C64).normal(x.to(C64))
+                for name, clone in (("deepcopy", copy.deepcopy(op)), ("pickle", pickle.loads(pickle.dumps(op))),
+                                    ("copy", copy.copy(op))):
+                    self.assertEqual((clone.kernel, clone.compiled), (op.kernel, op.compiled), name)
+                    self.assertTrue(torch.equal(clone.normal(x), want), name)
+                    self.assertTrue(torch.equal(clone.to(C64).normal(x.to(C64)), want64), name)
+                self.assertTrue(torch.equal(op.normal(x), want))  # the original still works
+                term = FusedTwoFlavourWilson(kappas(0.12, 0.13), geo, kernel="auto" if kernel == "fast" else kernel,
+                                             solver_tol=1e-12, precision="mixed")
+                term.refresh(U, torch.Generator().manual_seed(64))
+                term.action(U)  # the operator and its complex64 copy are now cached in the term
+                clones = (("deepcopy", copy.deepcopy(term)), ("pickle", pickle.loads(pickle.dumps(term))))
+                S = term.action(U)  # warm-started from the X the clones also hold
+                for name, clone in clones:
+                    self.assertTrue(torch.equal(clone.phi, term.phi), name)
+                    self.assertTrue(torch.equal(clone.action(clone._op_cache[0]), S), name)  # its copy of U
 
     def test_operator_cache_key_and_alias(self):
         geo = G4s

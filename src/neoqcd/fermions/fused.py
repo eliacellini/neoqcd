@@ -674,13 +674,34 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
         self._backend = None
         super().__init__(U, kappa, geometry, time_sign, dtype=dtype, colour_product=colour_product)
         self.kernel, self.kernel_fallback_reason = resolve_kernel(kernel, self.device, self.geometry, strict)
-        if self.kernel in ("cuda", "cpu"):
+        if self.compiled:
             self._backend = load_backend(self.kernel, self.device)
 
     @property
     def compiled(self):
         """True when the hop runs through a compiled kernel ("cuda" or "cpu")."""
-        return self._backend is not None
+        return self.kernel in ("cuda", "cpu")
+
+    def _get_backend(self):
+        """The loaded library (re-acquired after a copy or unpickling: `__getstate__`)."""
+        if self._backend is None:
+            self._backend = load_backend(self.kernel, self.device)
+        return self._backend
+
+    # ---- copies and pickling -----------------------------------------------------------------
+    def __getstate__(self):
+        """The state without the ctypes objects (the loaded library and the argument templates
+        hold raw pointers: ctypes refuses to copy or pickle them). Both are re-acquired lazily
+        (`_get_backend`, `_args_template`), so copy.copy, copy.deepcopy and pickle work; a copy
+        unpickled where its compiled backend does not load raises BackendUnavailable at the first
+        hop."""
+        state = self.__dict__.copy()
+        state["_backend"] = None
+        state["_kargs"] = {}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     # ---- per-dtype state ---------------------------------------------------------------------
     def _set_dtype(self, dtype):
@@ -797,7 +818,7 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
                 raise ValueError(f"add of shape {tuple(add.shape)} differs from {tuple(psi.shape)}")
             a.add = add.data_ptr()
         stream = torch.cuda.current_stream(psi.device).cuda_stream if psi.device.type == "cuda" else None
-        self._backend.hop(a, stream)
+        self._get_backend().hop(a, stream)
         return out
 
     def _hop_loop(self, psi, t, dagger=False):
