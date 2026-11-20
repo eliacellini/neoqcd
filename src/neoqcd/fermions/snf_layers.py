@@ -20,7 +20,11 @@ Bookkeeping (S(x; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa) of `QCDAction
 
 the identity `w = st - s0 - Q - logJ` of `Flow.__call__`. log J_i is the log-Jacobian the pure-gauge
 layer returns, treated as in `Flow._full_logdet`. For SU(3) it is the exact Haar log-Jacobian
-log |det df_i/dU| (checked against the dense tangent-space Jacobian to ~1e-14, test_fermions_snf);
+log |det df_i/dU|, checked against the dense tangent-space Jacobian of the whole layer map to
+1e-10 absolute: stout in 2D 4 x 4 (test_fermions_snf; the signed layer at rho < 0 in
+test_fermions_fast_action), the signed stout in 4D 2^3 x 4 for a batch of 2 and both signs of rho
+(test_fermions_snf_layer_checks), the residual kinds in 2D and 4D 2^4 (test_fermions_snf_residual);
+gauge equivariance of every kind and invariance of log J in test_fermions_snf_layer_checks;
 for SU(2) the stout value is doubled by the legacy rule of `Flow._full_logdet`, which is NOT the
 exact Haar log-Jacobian (relative error ~1e-3 measured at rho = 0.01-0.1), so Jarzynski is only
 approximate there (`FermionLayerBlock` warns). Jarzynski: <exp(-W)> = Z(lambda_n)/Z(lambda_0) on the joint (U, phi), since
