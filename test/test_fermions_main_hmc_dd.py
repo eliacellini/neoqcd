@@ -181,7 +181,6 @@ class MainHMCDDTest(unittest.TestCase):
             "integers": DD[:-1] + ["4x4"],
             "--n-block-substeps must be >= 1": DD + ["--n-block-substeps", "0"],
             "3 level": DD + ["--integrator", "omelyan,leapfrog"],
-            "--precision mixed yet": DD + ["--fast", "--precision", "mixed"],
         }
         for pattern, argv in refused.items():
             with self.subTest(pattern=pattern), self.assertRaisesRegex(SystemExit, pattern.strip()):
@@ -207,7 +206,8 @@ class MainHMCDDTest(unittest.TestCase):
         ref = self.tmp / "reference"
         MAIN.main(DD + tight + ["--out", str(ref)])
         want = read_observables(ref / "observables.csv")
-        cases = {"fast": ["--fast"], "loop": ["--fast", "--kernel", "loop"]}
+        cases = {"fast": ["--fast"], "loop": ["--fast", "--kernel", "loop"],
+                 "mixed": ["--fast", "--precision", "mixed", "--inner-tol", "1e-5"]}
         if backend_status("cpu")[0]:
             cases["cpu"] = ["--fast", "--kernel", "cpu"]
         for name, extra in cases.items():
@@ -220,10 +220,18 @@ class MainHMCDDTest(unittest.TestCase):
                 self.assertLess(np.abs(got["plaquette"] - want["plaquette"]).max(), 1e-10)
                 self.assertTrue(np.all(got["max_residual"] < 1e-11))
                 meta = json.loads((out / "run_meta.json").read_text())
-                self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fast" if name == "fast"
-                                 else "half_lattice_fused")
-                block = meta["run"]["dd"]["levels"][1][0][0]
-                self.assertEqual(block, "FastBlockTwoFlavour" if name == "fast" else "FusedBlockTwoFlavour")
+                fused = name in ("loop", "cpu")
+                self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fused" if fused else "half_lattice_fast")
+                levels = [lvl[0][0] for lvl in meta["run"]["dd"]["levels"]]
+                self.assertEqual(levels, ["FastSchurTwoFlavour", "FusedBlockTwoFlavour" if fused else "FastBlockTwoFlavour",
+                                          "MaskedActionTerm"])
+                if name == "mixed":  # the real cost: complex64 loop + complex128 outer applications of both terms
+                    self.assertIn("complex64", meta["run"]["cg_iter_definition"])
+                    cost = meta["run"]["dd"]["cost_this_process"]
+                    self.assertEqual(int(got["cg_iter"][::2].sum()),
+                                     sum(cost[t]["cg_loop_iterations"] + cost[t]["double_applications"]
+                                         for t in ("schur", "block")))
+                    self.assertTrue(all(cost[t]["double_applications"] > 0 for t in ("schur", "block")))
         # the solver path is in the resume key
         with self.assertRaisesRegex(SystemExit, "differ"):
             MAIN.main(DD + tight[:1] + ["5"] + tight[2:] + ["--out", str(ref), "--resume", "--fast"])

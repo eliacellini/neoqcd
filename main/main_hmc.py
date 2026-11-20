@@ -65,12 +65,15 @@ Schur-complement term (global solves) outermost with --n-steps steps, the block 
 --n-gauge-substeps steps per block position update (--integrator: one scheme or three); only the
 active links move, and every trajectory is preceded by a translation of the gauge field
 (DDHMC.cycle; --dd-translation random (default) | luscher (appendix C) | odometer | none, the
-last not ergodic, with a WARNING line). With --fast the block term runs through the half-lattice
-operator on the block links (neoqcd.fermions.fast_ddhmc; --kernel selects the fused hop as for
-plain HMC); the Schur term stays on the reference operators and --precision mixed is refused.
-Without --dd-blocks the run is plain HMC, bitwise as before. Refused with staggered or no fermions and with --kappa-heavy. The CSV columns are those of
-plain HMC (cost columns: Schur + block solves; block solves are global CGs on the block operator,
-one operator application per iteration like a full solve); run_meta.json "run"."dd" records the
+last not ergodic, with a WARNING line). With --fast both fermion terms run through the
+half-lattice operator (neoqcd.fermions.fast_ddhmc.FastDDHMCHamiltonian: the block term on the
+block links, the Schur term's full and block solves, hops and force), with --precision,
+--colour-product, --check-every, --inner-tol, --max-outer and --kernel / --link-layout (fused hop)
+as for plain HMC. Without --dd-blocks the run is plain HMC, bitwise as before. Refused with
+staggered or no fermions and with --kappa-heavy. The CSV columns are those of plain HMC (cost
+columns: Schur + block solves; block solves are global CGs on the block operator, one operator
+application per iteration like a full solve; with --precision mixed the real cost of both terms,
+as below); run_meta.json "run"."dd" records the
 blocks, the active-link fraction (measured and the formula of the paper), the translation and its
 period, the levels and the Schur/block split of the solves and iterations of this process. The
 block extents and the translation are part of the resume key (older checkpoints count as plain
@@ -350,8 +353,6 @@ def validate_dd(args):
         raise SystemExit("--dd-blocks is for --fermions wilson (DD-HMC is N_f = 2 Wilson only)")
     if args.kappa_heavy is not None:
         raise SystemExit("--dd-blocks does not combine with Hasenbusch (--kappa-heavy)")
-    if args.precision == "mixed":
-        raise SystemExit("--dd-blocks does not support --precision mixed yet (the Schur term has no fast path)")
     blocks = parse_dd_blocks(args.dd_blocks, args.D)
     lattice = (args.T,) + (args.L,) * (args.D - 1)
     for mu, (n, b) in enumerate(zip(lattice, blocks)):
