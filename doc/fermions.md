@@ -418,10 +418,15 @@ draws, action and force to the solver tolerance, computed differently:
   above 10 max(tol, 1e3 ε) at exit (bounded by `max_iter`, stops at a true-residual floor).
 - `mixed_precision_cg`: defect correction, complex64 inner CG, complex128 residuals; stops on
   convergence, on stagnation (true residual not halved in an outer step) or when the total inner
-  budget `max_iter` is spent.
+  budget `max_iter` is spent. An outer step that increases a sample's residual is undone for that
+  sample. A sample with a non-finite residual (NaN or inf right-hand side) is finished at once, as
+  in `lean_cg`: the other samples end bitwise as in a batch without it, and the convergence check
+  names only that sample (before 20 November its NaN inner tolerance spent the whole inner budget
+  and left the healthy samples at the complex64 level).
 - The operator is cached per links tensor (`_version`) and per value of κ, time_sign,
-  colour product and geometry. Writes through `U.data` or numpy views do not bump `_version`
-  and are not supported (as for the η†η cache).
+  colour product and geometry. In-place writes through U or a view of it, `U.detach()` included
+  (shared version counter), are detected; writes through `U.data` or numpy views do not bump
+  `_version` and are not supported (as for the η†η cache).
 
 **Measured on an A100** (torch 2.0, complex128 unless stated):
 
@@ -446,6 +451,12 @@ addresses that.
   fused into the second hop. `FusedTwoFlavourWilson` / `FusedTwoFlavourHamiltonian` are the fast
   pseudofermion term and Hamiltonian with this operator (heat bath, action, force, solvers,
   mixed precision unchanged).
+- Inputs: the compiled kernels read raw memory, so fields and `add` are made plain first (lazy
+  conjugate and negative bits resolved, strides, offsets and expanded dimensions materialised);
+  `add` on another device is a ValueError. They are not differentiable: with grad mode on, an
+  input that requires grad (field, `add`, links) is a RuntimeError, not a silently detached
+  result (use `fast` or `loop`, or `torch.no_grad()`). Operator and term can be deep-copied and
+  pickled (the ctypes handles are dropped and re-acquired at the first hop).
 - Kernels: `cuda` (the compiled CUDA kernel), `cpu` (the same source built with the host C++
   compiler and run as a loop over the CUDA thread index: tests the index arithmetic without a
   GPU), `loop` (pure torch, explicit only), `auto` (`cuda` on a CUDA device when it builds,
@@ -459,8 +470,18 @@ addresses that.
   PATH) into a shared library with an extern "C" entry point, loaded through ctypes and launched
   on the current torch stream (no torch headers, no ninja, no build lock). Cache directory
   `$NEOQCD_KERNEL_CACHE` (default `~/.cache/neoqcd/kernels`), one file per source hash,
-  compiler version and GPU architecture, written under a temporary name and renamed atomically
-  (concurrent jobs and killed builds are safe). The `cpu` build uses `$CXX`, c++, g++ or clang++.
+  compiler version and GPU architecture, written under a temporary name (host, pid and a random
+  suffix: jobs on several nodes may share the cache; removed on any failure or timeout) and
+  renamed atomically (concurrent jobs and killed builds are safe). A cached file that does not
+  load (empty, truncated, a stale argument layout) is rebuilt once and replaced atomically (the
+  fresh build is loaded under its temporary name first); if that fails too the backend is
+  unavailable with both reasons. The `cpu` build uses `$CXX`, c++, g++ or clang++.
+- Devices and streams: the launch makes the tensors' device current through torch
+  (`torch.cuda.device`, only when it is not torch's current device), so the library (its own
+  static CUDA runtime) switches no device and creates no context behind torch's back; it runs on
+  torch's current stream of that device. The CUDA tests of a second GPU (torch's current device 0
+  or 1, interleaved with torch ops) and of a non-default stream are written but not yet run on a
+  GPU (`CudaDeviceAndStreamTest`).
 - Measured on an A100 (torch 2.0, CUDA 12.1; job 64456003, commit 6858689): the library built
   with nvcc and loaded at the first attempt; all CUDA equality tests passed (largest relative
   deviation 2.55e-16 in complex128). Normal operator D̂†D̂, ms, complex128 / complex64:
@@ -481,8 +502,10 @@ addresses that.
   the link layout and also times the solves with `soa`.)
 - How to enable: `main_hmc.py --fast --kernel cuda [--link-layout soa|site] [--precision
   mixed]` (also `auto`, `cpu`, `loop`; default `off` = `FastTwoFlavourHamiltonian`). Requested and
-  resolved kernel, layout and backend status are in run_meta.json (`run.fused_kernel`), kernel and
-  layout in the resume key (older checkpoints count as `--kernel off`). In Python:
+  resolved kernel, layout and backend status are in run_meta.json (`run.fused_kernel`); an `auto`
+  that falls back to `fast` (compiled kernel unavailable) is also one WARNING line with the reason
+  on stderr (`bench_fermions.py`: one line per unavailable kernel and reason). Kernel and layout
+  are in the resume key (older checkpoints count as `--kernel off`). In Python:
   `FusedTwoFlavourHamiltonian(beta, kappa, geometry, kernel="cuda", link_layout="soa", ...)`.
   `job/debug_hmc_fermions.sh` points `w4f`, `w8f` (the `w4`/`w8` validation points with the
   kernel, `_fused` directories) and `w16` (16^4, β = 5.6, κ = 0.153, B = 16).
@@ -504,7 +527,11 @@ plaquette = 3 × ours, converted):
 is opt-in everywhere and tested for equality against them (`test_fermions_fast`,
 `test_fermions_fast_action`).
 
-- `main_hmc.py --fast`: `FastTwoFlavourHamiltonian`.
+- `main_hmc.py --fast`: `FastTwoFlavourHamiltonian`. The solver path is in the resume key
+  (`solver_key`: `--fast` and with it `--precision`, `--colour-product`, `--check-every`, and
+  `--inner-tol`/`--max-outer` with mixed precision), so a run resumes only with the settings it
+  started with. Checkpoints from before 20 November take these settings from the run_meta.json
+  written with them (else the defaults, i.e. the reference path), with one log line.
 - `QCDAction(..., fast=True, precision=..., colour_product=..., check_every=..., inner_tol=...,
   max_outer=...)` (Wilson only; ValueError for staggered, and for fast-only options without
   `fast=True`): the fermion term is `ParametricFastTwoFlavourWilson` (`action.py`), the fast term
