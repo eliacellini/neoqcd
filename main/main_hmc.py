@@ -40,6 +40,16 @@ is also one WARNING line on stderr with the reason, --quiet or not. Kernel and l
 the resume key (checkpoints without them count as --kernel off). --precision, --colour-product,
 --check-every, --inner-tol and --max-outer are rejected without --fast (the last two also
 without --precision mixed). All are recorded in run_meta.json ("parameters" and "run").
+--md-kernels none (default) | all | a comma list of gauge_force, update, fermion_force, cg (needs
+--kernel cuda, cpu or auto; not with --dd-blocks) runs the rest of the trajectory through the
+fused kernels of neoqcd.fermions.fused_hmc on the target of the hop ("cuda", or "cpu" = the host
+build): the gauge force with the defect weights (and the momentum kick in the same pass),
+U <- exp(i eps P) U with P <- P - eps F (the last kick of each position update fused with it), the
+pseudofermion force from the half-lattice solve, the CG linear algebra between the hops. Same
+physics: agreement with the torch code to rounding, not bitwise (a different chain from the same
+seed). With "auto" falling back to the --fast operator the MD kernels run the torch code too (in
+the same WARNING line). The components are in the resume key (older checkpoints: none) and in
+run_meta.json ("run"."md_kernels": requested, target, backend status).
 
 Cost columns. `cg_iter` is the sum over the solves of the trajectory of the largest per-replica
 CG iteration count (the reference and --fast double: one operator application each). With
@@ -89,8 +99,8 @@ Resume: --resume reads <out>/checkpoint.*, checks that the physics parameters ag
 rows past the checkpoint and continues with the stored generator state: the continuation is
 bitwise identical to an uninterrupted run with the same seed (same device and thread count).
 The solver path is part of the check (`solver_key`: --fast, and with it --precision,
---colour-product, --check-every, and --inner-tol / --max-outer with mixed precision; plus --kernel
-and --link-layout): a run is resumed only with the settings it was started with, so run_meta.json
+--colour-product, --check-every, and --inner-tol / --max-outer with mixed precision; plus --kernel,
+--link-layout and --md-kernels): a run is resumed only with the settings it was started with, so run_meta.json
 describes the whole run. Checkpoints written before the key had the solver path take it from the
 run_meta.json written with them, else from the defaults (reference path); one line in the log says so.
 """
@@ -129,6 +139,7 @@ from neoqcd.fermions.io import (  # noqa: E402
 from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_product  # noqa: E402
 from neoqcd.fermions.fast_terms import FastHasenbuschHamiltonian, FastStaggeredHamiltonian  # noqa: E402
 from neoqcd.fermions import fused as fused_mod  # noqa: E402
+from neoqcd.fermions import fused_hmc as fused_hmc_mod  # noqa: E402
 from neoqcd.fermions.ddhmc import DDHMC, BlockDecomposition, DDHMCHamiltonian  # noqa: E402
 from neoqcd.fermions.fast_ddhmc import FastDDHMCHamiltonian  # noqa: E402
 from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian  # noqa: E402
@@ -211,6 +222,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "off (default) = the --fast operator.")
     p.add_argument("--link-layout", choices=fused_mod.LINK_LAYOUTS, default=None,
                    help=f"With --kernel: link layout of the compiled kernel (default {fused_mod.DEFAULT_LINK_LAYOUT}).")
+    p.add_argument("--md-kernels", default=None,
+                   help="With --kernel cuda|cpu|auto: fused kernels for the rest of the trajectory "
+                        "(neoqcd.fermions.fused_hmc): none (default), all, or a comma list of "
+                        f"{', '.join(fused_hmc_mod.MD_COMPONENTS)}.")
     p.add_argument("--check-every", type=int, default=None,
                    help="With --fast: host convergence check of the CG every k iterations (default 10).")
     p.add_argument("--inner-tol", type=float, default=None,
@@ -299,6 +314,18 @@ def validate_args(args):
         args.link_layout = fused_mod.DEFAULT_LINK_LAYOUT if args.link_layout is None else args.link_layout
     elif args.link_layout is not None:
         raise SystemExit("--link-layout needs --kernel")
+    try:
+        md = fused_hmc_mod.parse_md_kernels(args.md_kernels)
+    except ValueError as exc:
+        raise SystemExit(f"--md-kernels: {exc}")
+    if md:
+        if args.kernel == "off":
+            raise SystemExit("--md-kernels needs --kernel cuda, cpu or auto (and --fast)")
+        if args.kernel == "loop":
+            raise SystemExit("--md-kernels needs a compiled kernel: --kernel cuda, cpu or auto, not loop")
+        if args.dd_blocks is not None:
+            raise SystemExit("--md-kernels does not support DD-HMC (--dd-blocks)")
+    args.md_kernels = list(md)
     if args.on_unconverged is not None and not (args.fermions == "wilson" or (args.fermions == "staggered" and args.fast)):
         raise SystemExit("--on-unconverged is for --fermions wilson, or staggered with --fast")
     args.colour_product = "auto" if args.colour_product is None else args.colour_product
@@ -442,6 +469,7 @@ def physics_key(args):
         "kappa_heavy": None if args.kappa_heavy is None else float(args.kappa_heavy),
         "hasenbusch_layout": args.hasenbusch_layout,
         "kernel": args.kernel, "link_layout": args.link_layout,
+        "md_kernels": list(args.md_kernels),
         "solver": solver_key(vars(args)),
         "dd": dd_key(args),
     }
@@ -509,6 +537,30 @@ def resolve_fused_kernel(args, device, geometry):
             "link_layout": args.link_layout, "compiled": resolved in ("cuda", "cpu"), "backend_status": status,
             "colour_product_of_fallback": (resolve_colour_product(args.colour_product, device)
                                            if resolved == "fast" else None)}
+
+
+def resolve_md_kernels(args, fused_info, device):
+    """run_meta record of --md-kernels (None without it): the compiled target is the resolved hop
+    kernel's ("cuda" or "cpu"); with the hop resolved to "fast" ("auto" without a usable compiled
+    kernel) the MD kernels run the torch code (reason recorded). For an explicit "cuda" / "cpu" an
+    unavailable MD library is a SystemExit, as for the hop."""
+    if not args.md_kernels:
+        return None
+    target = fused_info["resolved"] if fused_info is not None and fused_info["resolved"] in ("cuda", "cpu") else None
+    reason, status = None, None
+    if target is None:
+        reason = (f"the hop kernel resolved to {fused_info['resolved'] if fused_info else None!r}: "
+                  f"no compiled target ({fused_info['fallback_reason'] if fused_info else 'no --kernel'})")
+    else:
+        ok, why = fused_hmc_mod.md_backend_status(target, device)
+        if ok:
+            status = f"{target} library {why}"
+        elif args.kernel in ("cuda", "cpu"):
+            raise SystemExit(f"--md-kernels with --kernel {args.kernel}: MD kernel library unavailable: {why}")
+        else:
+            reason, target = why, None
+    return {"requested": list(args.md_kernels), "target": target, "fallback_reason": reason,
+            "backend_status": status if status is not None else f"torch code ({reason})"}
 
 
 def fused_kernel_log_line(info):
@@ -582,9 +634,10 @@ def build_dd_hamiltonian(args, geometry, device=None):
     return ham, FermionTerms([ham.schur, ham.block])
 
 
-def build_hamiltonian(args, geometry, device=None):
+def build_hamiltonian(args, geometry, device=None, md_target=None):
     """Hamiltonian and its fermion term (None for --fermions none; `FermionTerms` for Hasenbusch
-    and DD-HMC). `device` is where the DD-HMC block masks are built (default CPU)."""
+    and DD-HMC). `device` is where the DD-HMC block masks are built (default CPU); `md_target` the
+    compiled target of --md-kernels ("cuda", "cpu" or None: torch code)."""
     if args.dd_blocks is not None:
         return build_dd_hamiltonian(args, geometry, device)
     kw = dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
@@ -606,6 +659,14 @@ def build_hamiltonian(args, geometry, device=None):
     if args.fermions == "staggered" and args.fast:
         ham = FastStaggeredHamiltonian(args.beta, args.mass, geometry, n_gauge_substeps=args.n_gauge_substeps,
                                        on_unconverged=args.on_unconverged, **fast_kw, **kw)
+        return ham, ham.fermion
+    if args.fermions == "wilson" and args.fast and args.kernel != "off" and args.md_kernels:
+        ham = fused_hmc_mod.FusedMDHamiltonian(
+            args.beta, args.kappa, geometry, n_gauge_substeps=args.n_gauge_substeps, md_kernels=args.md_kernels,
+            md_target=md_target, md_strict=md_target is not None and args.kernel in ("cuda", "cpu"),
+            kernel=args.kernel, link_layout=args.link_layout, strict=args.kernel in ("cuda", "cpu"),
+            precision=args.precision, check_every=args.check_every, colour_product=args.colour_product,
+            inner_tol=args.inner_tol, max_outer=args.max_outer, on_unconverged=args.on_unconverged, **kw)
         return ham, ham.fermion
     if args.fermions == "wilson" and args.fast and args.kernel != "off":
         ham = fused_mod.FusedTwoFlavourHamiltonian(
@@ -827,6 +888,7 @@ def main(argv=None):
         stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout", "link_layout",
                                                                   "dd")})  # older checkpoints: plain HMC
         stored["kernel"] = meta.get("extra", {}).get("kernel", "off")  # older checkpoints: --kernel off
+        stored["md_kernels"] = list(meta.get("extra", {}).get("md_kernels", []))  # older checkpoints: none
         stored["solver"], solver_source = stored_solver_key(meta.get("extra", {}), meta_path)
         if stored != physics_key(args):
             raise SystemExit(f"--resume: checkpoint parameters {stored} differ from {physics_key(args)}")
@@ -862,9 +924,22 @@ def main(argv=None):
             print(line, file=sys.stderr, flush=True)
         else:
             _log(args, line)
-    ham, fermion = build_hamiltonian(args, geometry, device)
+    md_info = resolve_md_kernels(args, fused_info, device)
+    md_target = None if md_info is None else md_info["target"]
+    if md_info is not None and md_target is None:
+        line = (f"--md-kernels {','.join(args.md_kernels)}: no compiled target ({md_info['fallback_reason']}); "
+                "running the torch code")
+        if device.type == "cuda":  # several times slower: in the job log whatever --quiet says
+            print("WARNING: " + line, file=sys.stderr, flush=True)
+        else:
+            _log(args, line)
+    ham, fermion = build_hamiltonian(args, geometry, device, md_target=md_target)
     integrator = args.integrator_levels
-    if args.dd_blocks is None:
+    if args.dd_blocks is None and md_target is not None and "update" in args.md_kernels:
+        hmc = fused_hmc_mod.FusedHMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator,
+                                     target=md_target, strict=args.kernel in ("cuda", "cpu"))
+        update = hmc.trajectory
+    elif args.dd_blocks is None:
         hmc = HMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator)
         update = hmc.trajectory
     else:
@@ -891,6 +966,7 @@ def main(argv=None):
         "fermion_operator": ("reference" if not args.fast else
                              "half_lattice_fast" if fused_info is None else "half_lattice_fused"),
         "fused_kernel": fused_info,
+        "md_kernels": md_info,
         "precision": args.precision,
         "colour_product": resolve_colour_product(args.colour_product, device) if args.fast else None,
         "hasenbusch": (None if args.kappa_heavy is None else
@@ -908,6 +984,8 @@ def main(argv=None):
         extra = {"seed": args.seed, "final": bool(final), "kappa_heavy": args.kappa_heavy,
                  "hasenbusch_layout": args.hasenbusch_layout, "kernel": args.kernel,
                  "link_layout": args.link_layout, "solver": solver_key(vars(args))}
+        if args.md_kernels:  # runs without --md-kernels keep the checkpoint they always had
+            extra["md_kernels"] = list(args.md_kernels)
         if args.dd_blocks is not None:  # plain runs keep the checkpoint they always had
             extra.update(dd=dd_key(args), dd_state=dd_state(hmc))
             run_info["dd"]["cost_this_process"] = dd_cost(ham)
