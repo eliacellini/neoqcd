@@ -67,12 +67,22 @@ def random_momenta(shape, generator=None, dtype=torch.cdouble, device=None):
     return random_algebra(shape, generator=generator, dtype=dtype, device=device)
 
 
+def _float_mask(defect_mask):
+    """The defect mask as a floating tensor: an integer or boolean mask becomes float64 (an integer
+    mask times a python float would give float32 link factors, and casting the coupling to the
+    mask's dtype would truncate it)."""
+    defect_mask = torch.as_tensor(defect_mask)
+    return defect_mask if defect_mask.is_floating_point() else defect_mask.to(torch.float64)
+
+
 def defect_plaquette_weights(defect_mask, defect_par, D):
     """Plaquette weights {(mu, nu): field} of `Wilson_action` with a defect, for a scalar defect_par.
 
     kappa = defect_mask[0] + defect_mask[1] * defect_par on the links, and the weight of a plaquette
-    is the product of the kappa of its four links (`theory.plaquette_weight`).
+    is the product of the kappa of its four links (`theory.plaquette_weight`). A non-floating mask
+    is taken as float64.
     """
+    defect_mask = _float_mask(defect_mask)
     kappa = defect_mask[0] + defect_mask[1] * float(defect_par)
     return {(mu, nu): plaquette_weight(kappa, mu, nu, D) for nu in range(1, D) for mu in range(nu)}
 
@@ -83,8 +93,10 @@ def batched_defect_plaquette_weights(defect_mask, defect_par, D):
     Entry b of each field (shape (B,) + lattice) equals the field of
     `defect_plaquette_weights(defect_mask, defect_par[b], D)`, i.e. `theory.plaquette_weight` of
     kappa_b = defect_mask[0] + defect_mask[1] * defect_par[b]; this is the per-configuration layout
-    accepted by `WilsonGaugeAction`. A scalar (0-dim) defect_par gives B = 1.
+    accepted by `WilsonGaugeAction`. A scalar (0-dim) defect_par gives B = 1. A non-floating mask
+    is taken as float64 (the couplings are not truncated to its dtype).
     """
+    defect_mask = _float_mask(defect_mask)
     c = torch.as_tensor(defect_par, dtype=defect_mask.dtype, device=defect_mask.device).reshape(-1)
     n_lattice = defect_mask.dim() - 2  # defect_mask is (2, D) + lattice
     # kappa of shape (D, B) + lattice, so that plaquette_weight's kappa[mu] is (B,) + lattice and its
