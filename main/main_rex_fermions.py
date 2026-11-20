@@ -38,7 +38,8 @@ Output directory (--out, default output/rex_fermions/<auto name>):
     observables.csv     one row per (step, rung) (OBS_FIELDS): rung-averaged plaquette (mean over
                         chains of the configuration carrying the rung after the step), <exp(-dH)>
                         of the trajectories run at that rung, swap attempts/acceptances of the
-                        pair (rung, rung + 1) in this step, cost of the step;
+                        pair (rung, rung + 1) in this step, cost of the step, solver convergence of
+                        the step (max_residual, unconverged_solves: `main_snf_fermions.SolveMonitor`);
     replica_history.npz measured steps only: labels (steps, n_rungs, n_chains): rung carried by
                         each slot after the swaps; plaquette (same shape): plaquette of each slot's
                         configuration; defect_action (same shape): S_D = dS/dc at the slot's bc

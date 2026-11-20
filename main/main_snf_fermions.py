@@ -45,23 +45,36 @@ side --defect-size in the spatial directions at t = --defect-time-slice, dsize^(
 spatial coordinates = --defect-space-slice), e.g. the 2-link defect of the tests.
 
 Output directory (--out, default output/snf_fermions/<auto name>):
-    samples.csv     one row per evaluated sample (SAMPLE_FIELDS);
+    samples.csv     one row per evaluated sample (SAMPLE_FIELDS), with the solver convergence of
+                    the batch (max_residual, unconverged_solves: `SolveMonitor`);
     blocks.csv      one row per (evaluation batch, protocol step) (BLOCK_FIELDS);
-    training.csv    one row per training step (TRAIN_FIELDS), --mode snf only; param_abs_mean is
-                    the mean |parameter| the step's flow ran with (before its optimizer step);
+    training.csv    one row per training step (TRAIN_FIELDS), --mode snf only; param_abs_mean,
+                    max_abs_coeff and injectivity_ratio (`snf_layers.layer_diagnostics`) are those
+                    of the flow the step ran with (before its optimizer step); solver convergence;
     run_meta.json   parameters + summary: Jarzynski dF = -log <exp(-W)> = -log Z_n/Z_0 with its
                     jackknife error, ESS = <e^-W>^2/<e^-2W>, mean work/heat/logJ, acceptance per
-                    block, solves and CG iterations per sample, seconds per sample;
-    flow.pt / flow.json   (snf) {"state_dict": FermionSNF.state_dict(), "optimizer", "train_step"}
-                    and a sidecar with geometry, protocol, couplings and layer settings;
+                    block, solves and CG iterations per sample, seconds per sample, convergence
+                    (summary.convergence), skipped optimizer steps (summary.training
+                    .nonfinite_grad_steps), the evaluated flow's bijectivity diagnostics
+                    (run.layer_diagnostics; one RuntimeWarning per phase when exceeded);
+    flow.pt / flow.json   (snf) {"state_dict": FermionSNF.state_dict(), "optimizer", "train_step",
+                    "checkpoint"} and a sidecar with geometry, protocol, couplings, conditioning and
+                    layer settings; flow_prev.pt the previous generation (checkpoint pair below);
     pool.pt / pool.json   pool links + run generator (`neoqcd.fermions.io.save_state`), with
                     extra = {"phase": "train"|"eval"|"done", "progress": steps/batches done}.
 Cost columns: `solves` counts the CG solves of the flow for one batch; a batched solve serves the B
 configurations, each of which needs its own, so `solves` is also the number of solves per sample.
 `pool_solves` are those of the --n-between decorrelation trajectories (per sample likewise).
 
-Resume: --resume reads pool.* (and flow.pt), checks the physics parameters, drops CSV rows past
-the checkpoint and continues training or evaluation where the checkpoint left it.
+Resume: --resume reads pool.* (and the flow file of the pool's step, `load_flow_checkpoint`),
+checks the physics parameters and the training settings (`check_resume_key`; entries an older
+checkpoint lacks are accepted with a note), drops CSV rows past the checkpoint and continues
+training or evaluation where the checkpoint left it. Checkpoints write the flow first (atomically,
+the old flow.pt kept as flow_prev.pt) and then the pool, whose sidecar commits the pair: at any kill
+one flow file matches the pool, and a pair where none does is refused.
+
+--load-flow checks the sidecar: same architecture, and same protocol parameter, endpoints, values
+and conditioning unless --load-flow-force (`check_flow_sidecar`).
 """
 
 from __future__ import annotations
