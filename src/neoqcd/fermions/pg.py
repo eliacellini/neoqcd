@@ -50,14 +50,24 @@ loss costs).
 
 Supported terms (exact type): `TwoFlavourWilson` and `ParametricTwoFlavourWilson` even-odd (the
 `QCDAction` default). Anything else raises TypeError.
+
+Joint loss (`fermion_path_gradient_loss`): the pure-gauge `cnf.path_gradient_loss` with the gauge
+action of the ladder, unchanged, plus Re <grad_U xi_f, i F_theta U> (the loss is linear in xi):
+xi_f and its gradient at frozen field parameters, the live field only in the tangent, so the
+parameter gradient is that of the pure-gauge construction applied to the joint action. d_c S comes
+from `defect_ladder_action` (the pure-gauge `ladder_action`), never from `QCDAction`, whose
+parameters are constants (a jvp through it is silently zero; unit test).
 """
 
 import contextlib
+import functools
 import time
 import warnings
+from types import SimpleNamespace
 
 import torch
 
+from neoqcd.fermions._gauge_cnf import ladder_action, lie_tangent, path_gradient_loss
 from neoqcd.fermions.action import ParametricTwoFlavourWilson
 from neoqcd.fermions.dirac import WilsonDirac
 from neoqcd.fermions.pseudofermion import (
@@ -68,7 +78,12 @@ from neoqcd.fermions.pseudofermion import (
 )
 from neoqcd.fermions.solver import cg
 
-__all__ = ["LossSolveCounter", "pseudofermion_pg_term", "pg_fermion_kind", "hermitian_tangent"]
+__all__ = ["LossSolveCounter", "pseudofermion_pg_term", "pg_fermion_kind", "hermitian_tangent",
+           "defect_ladder_action", "check_same_defect", "fermion_path_gradient_loss", "frozen_parameters",
+           "FERMION_TERM"]
+
+# The fermion contribution of the residual: S_pf of the joint action with the replica's phi held fixed.
+FERMION_TERM = "joint_pseudofermion"
 
 
 # ---- bookkeeping ------------------------------------------------------------------------------
@@ -265,3 +280,128 @@ def pseudofermion_pg_term(U, fermion, velocity, *, phi=None, kappa=None, volume=
             t2 = 2.0 * _rdot(DX, g_ops.eo.apply(Y_res.x.detach()))
             (gradient,) = torch.autograd.grad((s + t2).sum(), Ug)
     return {"xi": s.detach() / volume, "gradient": gradient / volume, "S_pf": S_pf.detach(), "counter": counter}
+
+
+# ---- the joint loss ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def frozen_parameters(model):
+    """Parameters of `model` without requires_grad inside the block (as `cnf._frozen_parameters`)."""
+    flags = [(p, p.requires_grad) for p in model.parameters()]
+    for p, _ in flags:
+        p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p, flag in flags:
+            p.requires_grad_(flag)
+
+
+def defect_ladder_action(geometry, beta, defect_mask):
+    """The gauge action S_g(U; beta, c) of the bc ladder as a function (U, c) -> (B,), differentiable
+    in c: the pure-gauge `cnf_training.ladder_action` (domain "defect").
+
+    d_c S of the PG residual must come from here: `QCDAction` stores its parameters as floats or
+    detached tensors (`action._as_parameter`), so a derivative in c through it does not exist. The
+    value equals `QCDAction.gauge_action(U, c)` (unit test).
+    """
+    pars = SimpleNamespace(D=int(geometry.D), N=int(geometry.N))
+    return functools.partial(ladder_action, pars, "defect", float(beta), defect_mask, int(geometry.volume))
+
+
+def check_same_defect(field_mask, action_mask, what="defect"):
+    """ValueError unless two (2, D, lattice) defect masks agree link by link (the field's patch and
+    the action's mask are built separately: `cnf_io.build_cnf` and the fermion drivers)."""
+    a = torch.as_tensor(field_mask).detach().to("cpu", torch.float64)
+    b = torch.as_tensor(action_mask).detach().to("cpu", torch.float64)
+    if a.shape != b.shape:
+        raise ValueError(f"{what}: the field's defect mask has shape {tuple(a.shape)}, the action's {tuple(b.shape)}")
+    differ = int((a != b).any(dim=0).sum())
+    if differ:
+        raise ValueError(f"{what}: the field's defect mask and the action's differ on {differ} links "
+                         f"(field {int(a[1].sum())} defect links, action {int(b[1].sum())})")
+
+
+def _slice_kappa(kappa, sl, B):
+    if torch.is_tensor(kappa) and kappa.dim() == 1 and kappa.numel() == B and B > 1:
+        return kappa[sl]
+    return kappa
+
+
+def _pinn(xi, t, volume):
+    """V Var(xi | t) within groups of equal t (`cnf._pinn`), 0-dim."""
+    groups = torch.unique(t.detach())
+    total, count = xi.new_zeros(()), 0
+    for value in groups:
+        sample = xi[t.detach() == value]
+        if sample.numel() > 1:
+            total = total + sample.var(unbiased=False) * sample.numel()
+            count += sample.numel()
+    return volume * total / max(count, 1)
+
+
+def fermion_path_gradient_loss(field, action_fn, fermion, U, t, *, volume=None, chunk_size=None,
+                               directions_per_term=1, tol=None, max_iter=None, on_unconverged=None,
+                               counter=None):
+    """PG loss of the joint action S_g(U; c) + S_pf(U, phi) per chain (module doc).
+
+    loss = [unchanged pure-gauge `cnf.path_gradient_loss(field, action_fn, U, t)`]
+           + Re <grad_U xi_f, lie_tangent(U, field.drift(U, t))>,
+    the second with xi_f from `pseudofermion_pg_term` at frozen field parameters (links
+    differentiated, also through the frozen field) and the live field in the tangent, so the
+    parameter gradient reaches the live field only. `action_fn(U, c)` is the gauge action of the
+    ladder (`defect_ladder_action`); `fermion` holds the phi of each chain (the phi of its last
+    trajectory: S_pf does not depend on c). `chunk_size` splits the chains (memory only).
+
+    Returns a dict: loss (B,) (differentiable in the field parameters), loss_gauge, loss_fermion,
+    xi = xi_gauge + xi_fermion, xi_gauge, xi_fermion (B,) detached, S_pf (B,) (= Re phi^dagger X at
+    U: <S_pf>/n = 1 in equilibrium), pinn (V Var(xi | t) of the total), F_norm (of the pure-gauge
+    loss), solves (`LossSolveCounter.as_dict()` of the fermion part), gauge_seconds.
+    """
+    pg_fermion_kind(fermion)
+    if volume is None:
+        volume = fermion.geometry.volume
+    volume = int(volume)
+    t = torch.as_tensor(t, dtype=U.real.dtype, device=U.device).reshape(-1)
+    if t.numel() == 1:
+        t = t.expand(U.shape[0]).clone()
+    if t.numel() != U.shape[0]:
+        raise ValueError(f"t must be scalar or have one value per chain ({U.shape[0]})")
+    counter = LossSolveCounter() if counter is None else counter
+    start = time.perf_counter()
+    gauge = path_gradient_loss(field, action_fn, U, t, volume=volume, chunk_size=chunk_size,
+                               directions_per_term=directions_per_term)
+    gauge_seconds = time.perf_counter() - start
+    phi = fermion.phi
+    if phi is None:
+        raise RuntimeError("the pseudofermion field is not set: the PG term needs the phi of the last trajectory")
+    B = U.shape[0]
+    size = B if chunk_size is None else int(chunk_size)
+    parts = []
+    for begin in range(0, B, size):
+        sl = slice(begin, begin + size)
+        tc = t[sl]
+        tangent = lambda value, tc=tc: lie_tangent(value, field.drift(value, tc))
+        with frozen_parameters(field):
+            parts.append(pseudofermion_pg_term(U[sl], fermion, tangent, phi=phi[sl], kappa=_slice_kappa(fermion.kappa, sl, B),
+                                               volume=volume, tol=tol, max_iter=max_iter,
+                                               on_unconverged=on_unconverged, counter=counter))
+    xi_f = torch.cat([p["xi"] for p in parts])
+    gradient = torch.cat([p["gradient"] for p in parts])
+    S_pf = torch.cat([p["S_pf"] for p in parts])
+    velocity = lie_tangent(U.detach(), field.drift(U.detach(), t))
+    loss_f = (gradient.conj() * velocity).real.flatten(1).sum(1)
+    xi_g = gauge["xi"]
+    xi = xi_g + xi_f
+    return {
+        "loss": gauge["loss"] + loss_f,
+        "loss_gauge": gauge["loss"].detach(),
+        "loss_fermion": loss_f.detach(),
+        "xi": xi,
+        "xi_gauge": xi_g,
+        "xi_fermion": xi_f,
+        "S_pf": S_pf,
+        "pinn": _pinn(xi, t, volume),
+        "F_norm": gauge["F_norm"],
+        "solves": counter.as_dict(),
+        "gauge_seconds": gauge_seconds,
+    }
