@@ -164,6 +164,7 @@ TRAIN_FIELDS = (
 
 POOL_NAME = "pool"
 FLOW_NAME = "flow"
+FLOW_PREV = "flow_prev.pt"  # the previous generation of flow.pt (checkpoint pair, `save_flow`)
 
 
 # ---- arguments ----------------------------------------------------------------------------------
@@ -242,7 +243,11 @@ def parse_args(argv=None):
     add_residual_args(p)
     p.add_argument("--load-flow", type=str, default=None,
                    help="flow.pt of a previous snf run (layer weights); its flow.json sidecar must record the "
-                        "same layer architecture.")
+                        "same layer architecture, protocol parameter, initial value, protocol values and layer "
+                        "conditioning (c_i, d_i).")
+    p.add_argument("--load-flow-force", action="store_true",
+                   help="Load a --load-flow flow trained on another protocol (parameter, endpoints, values or "
+                        "conditioning), printing what differs; the architecture must still match.")
     p.add_argument("--train-steps", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3,
                    help="Adam learning rate. Adam's first steps move every parameter by about lr whatever "
@@ -350,22 +355,64 @@ def flow_architecture(args):
     return arch
 
 
-def check_flow_sidecar(args, flow_pt):
-    """Refuse a flow.pt whose sidecar records another architecture (or no sidecar at all)."""
+def check_flow_sidecar(args, flow_pt, log=print):
+    """Refuse a flow.pt whose sidecar records another architecture (or no sidecar at all), or another
+    protocol: parameter name, initial value, protocol values, layer conditioning (c_i, d_i) (a flow
+    trained in kappa would otherwise load silently into a beta or bc run with the same n, and a
+    reversed protocol flips the sign of d_i). --load-flow-force loads a flow of another protocol
+    (same architecture), printing what differs. Entries an older sidecar does not record are
+    listed in a note and not compared."""
     sidecar = Path(flow_pt).with_suffix(".json")
     if not sidecar.exists():
         raise SystemExit(f"--load-flow: no sidecar {sidecar} (the layer architecture cannot be checked)")
     meta = json.loads(sidecar.read_text())
     recorded = meta.get("architecture")
     if recorded is None:  # sidecars written before the residual options: layer kind only
-        recorded = {"layers": meta.get("layers")}
         if meta.get("layers") in RESIDUAL_KINDS or meta.get("layers") != args.layers:
             raise SystemExit(f"--load-flow: {sidecar} records layers {meta.get('layers')!r} without the "
                              f"architecture; this run has {flow_architecture(args)}")
-        return
-    if recorded != clean_json(flow_architecture(args)):
+    elif recorded != clean_json(flow_architecture(args)):
         raise SystemExit(f"--load-flow: the flow of {sidecar} has architecture {recorded}, this run "
                          f"{clean_json(flow_architecture(args))}")
+    differences, unrecorded = flow_protocol_differences(args, meta)
+    if unrecorded:
+        log(f"note: --load-flow: {sidecar} does not record {unrecorded}: not compared")
+    if differences:
+        text = "; ".join(differences)
+        if not getattr(args, "load_flow_force", False):
+            raise SystemExit(f"--load-flow: the flow of {sidecar} was trained on another protocol: {text} "
+                             "(--load-flow-force loads it anyway)")
+        log(f"WARNING: --load-flow-force: loading a flow trained on another protocol: {text}")
+    return differences
+
+
+def _same_values(a, b):
+    a, b = list(a), list(b)
+    return len(a) == len(b) and all(math.isclose(float(x), float(y), rel_tol=1e-12, abs_tol=1e-15)
+                                    for x, y in zip(a, b))
+
+
+def flow_protocol_differences(args, meta):
+    """([what differs], [what the sidecar does not record]) between the protocol of a flow sidecar
+    and this run's: parameter name, initial value, protocol values, conditioning (c_i, d_i)."""
+    conditioning = layer_conditioning(args.initial, args.protocol_values, args.residual_condition, args.residual_delta)
+    current = {"parameter": args.protocol, "initial": [args.initial], "protocol": args.protocol_values,
+               "conditioning": [x for c in conditioning for x in c]}
+    stored = {"parameter": (meta.get("physics") or {}).get("protocol"),
+              "initial": None if meta.get("initial") is None else [meta["initial"]],
+              "protocol": meta.get("protocol"),
+              "conditioning": None if meta.get("conditioning") is None else [x for c in meta["conditioning"] for x in c]}
+    differences, unrecorded = [], []
+    for name, value in current.items():
+        old = stored[name]
+        if old is None:
+            unrecorded.append(name)
+        elif (old != value) if name == "parameter" else not _same_values(old, value):
+            if name == "conditioning":
+                old, value = meta["conditioning"], [list(c) for c in conditioning]
+            differences.append(f"{name} {old if name != 'initial' else old[0]} (flow) vs "
+                               f"{value if name != 'initial' else value[0]} (this run)")
+    return differences, unrecorded
 
 
 def learning_rate(args, step):
@@ -533,7 +580,47 @@ def physics_key(args):
         "n_gauge_substeps": args.n_gauge_substeps, "integrator": list(args.integrator_levels),
         **staggered_key(args),
         **residual_key(args),
+        **training_key(args),
     }
+
+
+# entries added to the resume key on 20 November: a checkpoint without them is accepted (with a note)
+ADDED_RESUME_KEYS = ("n_between", "train_steps", "lr", "lr_warmup", "grad_clip", "rho_init")
+
+
+def training_key(args):
+    """Resume-key entries of the sampling and training settings: --n-between (all modes), and with
+    --mode snf --train-steps, --lr, --lr-warmup, --grad-clip (and --rho-init for the stout kinds,
+    the only ones that use it)."""
+    key = {"n_between": int(args.n_between)}
+    if args.mode == "snf":
+        key.update(train_steps=int(args.train_steps), lr=float(args.lr), lr_warmup=int(args.lr_warmup),
+                   grad_clip=float(args.grad_clip))
+        if args.layers in ("smearing", "smearing_signed"):
+            key["rho_init"] = float(args.rho_init)
+    return key
+
+
+def key_differences(stored, current):
+    """'name: checkpoint -> this run' for every top-level entry that differs."""
+    stored = stored or {}
+    return [f"{k}: {stored.get(k, '<absent>')!r} -> {current.get(k, '<absent>')!r}"
+            for k in sorted(set(stored) | set(current)) if stored.get(k, "<absent>") != current.get(k, "<absent>")]
+
+
+def check_resume_key(stored, key, log=print, added=ADDED_RESUME_KEYS):
+    """SystemExit unless the checkpoint's physics key equals this run's; entries of `added` that an
+    older checkpoint does not hold are accepted with a printed note (not compared)."""
+    key = clean_json(key)
+    stored = stored or {}
+    missing = [k for k in added if k in key and k not in stored]
+    if missing:
+        log(f"note: --resume: the checkpoint predates the resume-key entries {missing}: they are not compared "
+            f"(this run: {', '.join(f'{k}={key[k]!r}' for k in missing)})")
+        key = {k: v for k, v in key.items() if k not in missing}
+    if stored != key:
+        raise SystemExit("--resume: the checkpoint parameters differ from this run's: "
+                         + "; ".join(key_differences(stored, key)))
 
 
 def residual_key(args):
@@ -719,6 +806,45 @@ class Counter:
         return s - snap[0], c - snap[1]
 
 
+def flow_train_step(phase, progress, train_steps):
+    """Training steps behind the flow of a checkpoint (phase, progress): the flow changes in training only."""
+    return int(progress if phase == "train" else train_steps)
+
+
+def save_flow(out, flow, optimizer, phase, progress, train_steps):
+    """flow.pt of checkpoint (phase, progress) {"state_dict", "optimizer", "train_step"}, written
+    atomically (temporary file + os.replace) after moving the current flow.pt to flow_prev.pt. The
+    pool checkpoint is written after this, so at any kill one of flow.pt / flow_prev.pt holds the
+    flow of the pool's step: before the rename both files are the old pair; between the rename and
+    the new flow.pt only flow_prev.pt exists (the pool's); after it flow.pt is newer than the pool
+    and flow_prev.pt is the pool's, until the pool is written."""
+    out = Path(out)
+    flow_path, prev = out / f"{FLOW_NAME}.pt", out / FLOW_PREV
+    payload = {"state_dict": flow.state_dict(),
+               "optimizer": optimizer.state_dict() if optimizer is not None else None,
+               "train_step": flow_train_step(phase, progress, train_steps),
+               "checkpoint": {"phase": phase, "progress": int(progress)}}
+    if flow_path.exists():
+        os.replace(flow_path, prev)
+    _atomic_write(flow_path, lambda tmp: torch.save(payload, tmp))
+
+
+def load_flow_checkpoint(out, phase, progress, train_steps, device):
+    """(payload, path) of the flow file (flow.pt, else flow_prev.pt) whose train_step is that of the
+    pool checkpoint (phase, progress) (`save_flow`); SystemExit if neither is."""
+    out = Path(out)
+    want = flow_train_step(phase, progress, train_steps)
+    found = []
+    for path in (out / f"{FLOW_NAME}.pt", out / FLOW_PREV):
+        if path.exists():
+            payload = torch.load(path, map_location=device)
+            if int(payload.get("train_step", -1)) == want:
+                return payload, path
+            found.append(f"{path.name}: train step {payload.get('train_step')}")
+    raise SystemExit(f"--resume: no flow file of {out} matches the pool checkpoint (phase {phase}, progress {progress}, "
+                     f"train step {want}): {found or 'no flow file'}; the pair is inconsistent, restart with --overwrite")
+
+
 # ---- the run ------------------------------------------------------------------------------------
 class PoolSampler:
     """B chains in equilibrium at lambda_0 (fermionic HMC on the shared QCDAction)."""
@@ -766,6 +892,8 @@ def summarize(out, batch, protocol):
                 "ess_first": float(t["ess"][0]), "ess_last10_mean": float(t["ess"][-10:].mean()),
                 "seconds_per_step": float(t["wall_s"].mean()),
                 "solves_per_step": float(t["solves"].mean()),
+                # steps whose optimizer step was skipped (non-finite gradient norm)
+                "nonfinite_grad_steps": int((~np.isfinite(t["grad_norm"])).sum()),
             }
             if "injectivity_ratio" in t:  # rows of runs older than the column read as NaN: skipped
                 ratio = t["injectivity_ratio"]
@@ -855,7 +983,7 @@ def main(argv=None):
         flow = FermionNEMCMC(action, protocol, initial_parameter=lam0, **hmc_kw)
         params, optimizer = [], None
     if args.load_flow:
-        check_flow_sidecar(args, args.load_flow)
+        check_flow_sidecar(args, args.load_flow, log=lambda m: _log(args, m))
         payload = torch.load(args.load_flow, map_location=device)
         flow.load_state_dict(payload["state_dict"])
 
@@ -866,14 +994,17 @@ def main(argv=None):
         if not pool_prefix.with_suffix(".json").exists():
             raise SystemExit(f"--resume: no checkpoint in {out}")
         U, meta, rng_state = load_state(pool_prefix, device=device)
-        if meta["extra"].get("physics") != clean_json(key):
-            raise SystemExit(f"--resume: checkpoint parameters {meta['extra'].get('physics')} differ from {key}")
+        check_resume_key(meta["extra"].get("physics"), key, log=lambda m: _log(args, m))
         if meta["rng"]["device"].split(":")[0] != device.type:
             raise SystemExit(f"--resume: checkpoint RNG is for {meta['rng']['device']}, run on {device}")
         restore_generator(generator, rng_state)
         phase, progress = meta["extra"]["phase"], int(meta["extra"]["progress"])
         if args.mode == "snf":
-            payload = torch.load(flow_path, map_location=device)
+            payload, used = load_flow_checkpoint(out, phase, progress, args.train_steps, device)
+            if used.name != flow_path.name:  # restore the pair before anything is written
+                os.replace(used, flow_path)
+                _log(args, f"--resume: {flow_path.name} was newer than the pool checkpoint (a job killed between the "
+                           f"two writes): resuming from {used.name}, the flow of the pool's step (now {flow_path.name})")
             flow.load_state_dict(payload["state_dict"])
             if optimizer is not None and payload.get("optimizer") is not None:
                 optimizer.load_state_dict(payload["optimizer"])
@@ -881,7 +1012,8 @@ def main(argv=None):
         _log(args, f"resumed {out}: phase {phase}, progress {progress}")
     else:
         previous = [p for p in list(paths.values()) + [pool_prefix.with_suffix(".json"), pool_prefix.with_suffix(".pt"),
-                                                      flow_path, out / f"{FLOW_NAME}.json", meta_path] if p.exists()]
+                                                      flow_path, out / FLOW_PREV, out / f"{FLOW_NAME}.json", meta_path]
+                    if p.exists()]
         if previous and not args.overwrite:
             raise SystemExit(f"{out} holds a previous run ({[p.name for p in previous]}): use --resume or --overwrite")
         for p in previous:
@@ -917,14 +1049,16 @@ def main(argv=None):
         info.update(flow_architecture=flow_architecture(args), layer_conditioning=[list(c) for c in flow.conditioning])
 
     def checkpoint(phase_, progress_, final=False):
+        # the flow first (atomic, the previous generation kept as flow_prev.pt), then the pool, whose
+        # sidecar commits the pair: a kill at any point leaves a flow file of the pool's step
+        # (load_flow_checkpoint); see save_flow
+        if args.mode == "snf":
+            save_flow(out, flow, optimizer, phase_, progress_, args.train_steps)
         save_state(pool_prefix, pool.U, geometry=geometry, beta=beta0, trajectory=progress_,
                    time_sign=args.time_sign, generator=generator, **state_couplings(args, kappa0),
                    extra={"phase": phase_, "progress": int(progress_), "physics": clean_json(key),
                           "source": source, "bc": bc0, "seed": args.seed})
         if args.mode == "snf":
-            torch.save({"state_dict": flow.state_dict(),
-                        "optimizer": optimizer.state_dict() if optimizer is not None else None,
-                        "train_step": int(progress_ if phase_ == "train" else args.train_steps)}, flow_path)
             atomic_json_save(clean_json({"physics": key, "layers": args.layers, "rho_init": args.rho_init,
                                          "architecture": flow_architecture(args),
                                          "conditioning": [list(c) for c in flow.conditioning],
@@ -968,6 +1102,7 @@ def main(argv=None):
         checkpoint("train", 0)
 
     # ---- training
+    skipped = 0
     if phase == "train":
         for step in range(progress, args.train_steps):
             pool.advance(args.n_between, generator)
@@ -989,6 +1124,12 @@ def main(argv=None):
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             if math.isfinite(grad_norm):
                 optimizer.step()
+            else:  # skipped: counted in run_meta.json (summary.training.nonfinite_grad_steps, from the CSV)
+                skipped += 1
+                if skipped <= 10 or skipped % 100 == 0:
+                    print(f"WARNING: training step {step}: gradient norm {grad_norm} is not finite, optimizer step "
+                          f"skipped ({skipped} skipped in this session{'' if skipped < 10 else '; printing every 100th'})",
+                          file=sys.stderr, flush=True)
             _sync(device)
             wall = time.perf_counter() - t0
             solves, cg_iter = counter.since(snap)

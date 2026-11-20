@@ -1,7 +1,10 @@
 """Argument checks, defaults, checkpoints and flow loading of main/main_snf_fermions.py (review of
 20 November): the default layers (smearing_signed from the identity), the |rho| layer refused with
 lr >= |rho_init|, residual layers with all conditioning steps zero refused, options a layer kind
-ignores warned about.
+ignores warned about; the flow/pool checkpoint pair (a kill between the two writes resumes from
+flow_prev.pt, an inconsistent pair is refused), --load-flow refusing another protocol unless
+--load-flow-force, the training settings in the resume key (older checkpoints accepted with a
+note), skipped optimizer steps on a non-finite gradient reported and counted.
 
 2D 4 x 4 SU(3), a handful of samples; checks the bookkeeping, not physics.
 """
@@ -9,6 +12,7 @@ ignores warned about.
 import contextlib
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -29,6 +33,9 @@ def _load(name):
 
 
 SNF = _load("main_snf_fermions")
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 from neoqcd.fermions.io import read_observables  # noqa: E402
 
@@ -116,6 +123,169 @@ class DefaultsAndChecksTest(unittest.TestCase):
             self.assertEqual(t["logJ_mean"][0], 0.0)
             self.assertGreater(t["grad_norm"][0], 0.0)
             self.assertGreater(t["param_abs_mean"][1], 0.0)
+
+
+
+def quiet_main(argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        result = SNF.main(argv)
+    return result, out.getvalue() + err.getvalue()
+
+
+class CheckpointPairTest(unittest.TestCase):
+    """flow.pt is written (atomically, previous generation kept as flow_prev.pt) before the pool,
+    whose sidecar commits the pair; on resume the flow file of the pool's step is used and an
+    inconsistent pair is refused."""
+
+    BASE = KAPPA + ["--mode", "snf", "--batch", "2", "--seed", "11", "--train-steps", "3", "--eval-samples", "4",
+                    "--checkpoint-every", "1", "--therm", "1"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _killed_at_pool_write(self, out, n):
+        """Run until the n-th pool save_state, which fails (the flow of that checkpoint is written)."""
+        calls = {"n": 0}
+        original = SNF.save_state
+
+        def failing(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == n:
+                raise KeyboardInterrupt("killed between the flow and the pool writes")
+            return original(*a, **kw)
+        SNF.save_state = failing
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                quiet_main(self.BASE + ["--out", str(out)])
+        finally:
+            SNF.save_state = original
+
+    def test_kill_between_flow_and_pool_resumes_identically(self):
+        full, part = self.tmp / "full", self.tmp / "part"
+        quiet_main(self.BASE + ["--out", str(full)])
+        self._killed_at_pool_write(part, 3)  # checkpoints: train 0, train 1, (killed) train 2
+        self.assertEqual(torch.load(part / "flow.pt")["train_step"], 2)
+        self.assertEqual(torch.load(part / "flow_prev.pt")["train_step"], 1)
+        self.assertEqual(json.loads((part / "pool.json").read_text())["extra"]["progress"], 1)
+        _, log = quiet_main([a for a in self.BASE if a != "--quiet"] + ["--out", str(part), "--resume"])
+        self.assertIn("flow_prev.pt", log)
+        for name, field in (("training.csv", "loss"), ("training.csv", "param_abs_mean"), ("samples.csv", "work")):
+            np.testing.assert_array_equal(read_observables(full / name)[field], read_observables(part / name)[field])
+
+    def test_inconsistent_pair_refused(self):
+        part = self.tmp / "part"
+        self._killed_at_pool_write(part, 3)
+        # the pair the older write order could leave (pool newer than every flow file)
+        for name in ("flow.pt", "flow_prev.pt"):
+            payload = torch.load(part / name)
+            payload["train_step"] = 0
+            torch.save(payload, part / name)
+        with self.assertRaisesRegex(SystemExit, "matches the pool checkpoint"):
+            quiet_main(self.BASE + ["--out", str(part), "--resume"])
+
+    def test_inconsistent_single_flow_refused(self):
+        """Without flow_prev.pt (as a run of the older code leaves it): a flow.pt of another step than
+        the pool is refused, not loaded silently."""
+        part = self.tmp / "part"
+        self._killed_at_pool_write(part, 3)
+        progress = json.loads((part / "pool.json").read_text())["extra"]["progress"]
+        payload = torch.load(part / "flow.pt")
+        payload["train_step"] = progress + 1
+        torch.save(payload, part / "flow.pt")
+        if (part / "flow_prev.pt").exists():
+            (part / "flow_prev.pt").unlink()
+        with self.assertRaisesRegex(SystemExit, "matches the pool checkpoint"):
+            quiet_main(self.BASE + ["--out", str(part), "--resume"])
+
+
+class LoadFlowProtocolTest(unittest.TestCase):
+    """--load-flow compares the protocol parameter, endpoints, values and conditioning."""
+
+    def test_protocol_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            common = LATTICE + ["--mode", "snf", "--batch", "2", "--seed", "3", "--eval-samples", "2"]
+            for layers in ("smearing_signed", "residual"):
+                trained = tmp / f"trained_{layers}"
+                quiet_main(common + ["--layers", layers, "--protocol", "kappa", "--final", "0.19", "--n-step", "2",
+                                     "--train-steps", "1", "--out", str(trained)])
+                flow = str(trained / "flow.pt")
+                same = ["--layers", layers, "--protocol", "kappa", "--final", "0.19", "--n-step", "2"]
+                quiet_main(common + same + ["--load-flow", flow, "--out", str(tmp / f"same_{layers}")])
+                for k, other in enumerate((["--protocol", "beta", "--final", "5.2", "--n-step", "2"],
+                                           ["--protocol", "kappa", "--final", "0.2", "--n-step", "2"],
+                                           ["--protocol", "kappa", "--initial", "0.19", "--final", "0.18",
+                                            "--n-step", "2"])):
+                    argv = common + ["--layers", layers] + other + ["--load-flow", flow]
+                    with self.subTest(layers=layers, other=other):
+                        with self.assertRaisesRegex(SystemExit, "another protocol") as cm:
+                            quiet_main(argv + ["--out", str(tmp / f"bad_{layers}_{k}")])
+                        self.assertIn("--load-flow-force", str(cm.exception))
+                        if k == 0:
+                            self.assertIn("parameter kappa (flow) vs beta (this run)", str(cm.exception))
+                        _, log = quiet_main([a for a in argv if a != "--quiet"] + ["--load-flow-force", "--out",
+                                                                                  str(tmp / f"force_{layers}_{k}")])
+                        self.assertIn("WARNING: --load-flow-force", log)
+                        self.assertTrue((tmp / f"force_{layers}_{k}" / "samples.csv").exists())
+
+
+class ResumeKeyTest(unittest.TestCase):
+    """--n-between, --train-steps, --lr, --lr-warmup, --grad-clip, --rho-init are in the resume key;
+    a checkpoint written before them is accepted with a note."""
+
+    def test_training_settings_in_key(self):
+        base = KAPPA + ["--mode", "snf", "--batch", "2", "--seed", "3", "--train-steps", "2", "--eval-samples", "2",
+                        "--rho-init", "0.01", "--checkpoint-every", "1"]
+        key = SNF.physics_key(SNF.parse_args(base))
+        for name, value in (("n_between", 1), ("train_steps", 2), ("lr", 1e-3), ("lr_warmup", 0), ("grad_clip", 0.0),
+                            ("rho_init", 0.01)):
+            self.assertEqual(key[name], value, name)
+        self.assertNotIn("rho_init", SNF.physics_key(SNF.parse_args(KAPPA + ["--mode", "snf", "--layers", "residual"])))
+        self.assertNotIn("lr", SNF.physics_key(SNF.parse_args(KAPPA)))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "run"
+            quiet_main(base + ["--out", str(out)])
+            for changed in (["--lr", "2e-3"], ["--n-between", "2"], ["--rho-init", "0.02"], ["--grad-clip", "1"],
+                            ["--lr-warmup", "3"], ["--train-steps", "3"]):
+                name = changed[0][2:].replace("-", "_")
+                with self.subTest(changed=changed), self.assertRaisesRegex(SystemExit, name):
+                    quiet_main(base + changed + ["--out", str(out), "--resume"])
+            # a checkpoint of the older code: the new entries absent -> accepted, with a note
+            side = json.loads((out / "pool.json").read_text())
+            for name in SNF.ADDED_RESUME_KEYS:
+                side["extra"]["physics"].pop(name, None)
+            (out / "pool.json").write_text(json.dumps(side))
+            _, log = quiet_main([a for a in base if a != "--quiet"] + ["--lr", "2e-3", "--out", str(out), "--resume"])
+            self.assertIn("predates the resume-key entries", log)
+
+
+class NonFiniteGradientTest(unittest.TestCase):
+    """A non-finite gradient skips the optimizer step with a printed line and is counted in
+    run_meta.json (summary.training.nonfinite_grad_steps)."""
+
+    def test_skipped_steps_reported(self):
+        original = SNF.FermionSNF.__dict__["loss"]  # the staticmethod object itself
+
+        def nan_loss(W):
+            return W.mean() * float("nan")
+        SNF.FermionSNF.loss = staticmethod(nan_loss)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "run"
+                _, log = quiet_main(KAPPA + ["--mode", "snf", "--batch", "2", "--seed", "3", "--train-steps", "3",
+                                             "--rho-init", "0.01", "--eval-samples", "2", "--out", str(out)])
+                meta = json.loads((out / "run_meta.json").read_text())
+                t = read_observables(out / "training.csv")
+        finally:
+            SNF.FermionSNF.loss = original
+        self.assertEqual(log.count("is not finite, optimizer step skipped"), 3)
+        self.assertEqual(meta["summary"]["training"]["nonfinite_grad_steps"], 3)
+        np.testing.assert_array_equal(t["param_abs_mean"], [0.01, 0.01, 0.01])  # never stepped
 
 
 if __name__ == "__main__":
