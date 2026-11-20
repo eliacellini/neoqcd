@@ -73,12 +73,17 @@ S_pf = phi^dagger M_ee(m)^-1 phi of `StaggeredPseudofermion` (one even-site fiel
 kappa replaced by the mass (`QCDAction.fermion_parameter_name`), and the force from the same solve,
 F = 2 staggered_hopping_derivative(op, X, K_oe X) with X = M_ee^-1 phi (its algebra gradient
 convention is that of `TwoFlavourWilson.force`, so the backward G = i F U is unchanged). A mass
-jump costs one solve, as a kappa jump. The fermion term type is dispatched by isinstance.
+jump costs one solve, as a kappa jump. The fermion term type is dispatched by EXACT type
+(`_fermion_kind`): the reference and fast Wilson and staggered terms and their parametric
+subclasses; every other term (Hasenbusch heavy/ratio, clover, DD-HMC blocks, the fused-kernel
+term, a user subclass) raises TypeError rather than being taken for its base class.
 
 Fast Wilson (`QCDAction(..., fast=True)`, `fast.FastTwoFlavourWilson`): `PseudofermionAction`
 solves on the half lattice (phi_e, X_e), S = Re phi_e^dagger X_e, and the force from the same X_e
 (`FastTwoFlavourWilson.force_from_solution`, built on `HalfLatticeWilson.hopping_derivative`); the
-backward i F U is unchanged. Equal to the reference path to the solver tolerance (unit tests).
+backward i F U is unchanged. Equal to the reference path to the solver tolerance (unit tests). The
+fast staggered term (`fast_terms.FastStaggeredPseudofermion`, library only: `QCDAction` has no
+fast staggered option) is handled the same way, checked against the reference staggered term.
 
 Identity start (`make_gauge_layers(..., kind="smearing_signed", rho=0)`, `SignedCouplingLayer`):
 the pure-gauge stout layer uses |rho|, whose gradient vanishes at rho = 0, so a layer starting at
@@ -124,7 +129,8 @@ import torch
 
 from neoqcd.fermions._gauge import (CouplingLayer, ResidualCouplingLayer, Smearing, mean_plaquette,
                                     plaquette_fields)
-from neoqcd.fermions.action import _as_parameter, _same_parameter
+from neoqcd.fermions.action import (ParametricFastTwoFlavourWilson, ParametricStaggeredPseudofermion,
+                                    ParametricTwoFlavourWilson, _as_parameter, _same_parameter)
 from neoqcd.fermions.fast import FastTwoFlavourWilson
 from neoqcd.fermions.pseudofermion import TwoFlavourWilson, hopping_derivative
 from neoqcd.fermions.staggered_pseudofermion import StaggeredPseudofermion, staggered_hopping_derivative
@@ -136,23 +142,44 @@ __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "Fermi
            "layer_conditioning", "CONDITION_MODES", "DELTA_MODES", "default_sharing"]
 
 
+def _supported_terms():
+    """{exact class: kind} of the fermion terms `PseudofermionAction` handles, each validated
+    against its reference by the unit tests. The lookup is by exact type, not isinstance: a
+    subclass may change the action (Hasenbusch ratio: chi^dagger M^-1 chi), the operator (clover,
+    blocks) or the field layout, and would otherwise be taken for its base class silently."""
+    from neoqcd.fermions.fast_terms import FastStaggeredPseudofermion  # lazy: optional fast path
+    return {TwoFlavourWilson: "wilson", ParametricTwoFlavourWilson: "wilson",
+            FastTwoFlavourWilson: "wilson_fast", ParametricFastTwoFlavourWilson: "wilson_fast",
+            StaggeredPseudofermion: "staggered", ParametricStaggeredPseudofermion: "staggered",
+            FastStaggeredPseudofermion: "staggered_fast"}
+
+
 def _fermion_kind(fermion):
-    """"wilson" (reference `TwoFlavourWilson`), "wilson_fast" (`fast.FastTwoFlavourWilson`, half-
-    lattice phi and X) or "staggered" from the type of the fermion term (dispatch of this module).
-    Hasenbusch terms and unknown types raise TypeError."""
-    from neoqcd.fermions.hasenbusch import RatioWilsonTerm  # lazy: avoids an import cycle
-    if isinstance(fermion, RatioWilsonTerm):
-        raise TypeError(f"{type(fermion).__name__}: Hasenbusch terms are not supported in the SNF layers "
-                        "yet (PseudofermionAction would return the plain TwoFlavourWilson S_pf, which is wrong)")
-    if isinstance(fermion, StaggeredPseudofermion):
-        return "staggered"
-    if isinstance(fermion, FastTwoFlavourWilson):  # before TwoFlavourWilson: it is a subclass
-        return "wilson_fast"
-    if isinstance(fermion, TwoFlavourWilson):
-        return "wilson"
-    raise TypeError(f"unsupported fermion term {type(fermion).__name__}: PseudofermionAction handles "
-                    "TwoFlavourWilson, FastTwoFlavourWilson and StaggeredPseudofermion (and their "
-                    "parametric subclasses)")
+    """"wilson" (reference `TwoFlavourWilson`, even-odd or full lattice), "wilson_fast"
+    (`fast.FastTwoFlavourWilson`, half-lattice phi and X), "staggered" (`StaggeredPseudofermion`)
+    or "staggered_fast" (`fast_terms.FastStaggeredPseudofermion`, half-lattice phi and X), with
+    the parametric subclasses of `action.py`: the dispatch of this module, by exact type
+    (`_supported_terms`). Every other term raises TypeError: the Hasenbusch heavy and ratio terms
+    (reference and fast) with a message naming them, any other subclass of a supported term
+    (clover, DD-HMC blocks, the fused-kernel term, ...) and unknown types."""
+    supported = _supported_terms()
+    kind = supported.get(type(fermion))
+    if kind is not None:
+        return kind
+    from neoqcd.fermions.fast_terms import FastHeavyWilsonTerm, FastRatioWilsonTerm  # lazy
+    from neoqcd.fermions.hasenbusch import HeavyWilsonTerm, RatioWilsonTerm  # lazy: avoids an import cycle
+    name = type(fermion).__name__
+    names = ", ".join(sorted({c.__name__ for c in supported}))
+    if isinstance(fermion, (HeavyWilsonTerm, RatioWilsonTerm, FastHeavyWilsonTerm, FastRatioWilsonTerm)):
+        raise TypeError(f"{name}: Hasenbusch terms are not supported in the SNF layers (PseudofermionAction "
+                        "would return the plain TwoFlavourWilson S_pf and force, which is wrong for the ratio "
+                        f"term); supported terms: {names}")
+    base = next((c for c in type(fermion).__mro__[1:] if c in supported), None)
+    if base is not None:
+        raise TypeError(f"unsupported fermion term {name}: a subclass of {base.__name__} that PseudofermionAction "
+                        f"has not been validated for (its action, operator or field layout may differ from "
+                        f"those of {base.__name__}); supported terms: {names}")
+    raise TypeError(f"unsupported fermion term {name}: PseudofermionAction handles {names}")
 
 
 def _staggered_force_from_solution(op, X):
@@ -169,7 +196,7 @@ def _force_from_solution(fermion, op, X):
     kind = _fermion_kind(fermion)
     if kind == "staggered":
         return _staggered_force_from_solution(op, X)
-    if kind == "wilson_fast":
+    if kind in ("wilson_fast", "staggered_fast"):
         return fermion.force_from_solution(op, X)
     if fermion.even_odd:
         w = op.wilson
@@ -194,23 +221,31 @@ class PseudofermionAction(torch.autograd.Function):
     S = phi^dagger M_ee(m)^-1 phi at its current mass, force F = 2 staggered_hopping_derivative(
     op, X, K_oe X) from the same solve X = M_ee^-1 phi (`staggered_pseudofermion` module doc); any
     other fermion type raises TypeError. Fast Wilson (`fast.FastTwoFlavourWilson`, e.g. the term
-    of `QCDAction(..., fast=True)`): the same S and F from one half-lattice solve (phi and X on the
-    even sites, force by `HalfLatticeWilson.hopping_derivative`); the backward is unchanged.
-    Forward: one CG solve at `fermion.action_tol`, S = Re phi^dagger X, (B,) float64; if U
-    requires grad, the force F at U is computed from the same X and saved (so later changes of
-    fermion.phi or kappa do not affect the backward). Backward: dS/dU = grad_out * i F U
-    (module doc), no backpropagation through CG.
+    of `QCDAction(..., fast=True)`) and fast staggered (`fast_terms.FastStaggeredPseudofermion`):
+    the same S and F from one half-lattice solve (phi and X on the even sites, force by the
+    half-lattice operator's `hopping_derivative`, `force_from_solution`); the backward is
+    unchanged. The accepted types are exactly those of `_supported_terms` (Hasenbusch, clover,
+    DD-HMC block and fused-kernel terms raise TypeError).
+    Forward: one CG solve at `fermion.action_tol` (the Metropolis accuracy: the SNF work is an
+    action difference), S = Re phi^dagger X, (B,) float64; if U requires grad, the force F at U is
+    computed from the same X and saved (so later changes of fermion.phi or kappa do not affect the
+    backward). Backward: dS/dU = grad_out * i F U (module doc), no backpropagation through CG.
+    First derivatives only: F is saved as a constant, so a second derivative would silently miss
+    dF/dU (and `torch.autograd.function.once_differentiable` would still drop this term's
+    contribution without an error when the gradient also flows through other terms). The backward
+    therefore raises RuntimeError whenever it runs in grad mode, i.e. under `create_graph=True`.
     """
 
     @staticmethod
     def forward(ctx, U, fermion):
         kind = _fermion_kind(fermion)  # TypeError for unknown fermion terms
-        # the fast term caches its operator per links tensor: give it a detached view, so the cache
-        # never holds the autograd graph of a layer output
-        op = fermion.operator(U.detach() if kind == "wilson_fast" else U)
+        half = kind in ("wilson_fast", "staggered_fast")
+        # the fast terms cache their operator per links tensor: give them a detached view, so the
+        # cache never holds the autograd graph of a layer output
+        op = fermion.operator(U.detach() if half else U)
         fermion.stats["action_calls"] += 1
         X = fermion._solve(op, fermion.action_tol)
-        phi = fermion._phi_h if kind == "wilson_fast" else fermion.phi  # the layout of X
+        phi = fermion._phi_h if half else fermion.phi  # the layout of X
         S = (phi.conj() * X).real.reshape(X.shape[0], -1).sum(1)
         if ctx.needs_input_grad[0]:
             fermion.stats["force_calls"] += 1
@@ -220,6 +255,10 @@ class PseudofermionAction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        if torch.is_grad_enabled():  # the engine runs backward in grad mode only for create_graph=True
+            raise RuntimeError("PseudofermionAction is differentiable once (the saved force F is a constant, there "
+                               "is no backpropagation through the solver): create_graph=True / second derivatives "
+                               "of S_pf are not supported")
         U, F = ctx.saved_tensors
         g = grad_out.to(U.dtype).view((-1,) + (1,) * (U.dim() - 1))
         return g * (1j * torch.matmul(F, U)), None
