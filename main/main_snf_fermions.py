@@ -62,12 +62,14 @@ the checkpoint and continues training or evaluation where the checkpoint left it
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import platform
 import sys
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -87,6 +89,7 @@ from neoqcd.fermions.fast import resolve_colour_product  # noqa: E402
 from neoqcd.fermions.hmc import HMC, INTEGRATORS  # noqa: E402
 from neoqcd.fermions.io import (  # noqa: E402
     ObservableWriter,
+    _atomic_write,
     atomic_json_save,
     load_state,
     read_observables,
@@ -109,6 +112,7 @@ from neoqcd.fermions.snf_layers import (  # noqa: E402
     RESIDUAL_OPTIONS,
     FermionSNF,
     default_sharing,
+    layer_diagnostics_message,
     make_gauge_layers,
     residual_options,
 )
@@ -147,6 +151,9 @@ TRAIN_FIELDS = (
     "grad_norm", "solves", "cg_iter", "wall_s",
     "lr",              # learning rate of this step (after the --lr-warmup factor)
     "param_abs_mean",  # mean |parameter| the flow of this step ran with (BEFORE its optimizer step)
+    "max_abs_coeff",   # max |rho| (stout) or |coefficient| (residual) of that flow (snf_layers.layer_diagnostics)
+    "injectivity_ratio",  # max |rho| / (1/(2(D-1))) (stout) or the residual contraction estimate; >= 1: no
+                          # bijectivity guarantee (one RuntimeWarning per run)
 )
 
 POOL_NAME = "pool"
@@ -597,6 +604,32 @@ def start_links(args, geometry, device, batch, beta0, kappa0, bc0):
     return U[:batch].clone(), f"{args.start_config} (trajectory {meta['trajectory']})"
 
 
+def upgrade_csv_header(path, fields, log=print):
+    """Resume of a run written before columns were added to `fields`: if the CSV at `path` has a
+    header whose columns are all in `fields` (in the same order) but not all of `fields`, it is
+    rewritten atomically with the new header and empty values in the new columns (read back as
+    NaN), and a line is logged. Any other header is left alone (`ObservableWriter` refuses it)."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        if header == list(fields) or [f for f in fields if f in header] != header:
+            return False
+        rows = [dict(zip(header, row)) for row in reader]
+
+    def write(tmp):
+        with open(tmp, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(fields)
+            writer.writerows([[row.get(f, "") for f in fields] for row in rows])
+    _atomic_write(path, write)
+    log(f"{path.name}: written before the columns {[f for f in fields if f not in header]} existed; "
+        f"header upgraded, the new columns are empty for its {len(rows)} rows")
+    return True
+
+
 def clean_json(x):
     """NaN/inf -> None, numpy scalars -> python (strict JSON)."""
     if isinstance(x, dict):
@@ -693,6 +726,13 @@ def summarize(out, batch, protocol):
                 "seconds_per_step": float(t["wall_s"].mean()),
                 "solves_per_step": float(t["solves"].mean()),
             }
+            if "injectivity_ratio" in t:  # rows of runs older than the column read as NaN: skipped
+                ratio = t["injectivity_ratio"]
+                known = ~np.isnan(ratio)
+                summary["training"].update(
+                    max_abs_coeff_max=float(np.nanmax(t["max_abs_coeff"])) if known.any() else None,
+                    injectivity_ratio_max=float(ratio[known].max()) if known.any() else None,
+                    injectivity_exceeded_steps=int((ratio[known] >= 1.0).sum()))
     if not spath.exists():
         return summary
     s = read_observables(spath)
@@ -809,6 +849,9 @@ def main(argv=None):
     pool = PoolSampler(args, action, lam0, U)
     counter = Counter(action.fermion)
 
+    if args.resume:  # CSVs of a run started before columns were added
+        for name, fields in (("samples", SAMPLE_FIELDS), ("blocks", BLOCK_FIELDS), ("training", TRAIN_FIELDS)):
+            upgrade_csv_header(paths[name], fields, log=lambda m: _log(args, m))
     writers = {"samples": ObservableWriter(paths["samples"], SAMPLE_FIELDS, trajectory_field="batch"),
                "blocks": ObservableWriter(paths["blocks"], BLOCK_FIELDS, trajectory_field="batch")}
     if args.mode == "snf":
@@ -854,6 +897,18 @@ def main(argv=None):
                          meta_path)
         return summary
 
+    warned = set()
+
+    def check_layers(where):
+        """layer_diagnostics of the current flow; one RuntimeWarning per `where` if the bound is exceeded."""
+        diag = flow.layer_diagnostics()
+        if diag["exceeded"] and where not in warned:
+            warned.add(where)
+            msg = f"{where}: {layer_diagnostics_message(diag)}: the layers may not be bijections"
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            _log(args, "WARNING: " + msg)
+        return diag
+
     _log(args, f"{args.mode} {args.layers} protocol {args.protocol}: {lam0} -> {protocol[-1]} in {len(protocol)} "
                f"steps, lattice {geometry.lattice} SU({args.N}) beta={args.beta} {args.fermions} {'kappa=%g' % args.kappa if args.fermions == 'wilson' else 'mass=%g' % args.mass} bc={args.bc} "
                f"B={args.batch} device={device} -> {out}")
@@ -884,6 +939,7 @@ def main(argv=None):
                 group["lr"] = lr
             # the parameters this step's flow runs with (before the optimizer step)
             param_abs_mean = float(torch.cat([p.detach().abs().reshape(-1) for p in params]).mean())
+            diag = check_layers("training")
             _, W, Q, logJ, _ = flow(FieldState(pool.U.clone()), generator)
             loss = flow.loss(W)
             loss.backward()
@@ -902,7 +958,8 @@ def main(argv=None):
                    "ess": effective_sample_size(Wd) if Wd.numel() > 1 else 1.0,
                    "heat_mean": float(Q.mean()), "logJ_mean": float(logJ.mean()), "acceptance": acc,
                    "grad_norm": grad_norm, "solves": solves, "cg_iter": cg_iter, "wall_s": wall,
-                   "lr": lr, "param_abs_mean": param_abs_mean}
+                   "lr": lr, "param_abs_mean": param_abs_mean, "max_abs_coeff": diag["max_abs_coeff"],
+                   "injectivity_ratio": diag["injectivity_ratio"]}
             writers["training"].write_rows([row])
             _log(args, f"train {step:5d} loss {row['loss']:+.5f} ess {row['ess']:.3f} acc {acc:.2f} "
                        f"|g| {grad_norm:.2e} solves {solves} {wall:.2f} s")
@@ -913,6 +970,9 @@ def main(argv=None):
 
     # ---- evaluation
     if phase == "eval":
+        if args.mode == "snf":  # the flow evaluated (trained here, loaded with --load-flow, or resumed)
+            info["layer_diagnostics"] = check_layers("evaluated flow")
+            _log(args, f"evaluated flow: {layer_diagnostics_message(info['layer_diagnostics'])}")
         works = []
         if progress:
             works = list(read_observables(paths["samples"])["work"])

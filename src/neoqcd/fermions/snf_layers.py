@@ -139,7 +139,8 @@ from neoqcd.fermions.snf import OBSERVABLES, FieldState, HMCBlock
 __all__ = ["PseudofermionAction", "pseudofermion_action", "joint_action", "FermionLayerBlock",
            "FermionSNF", "make_gauge_layers", "SignedSmearing", "SignedCouplingLayer", "LAYER_KINDS",
            "RESIDUAL_KINDS", "RESIDUAL_OPTIONS", "residual_options", "residual_flow_pars",
-           "layer_conditioning", "CONDITION_MODES", "DELTA_MODES", "default_sharing"]
+           "layer_conditioning", "CONDITION_MODES", "DELTA_MODES", "default_sharing", "stout_rho_bound",
+           "layer_diagnostics", "layer_diagnostics_message"]
 
 
 def _supported_terms():
@@ -364,9 +365,13 @@ class FermionLayerBlock(torch.nn.Module):
 class SignedSmearing(Smearing):
     """`Smearing` with a signed rho: the stout coefficient of every mask block is rho itself, not
     |rho| (`Smearing._mask_rho`). The stout map and its exact log-Jacobian are linear in rho
-    through the staples C = sum rho_p staple_p, so nothing else depends on the sign; for the small
-    |rho| of an identity start the map is invertible for either sign. Plain trainable rho only
-    (no hyper-smearing, no rho functional, no fit_train)."""
+    through the staples C = sum rho_p staple_p, so nothing else depends on the sign. Bijectivity:
+    each masked update is guaranteed to be a bijection only for |rho| < 1/(2(D - 1))
+    (`stout_rho_bound`: 1/6 in 4D), for either sign; above it two configurations can have the same
+    image with a finite log J and no error (a cold 4D configuration at rho = 0.2). Nothing here
+    clamps rho (that would change what is trained): `layer_diagnostics` reports max |rho| against
+    the bound and the SNF driver warns when it is exceeded. Plain trainable rho only (no
+    hyper-smearing, no rho functional, no fit_train)."""
 
     def _mask_rho(self, rho_runtime, batched_rho, sm, m):
         if self.use_hyper_smearing:
@@ -531,6 +536,88 @@ def make_gauge_layers(flow_pars, kind="smearing", rho=1e-3, residual=None, shari
     return layers
 
 
+def stout_rho_bound(D):
+    """1 / (2 (D - 1)) (1/6 in 4D, 1/2 in 2D): the stout coefficient below which the map
+    U -> exp(iQ(C U^dagger)) U of one masked update is guaranteed to be a bijection.
+
+    The staple sum C = rho sum_k S_k^dagger of the 2(D - 1) staples of a link (fixed by the mask)
+    has norm <= 2(D - 1) |rho|, so the generator is a contraction of U below this bound (the same
+    argument as for the Wilson flow). Above it the map can fold: on a cold 4D configuration two
+    inputs differing on one link have the same image at rho = 0.2 > 1/6, with a finite log J
+    (review of 20 November). The bound is sufficient, and reached on a cold configuration."""
+    return 1.0 / (2.0 * (int(D) - 1))
+
+
+def _residual_step_ratio(layer, condition, delta, N):
+    """Contraction estimate of one residual layer at (c, d): the largest over its sub-steps of
+    |d| / N * sum_f (|lin_f| + 2 sum_j |H_fj|) (f, j the trace features; H the symmetrised
+    quadratic coefficients, after the coeff_max tanh bound), and the largest |coefficient|."""
+    rf = layer.residual_flow
+    device = next(rf.parameters()).device
+    lin, quad, dv = rf._coefficients(condition, delta, 1, torch.float64, device)  # (1, steps, nf), (1, steps, nf, nf)
+    n_steps, nf = lin.shape[1], lin.shape[-1]
+    lin, quad = lin.reshape(n_steps, nf).abs(), quad.reshape(n_steps, nf, nf).abs()
+    d = float(dv.reshape(-1)[0].abs())
+    per_step = d / float(N) * (lin.sum(-1) + 2.0 * quad.sum((-1, -2)))
+    return _nan_max(per_step.tolist()), _nan_max([lin.max(), quad.max()])
+
+
+@torch.no_grad()
+def layer_diagnostics(blocks, D, N=3):
+    """Bijectivity diagnostics of the layers of a flow (no effect on the map: they only read the
+    parameters). `blocks`: the `FermionLayerBlock`s of a `FermionSNF` (`FermionSNF.layer_diagnostics`).
+
+    Returns {"kind", "max_abs_coeff", "rho_bound", "injectivity_ratio", "exceeded", "per_step"}:
+      stout kinds ("smearing", "smearing_signed"): max_abs_coeff = max |rho| over every layer and
+          mask slot (the coefficient the map uses: |rho| or the signed rho), rho_bound =
+          `stout_rho_bound(D)`, injectivity_ratio = max |rho| / rho_bound;
+      residual kinds: max_abs_coeff = the largest |linear| or |quadratic| coefficient the layers
+          use at their conditioning (after the coeff_max tanh bound), rho_bound None, and
+          injectivity_ratio = the largest contraction estimate
+              |d_i| / N * sum_f (|lin_f| + 2 sum_j |H_fj|)
+          over steps and sub-steps (f, j the 2(D - 1) or 4(D - 1) trace features). A HEURISTIC:
+          with real features and no quadratic term the layer is exactly a stout map with per-staple
+          coefficients d lin_f / N, and the estimate is the stout ratio above; the quadratic term
+          enters through the feature derivatives (|z| <= 1), counted twice; norm constants of
+          that term and the non-unitary convolved staples of n_pt > 0 are not tracked.
+    exceeded = not (injectivity_ratio < 1) (True for a NaN ratio): the layers are then not
+    guaranteed to be bijections and the Jarzynski/Crooks identities may fail silently (a finite
+    log J does not prove injectivity). per_step: the ratio of each protocol step."""
+    blocks = list(blocks)
+    if not blocks:
+        raise ValueError("no layers")
+    residual = [isinstance(b.layer, ResidualCouplingLayer) for b in blocks]
+    if any(residual) and not all(residual):
+        raise ValueError("mixed stout and residual layers")
+    if residual[0]:
+        ratios, coeffs = zip(*(_residual_step_ratio(b.layer, b.condition, b.delta_condition, N) for b in blocks))
+        ratios, coeffs = list(ratios), list(coeffs)
+        out = {"kind": "residual", "max_abs_coeff": _nan_max(coeffs), "rho_bound": None}
+    else:
+        bound = stout_rho_bound(D)
+        coeffs = [float(b.layer.rho_layer.detach().abs().max()) for b in blocks]
+        ratios = [c / bound for c in coeffs]
+        out = {"kind": "stout", "max_abs_coeff": _nan_max(coeffs), "rho_bound": bound}
+    ratio = _nan_max(ratios)
+    out.update(injectivity_ratio=ratio, exceeded=not ratio < 1.0, per_step=ratios)
+    return out
+
+
+def _nan_max(values):
+    """max of floats, NaN if any is NaN (python's max drops NaN depending on the order)."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
+
+
+def layer_diagnostics_message(diag):
+    """One line describing `layer_diagnostics` output (for logs and the RuntimeWarning)."""
+    if diag["kind"] == "stout":
+        return (f"stout layers: max |rho| = {diag['max_abs_coeff']:.4g}, bijectivity guaranteed only below "
+                f"1/(2(D-1)) = {diag['rho_bound']:.4g} (ratio {diag['injectivity_ratio']:.3g})")
+    return (f"residual layers: max |coefficient| = {diag['max_abs_coeff']:.4g}, contraction estimate "
+            f"{diag['injectivity_ratio']:.3g} (heuristic; bijectivity guaranteed only below 1)")
+
+
 CONDITION_MODES = ("time", "parameter")
 DELTA_MODES = ("fraction", "step")
 
@@ -627,6 +714,10 @@ class FermionSNF(torch.nn.Module):
     @property
     def n_step(self):
         return len(self.protocol)
+
+    def layer_diagnostics(self):
+        """`layer_diagnostics` of this flow's layers (max |rho| or coefficient, bijectivity bound)."""
+        return layer_diagnostics(self.blocks, self.action.geometry.D, self.action.geometry.N)
 
     @torch.no_grad()
     def _jump(self, U, p_old, p_new, S_cur):
