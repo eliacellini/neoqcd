@@ -377,7 +377,7 @@ Note sul training SNF (14 novembre): lo stimatore è blockwise (ingressi degli s
 ## Chiusura del 14 novembre 2026 (mattina)
 
 Fatto in questa sessione, tutto su `fermions` (pushato) salvo dove indicato:
-- **Metodo Gamma** (`obs.py`, codice di pura gauge): errore di lunghezza di una fetta in `_compute_drho` corretto sul branch separato `fix-gamma-drho` (commit 8f83515, worktree `../neoqcd-fix-gamma`), NON pushato e NON unito a main: decide l'utente.
+- **Metodo Gamma** (`obs.py`, codice di pura gauge): errore di lunghezza di una fetta in `_compute_drho` corretto sul branch separato `fix-gamma-drho` (commit 8f83515, worktree `../neoqcd-fix-gamma`), poi unito a main (3eecc1b, 16 novembre) e arrivato su `fermions` con il merge del 20 novembre.
 - **Strato veloce** esteso ad azione parametrica, NE-MCMC, SNF, REX; varianti veloci per staggered e Hasenbusch (`fast_terms.py`).
 - **Kernel fuso CUDA** (`fused.py`, nvcc + ctypes, nessuna installazione): 3.5e8 siti/s in doppia e 7e8 in singola su A100; solve a 16^4 batch 16 in 0.22 s (0.14 in precisione mista) contro 13.3 s del codice iniziale. HMC a 8^4 validato con il kernel fuso: P = 0.56637(20) (openQCD 0.5661(5)), 0.20 s per traiettoria per replica (5.15 all'inizio, 0.64 con lo strato veloce). I solve sono ora il 44% della traiettoria: il prossimo bersaglio sono forza di gauge, forza fermionica e aggiornamento dei link.
 - **SNF**: strato stout con segno (partenza esatta dall'identità), riscaldamento del learning rate, rete residual completa (statica e iper-rete, convoluzioni a link congelati) con condizionamento indipendente dal protocollo.
@@ -399,3 +399,31 @@ I file separati sono serviti a far lavorare più agenti in parallelo; vanno riun
 - gli argomenti, i checkpoint e i riepiloghi comuni ai driver, oggi condivisi con import incrociati tra script;
 - helper ed ensemble dei test, ricostruiti in più file;
 - infine la ristrutturazione grande: sottopacchetti per puro gauge e parti comuni, e sparisce `_gauge.py`.
+
+## Sessione del 20 novembre 2026
+
+Stato alla chiusura: tutto committato e pushato su `fermions`; worktree di test su Leonardo allineato allo stesso commit. Nessun job in coda.
+
+Fatto:
+- **Merge di `main`** (e958192; 35 commit di pura gauge: kernel fusi HBOR/stout/placchetta, protocollo ai punti interni, topologia, resume, fix del metodo Gamma). Nessun conflitto, nessun numero dei test cambiato; un solo test adattato (il metodo Gamma ora funziona).
+- **Revisione avversariale (Fable) dei moduli mai rivisti**: strato veloce (`fast.py`, `fast_terms.py`, opzione `fast` in azione/SNF/REX), kernel fuso (`fused.py`), strati SNF (con segno, residual, `PseudofermionAction`). Nessun errore di fisica; corretti tutti i difetti trovati (guardie, casi limite, cache dei kernel, CG misto con campioni NaN, checkpoint a due generazioni, `--load-flow` che confronta il protocollo, diagnostica di biiettività e di convergenza nei driver SNF/REX) e uccise le mutazioni sopravvissute.
+- **Cambi di default**: driver SNF con `--layers smearing_signed --rho-init 0`; `smearing` con lr >= |rho-init| rifiutato.
+- **Corse GPU (debug, torch 2.0)**: suite completa 500 test OK; kernel fuso su `cuda:1` e stream non di default OK; w4f bit a bit identico al 14 novembre, P = 0.06084(19) contro openQCD 0.060765(28); prime corse di staggered e Hasenbusch veloci (uguali al riferimento, 2.5x più veloci a 4^4); NE-MCMC veloce dF = -5.0141(119), ESS 0.965; REX distribuito su 4 GPU senza errori, 1.39 s/passo.
+- **DD-HMC**: schema `"luscher"` corretto sull'appendice C di hep-lat/0409106 (il vecchio schema resta come `"odometer"`); nel driver (`--dd-blocks`, `--dd-translation`, `--n-block-substeps`), termini di blocco e di Schur veloci e fusi (`fast_ddhmc.py`), resume bit a bit; rivisto da Fable (nessun errore algoritmico). Corretto il difetto C1 (e292350): i solve di Schur ora garantiscono il residuo del sistema in D con passate di correzione.
+- **Kernel fusi per il resto della traiettoria** (`fused_hmc.py`, `--md-kernels none|all|gauge_force,update,fermion_force,cg`): completi su emulazione CPU, MAI girati su GPU.
+- **Training PG con fermioni** (`pg.py`, `_gauge_cnf.py`, `main/main_pg_fermions.py`, `job/debug_pg_fermions.sh`): metodo invariato, termine pseudofermionico con il phi della replica tenuto fisso (opzione "a"), gradiente lungo il flusso con 2 solve senza retropropagazione nel CG; validato contro l'autograd denso (1e-13), a kappa = 0 bit a bit uguale al puro gauge. Mai girato su GPU. La scelta dell'opzione (a) è stata presa dall'orchestratore: da confermare con l'utente (alternative: baseline quenched a beta abbinato; traccia stocastica per l'obiettivo marginale).
+
+Risultati da ricordare:
+- `dd8` (8^4, blocchi 4^4, 200 + 300 traiettorie da freddo) NON è termalizzato: la placchetta scende ancora (0.5721, 0.5704, 0.5686 sui terzi) verso 0.5661(5). Integratore troppo fine (accettanza 99.7%, dH rms 0.0085): usare tau 1-2. Costo 0.31 s per replica-traiettoria contro 0.20 dell'HMC normale, cioè 17x per link attivo: senza solve locali ai blocchi il DD non conviene.
+- Pilota SNF: 20 passi di Adam a lr 1e-3 abbassano l'ESS da 0.98 a ~0.2: lr troppo alto per questo protocollo.
+- Hasenbusch a 8^4 con kappa' = 0.14 non ottimizzato costa 1.9x il Wilson semplice.
+- Il wrapper del kernel fuso ha +18 microsecondi per chiamata dopo le correzioni (pesa solo a 4^4, +6%).
+
+### Da dove riprendere, in ordine
+1. Suite fermionica completa sul Mac e su GPU sullo stato finale (dopo gli ultimi 15 commit è stata lanciata sul Mac a fine sessione: vedere l'esito nel messaggio di chiusura).
+2. GPU, coda di debug: `GRID=0 sbatch job/debug_bench_fermions.sh` (gemelli CUDA dei nuovi kernel e tempi per componente), poi `MODE=validate sbatch job/debug_bench_fermions.sh` (punto w8f con `--md-kernels all`, placchetta contro 0.5661(5)); `job/debug_pg_fermions.sh` (pilota PG, 8^4, 4 GPU).
+3. Resto delle correzioni del DD-HMC: C2 (il refresh di Schur deve sempre sollevare errore; azzerare phi_R e S_old in `refresh`), test per le sette mutazioni sopravvissute (ciclo su link di Haar per ogni modo, tolleranze distinte per ogni solve, lettura dei sottopassi e degli schemi nel driver, blocchi non cubici, resume con `random`/`none`), nits; poi il test statistico lento del DD (`NEOQCD_SLOW=1`, ~21 min) perché C1 cambia il solver. Dettagli nel rapporto di revisione in scratchpad `review_dd/` (può sparire: i punti sono elencati qui).
+4. Validazione fisica del DD: opzione di partenza da una configurazione termalizzata in `main_hmc.py` (`--start` accetta solo cold/hot), poi DD da w8f con tau 1-2.
+5. PG: sezione in `doc/fermions.md` (derivazione nel docstring di `pg.py`), revisione Fable di `pg.py` e di `fused_hmc.py` (non ancora riviste), poi decisioni dell'utente: opzione (a) sì/no, misura del rumore di phi per rung, baseline quenched.
+6. Corse vere in produzione (budget da decidere): training SNF con lr più basso, REX con scala ottimale a 10-15 rung, punto w16, kappa = 0.1545, training PG.
+7. Flow sugli pseudofermioni (ricerca); fase di pulizia (ora anche: un solo macchinario per i kernel tra `neoqcd/fused.py` e `fermions/fused.py`, `_gauge_cnf.py` dentro `_gauge.py`, `stats["shifts"]` nel driver, sezioni 1, 3 e 4 di `doc/fermions.md` da aggiornare con DD e PG).
