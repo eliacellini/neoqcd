@@ -64,6 +64,11 @@ ignore. `max_residual` is the largest true relative residual of the solves of th
 Resume: --resume reads <out>/checkpoint.*, checks that the physics parameters agree, drops CSV
 rows past the checkpoint and continues with the stored generator state: the continuation is
 bitwise identical to an uninterrupted run with the same seed (same device and thread count).
+The solver path is part of the check (`solver_key`: --fast, and with it --precision,
+--colour-product, --check-every, and --inner-tol / --max-outer with mixed precision; plus --kernel
+and --link-layout): a run is resumed only with the settings it was started with, so run_meta.json
+describes the whole run. Checkpoints written before the key had the solver path take it from the
+run_meta.json written with them, else from the defaults (reference path); one line in the log says so.
 """
 
 from __future__ import annotations
@@ -298,7 +303,8 @@ def default_name(args):
 
 
 def physics_key(args):
-    """Parameters that must agree between a checkpoint and a resumed run."""
+    """Parameters that must agree between a checkpoint and a resumed run (the solver path
+    included: `solver_key`)."""
     return {
         "geometry": {"D": args.D, "T": args.T, "L": args.L, "N": args.N},
         "batch": args.batch, "beta": float(args.beta), "fermions": args.fermions,
@@ -308,7 +314,49 @@ def physics_key(args):
         "kappa_heavy": None if args.kappa_heavy is None else float(args.kappa_heavy),
         "hasenbusch_layout": args.hasenbusch_layout,
         "kernel": args.kernel, "link_layout": args.link_layout,
+        "solver": solver_key(vars(args)),
     }
+
+
+# the argument defaults: the solver settings of a run whose records predate the solver key
+SOLVER_KEY_DEFAULTS = {"fast": False, "precision": "double", "colour_product": "auto", "check_every": 10,
+                       "inner_tol": 1e-6, "max_outer": 30}
+
+
+def solver_key(settings):
+    """Resume-key entry of the fermion solver path, from a mapping of the settings (vars(args) or
+    the "parameters" of a run_meta.json; missing entries take SOLVER_KEY_DEFAULTS): {"fast": False}
+    for the reference path; with --fast also the precision, the requested colour product, the
+    check interval and, with --precision mixed, inner_tol and max_outer (as `fast_key` of
+    main_snf_fermions.py). These change the chain beyond bitwise (fast and reference agree to the
+    solver tolerance; the check interval and the mixed settings change the CG iterates), so a run
+    is resumed only with the same ones and run_meta.json describes the whole run."""
+    s = dict(SOLVER_KEY_DEFAULTS)
+    s.update({k: v for k, v in settings.items() if k in SOLVER_KEY_DEFAULTS and v is not None})
+    if not s["fast"]:
+        return {"fast": False}
+    key = {"fast": True, "precision": s["precision"], "colour_product": s["colour_product"],
+           "check_every": int(s["check_every"])}
+    if s["precision"] == "mixed":
+        key.update(inner_tol=float(s["inner_tol"]), max_outer=int(s["max_outer"]))
+    return key
+
+
+def stored_solver_key(extra, meta_path):
+    """(solver key of a checkpoint, where it came from). Checkpoints written since the key has the
+    solver path store it ("checkpoint"). For older ones the settings come from the "parameters" of
+    the run_meta.json written with that checkpoint ("run_meta.json"), else from the argument
+    defaults, i.e. the reference path ("defaults"): an old --fast checkpoint then resumes only with
+    its own --fast settings, and an old reference one only without --fast."""
+    if extra.get("solver") is not None:
+        return extra["solver"], "checkpoint"
+    try:
+        params = json.loads(Path(meta_path).read_text())["parameters"]
+    except (OSError, ValueError, KeyError, TypeError):
+        params = None
+    if isinstance(params, dict) and "fast" in params:
+        return solver_key(params), "run_meta.json"
+    return solver_key({}), "defaults"
 
 
 def resolve_fused_kernel(args, device, geometry):
@@ -612,8 +660,12 @@ def main(argv=None):
         stored = {k: meta[k] for k in ("geometry", "batch", "beta", "fermions", "kappa", "mass", "time_sign")}
         stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout", "link_layout")})
         stored["kernel"] = meta.get("extra", {}).get("kernel", "off")  # older checkpoints: --kernel off
+        stored["solver"], solver_source = stored_solver_key(meta.get("extra", {}), meta_path)
         if stored != physics_key(args):
             raise SystemExit(f"--resume: checkpoint parameters {stored} differ from {physics_key(args)}")
+        if solver_source != "checkpoint":
+            _log(args, f"resume: the checkpoint predates the solver key; solver settings {stored['solver']} "
+                       f"taken from {solver_source}")
         if meta["rng"]["device"].split(":")[0] != device.type:
             raise SystemExit(f"--resume: checkpoint RNG is for {meta['rng']['device']}, run on {device}")
         restore_generator(generator, rng_state)
@@ -669,7 +721,8 @@ def main(argv=None):
                    generator=generator, extra={"seed": args.seed, "final": bool(final),
                                                "kappa_heavy": args.kappa_heavy,
                                                "hasenbusch_layout": args.hasenbusch_layout,
-                                               "kernel": args.kernel, "link_layout": args.link_layout})
+                                               "kernel": args.kernel, "link_layout": args.link_layout,
+                                               "solver": solver_key(vars(args))})
         try:
             summary, _ = summarize(csv_path, args.batch, args.gamma_S)
         except Exception as exc:  # checkpoint files are already written; never die on statistics

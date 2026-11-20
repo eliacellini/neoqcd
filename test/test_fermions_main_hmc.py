@@ -381,6 +381,58 @@ class MainHMCTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "differ"):
             MAIN.main(WILSON + ["--fast", "--kernel", "loop", "--n-traj", "3", "--resume", "--out", str(out)])
 
+    def test_solver_settings_are_part_of_the_resume_key(self):
+        """--fast, --precision, --colour-product, --check-every (and --inner-tol, --max-outer with
+        mixed) must match to resume; the same settings resume."""
+        runs = {"fast": WILSON + ["--fast"],
+                "mixed": WILSON + ["--fast", "--precision", "mixed", "--inner-tol", "1e-5", "--max-outer", "9"],
+                "reference": WILSON}
+        others = {"fast": [WILSON, WILSON + ["--fast", "--precision", "mixed"], WILSON + ["--fast", "--check-every", "5"],
+                           WILSON + ["--fast", "--colour-product", "broadcast"]],
+                  "mixed": [WILSON + ["--fast", "--precision", "mixed", "--inner-tol", "1e-5"],
+                            WILSON + ["--fast", "--precision", "mixed", "--inner-tol", "1e-4", "--max-outer", "9"],
+                            WILSON + ["--fast"]],
+                  "reference": [WILSON + ["--fast"]]}
+        for name, base in runs.items():
+            with self.subTest(run=name):
+                out = self.tmp / f"solver_{name}"
+                MAIN.main(base + ["--n-traj", "2", "--out", str(out)])
+                self.assertEqual(load_state(out / "checkpoint")[1]["extra"]["solver"], MAIN.solver_key(vars(MAIN.parse_args(base))))
+                for other in others[name]:
+                    with self.assertRaisesRegex(SystemExit, "differ"):
+                        MAIN.main(other + ["--n-traj", "3", "--resume", "--out", str(out)])
+                MAIN.main(base + ["--n-traj", "3", "--resume", "--out", str(out)])
+                self.assertEqual(json.loads((out / "run_meta.json").read_text())["trajectories_done"], 3)
+
+    def test_checkpoint_without_solver_key_resumes_with_its_own_settings(self):
+        """A checkpoint written before the solver key: the settings come from the run_meta.json
+        written with it (an old --fast run resumes with --fast only), else from the defaults
+        (the reference path)."""
+        def drop_solver_key(out):
+            path = out / "checkpoint.json"
+            meta = json.loads(path.read_text())
+            del meta["extra"]["solver"]
+            path.write_text(json.dumps(meta))
+
+        out = self.tmp / "old_fast"
+        MAIN.main(WILSON + ["--fast", "--check-every", "4", "--n-traj", "2", "--out", str(out)])
+        drop_solver_key(out)
+        for other in (WILSON, WILSON + ["--fast"]):  # the check interval of the run_meta.json: 4
+            with self.assertRaisesRegex(SystemExit, "differ"):
+                MAIN.main(other + ["--n-traj", "3", "--resume", "--out", str(out)])
+        MAIN.main(WILSON + ["--fast", "--check-every", "4", "--n-traj", "3", "--resume", "--out", str(out)])
+        self.assertEqual(json.loads((out / "run_meta.json").read_text())["trajectories_done"], 3)
+        self.assertEqual(load_state(out / "checkpoint")[1]["extra"]["solver"]["check_every"], 4)  # now stored
+        # no run_meta.json either: the defaults, i.e. a reference run
+        out = self.tmp / "old_reference"
+        MAIN.main(WILSON + ["--n-traj", "2", "--out", str(out)])
+        drop_solver_key(out)
+        (out / "run_meta.json").unlink()
+        with self.assertRaisesRegex(SystemExit, "differ"):
+            MAIN.main(WILSON + ["--fast", "--n-traj", "3", "--resume", "--out", str(out)])
+        MAIN.main(WILSON + ["--n-traj", "3", "--resume", "--out", str(out)])
+        self.assertEqual(MAIN.stored_solver_key({}, out / "missing.json"), ({"fast": False}, "defaults"))
+
     def test_hasenbusch_arguments_and_resume_key(self):
         for extra in (["--hasenbusch-layout", "shared"], ["--n-heavy-substeps", "2"], ["--n-ratio-substeps", "2"],
                       ["--kappa-heavy", "0.2"], ["--kappa-heavy", "0.08", "--hasenbusch-layout", "shared",
