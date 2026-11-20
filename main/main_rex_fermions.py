@@ -88,17 +88,21 @@ for _p in (ROOT / "src", ROOT / "main"):
 
 from main_hmc import _sync, choose_device  # noqa: E402
 from main_snf_fermions import (  # noqa: E402
+    SolveMonitor,
     _log,
     action_kwargs,
     add_physics_args,
     build_defect_mask,
     clean_json,
+    convergence_from_csv,
+    convergence_note,
     defect_key,
     fermion_kwargs,
     run_info,
     staggered_key,
     start_links,
     state_couplings,
+    upgrade_csv_header,
     validate_common,
 )
 
@@ -128,6 +132,8 @@ OBS_FIELDS = (
     "solves",         # CG solves of the step (batched over all replicas)
     "cg_iter",        # sum over those solves of the largest per-replica iteration count
     "wall_s",         # wall time of the step
+    "max_residual",   # largest true relative CG residual of the step's solves, all replicas (NaN-sticky)
+    "unconverged_solves",  # the step's solves above 10 max(tol, 1e3 eps) (kept with --on-unconverged warn|ignore)
 )
 
 STATE_NAME = "checkpoint"
@@ -295,7 +301,8 @@ def load_history(path, rex, n_steps, therm):
 
 def summarize(rex, csv_path, therm):
     """Summary of the steps after --therm (history in memory, cost columns from the CSV)."""
-    summary = {"steps_total": rex.n_steps_done, "therm": int(therm)}
+    summary = {"steps_total": rex.n_steps_done, "therm": int(therm),
+               "convergence": convergence_from_csv(csv_path, "step")}  # every step, thermalisation included
     n_meas = rex.n_steps_done - therm
     summary["steps_measured"] = int(max(n_meas, 0))
     if n_meas <= 0:
@@ -393,6 +400,8 @@ def main(argv=None):
                      n_gauge_substeps=args.n_gauge_substeps, swap_parity=args.swap_parity,
                      periodic_translation=args.periodic_translation, U=U, swap_generator=swap_generator,
                      **akw, **fermion_kwargs(args))
+    if resume:  # an observables.csv written before columns were added
+        upgrade_csv_header(csv_path, OBS_FIELDS, log=lambda m: _log(args, m))
     writer = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
     if resume:
         rex.labels = rex_state["labels"].clone()
@@ -411,6 +420,7 @@ def main(argv=None):
                 fermions=args.fermions, mass=args.mass,
                 n_rungs=n_rungs, defect_links=int(defect_mask[1].sum().item()), obs_fields=list(OBS_FIELDS))
     fermion = rex.qcd.fermion
+    monitor = SolveMonitor(fermion)
 
     def checkpoint(final=False):
         save_history(hist_path, rex, args.therm)
@@ -449,21 +459,27 @@ def main(argv=None):
         _sync(device)
         wall = time.perf_counter() - t0
         solves, cg_iter = fermion.stats["solves"] - s0, fermion.stats["cg_iterations"] - c0
+        max_res, unconverged = monitor.interval()
         rows = [{"step": step, "therm": int(step < args.therm), "rung": k, "bc": args.ladder_values[k],
                  "plaquette": st["plaquette_per_rung"][k], "exp_mdH": st["exp_minus_dH_per_rung"][k],
                  "swap_accepted": st["link_accepted"][k] if k < n_rungs - 1 else None,
                  "swap_proposed": st["link_proposed"][k] if k < n_rungs - 1 else None,
-                 "hmc_acceptance": st["hmc_acceptance"], "solves": solves, "cg_iter": cg_iter, "wall_s": wall}
+                 "hmc_acceptance": st["hmc_acceptance"], "solves": solves, "cg_iter": cg_iter, "wall_s": wall,
+                 "max_residual": max_res, "unconverged_solves": unconverged}
                 for k in range(n_rungs)]
         writer.write_rows(rows)
-        if step % max(1, total // 20) == 0:
+        if step % max(1, total // 20) == 0 or unconverged:
             _log(args, f"step {step:5d} plaq/rung {[round(x, 5) for x in st['plaquette_per_rung']]} "
                        f"hmc acc {st['hmc_acceptance']:.2f} swaps {st['link_accepted']}/{st['link_proposed']} "
-                       f"solves {solves} {wall:.2f} s")
+                       f"solves {solves}{convergence_note(max_res, unconverged)} {wall:.2f} s")
         if args.checkpoint_every and rex.n_steps_done % args.checkpoint_every == 0 and rex.n_steps_done < total:
             checkpoint()
 
     summary = checkpoint(final=True)
+    conv = summary.get("convergence", {})
+    if conv.get("max_residual") is not None:
+        _log(args, f"solver: largest true relative residual {conv['max_residual']:.2e}, "
+                   f"{conv['unconverged_solves']} unconverged solves (--on-unconverged {args.on_unconverged})")
     h = summary.get("history", {})
     _log(args, f"done: {summary.get('steps_measured')} measured steps, round trips {h.get('round_trips')}, "
                f"round-trip steps {h.get('round_trip_steps')}, swap acceptance {summary.get('swap_acceptance')}, "

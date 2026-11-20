@@ -102,6 +102,7 @@ from neoqcd.fermions.io import (  # noqa: E402
     save_state,
 )
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
+from neoqcd.fermions.pseudofermion import convergence_limit  # noqa: E402
 from neoqcd.fermions.snf import (  # noqa: E402
     FermionNEMCMC,
     FieldState,
@@ -140,6 +141,9 @@ SAMPLE_FIELDS = (
     "pool_wall_s",   # wall time of the decorrelation trajectories before this batch
     "ess_batch",     # ESS of the works of this batch
     "ess_cumulative",  # ESS of all works up to this batch
+    "max_residual",  # largest true relative CG residual of the solves of this batch (decorrelation
+                     # trajectories and flow, all samples; NaN-sticky; `SolveMonitor`)
+    "unconverged_solves",  # solves of this batch above 10 max(tol, 1e3 eps) (kept with --on-unconverged warn|ignore)
 )
 
 BLOCK_FIELDS = (
@@ -160,6 +164,8 @@ TRAIN_FIELDS = (
     "max_abs_coeff",   # max |rho| (stout) or |coefficient| (residual) of that flow (snf_layers.layer_diagnostics)
     "injectivity_ratio",  # max |rho| / (1/(2(D-1))) (stout) or the residual contraction estimate; >= 1: no
                           # bijectivity guarantee (one RuntimeWarning per run)
+    "max_residual",    # largest true relative CG residual of the step's solves (n-between trajectories and flow)
+    "unconverged_solves",  # the step's solves above the convergence limit
 )
 
 POOL_NAME = "pool"
@@ -845,6 +851,110 @@ def load_flow_checkpoint(out, phase, progress, train_steps, device):
                      f"train step {want}): {found or 'no flow file'}; the pair is inconsistent, restart with --overwrite")
 
 
+def nan_max(a, b):
+    """max of two floats or None (None: no value), NaN-sticky (python's max drops a NaN depending on
+    the order of its arguments)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if math.isnan(a) or math.isnan(b):
+        return float("nan")
+    return max(a, b)
+
+
+class SolveMonitor:
+    """Convergence record of every solve of a fermion term, for the output rows: wraps the term's
+    `_solve(op, tol)` (an instance attribute; the classes are untouched, as `SolveTimer` of
+    main_hmc.py), through which every action, force, jump and layer (`PseudofermionAction`) solve
+    goes. After each solve that reached the term's bookkeeping (its `stats["solves"]` moved, also
+    when the convergence policy then raises) it reads `stats["last_residual"]`, the TRUE relative
+    residual per sample, and keeps
+      - max_residual: the largest one (NaN-sticky: a NaN residual is never hidden by a later max);
+      - unconverged: the number of solves with a sample above `convergence_limit(tol)`, the rule of
+        the Wilson terms' policy, applied here to every term (the reference staggered term has no
+        policy of its own),
+    both for the current interval (`interval()` returns and resets them) and for the run."""
+
+    def __init__(self, fermion):
+        self.fermion = fermion
+        self.total_max, self.total_unconverged = None, 0
+        self._max, self._unconverged = None, 0
+        original = fermion._solve
+
+        def monitored(op, tol):
+            before = fermion.stats["solves"]
+            try:
+                return original(op, tol)
+            finally:
+                if fermion.stats["solves"] > before:
+                    self._record(fermion.stats.get("last_residual"), tol)
+
+        fermion._solve = monitored
+
+    def _record(self, residual, tol):
+        if residual is None:
+            return
+        residual = residual.detach().reshape(-1).to("cpu", torch.float64)
+        worst = float(residual.max()) if residual.numel() else None  # torch's max propagates NaN
+        bad = int(bool((~(residual <= convergence_limit(float(tol), torch.float64))).any()))
+        self._max, self.total_max = nan_max(self._max, worst), nan_max(self.total_max, worst)
+        self._unconverged += bad
+        self.total_unconverged += bad
+
+    def interval(self):
+        """(max_residual or None, unconverged solves) since the previous call; resets them."""
+        out = (self._max, self._unconverged)
+        self._max, self._unconverged = None, 0
+        return out
+
+
+def convergence_from_csv(path, group):
+    """Convergence summary of the rows of a CSV with max_residual / unconverged_solves columns, one
+    row per `group` value (the per-batch or per-step value repeated on its rows): max_residual
+    (NaN-sticky; None without any record), max_residual_nonfinite, unconverged_solves, and
+    rows_without_record (rows of a run older than the columns)."""
+    out = {"max_residual": None, "max_residual_nonfinite": False, "unconverged_solves": 0, "rows_without_record": 0}
+    path = Path(path)
+    if not path.exists():
+        return out
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows or "max_residual" not in rows[0]:
+        out["rows_without_record"] = len(rows)
+        return out
+    seen = set()
+    for row in rows:
+        if row[group] in seen:
+            continue
+        seen.add(row[group])
+        if row["max_residual"] == "":
+            out["rows_without_record"] += 1
+            continue
+        out["max_residual"] = nan_max(out["max_residual"], float(row["max_residual"]))
+        out["unconverged_solves"] += int(float(row["unconverged_solves"] or 0))
+    out["max_residual_nonfinite"] = out["max_residual"] is not None and not math.isfinite(out["max_residual"])
+    return out
+
+
+def merge_convergence(*parts):
+    """One convergence summary from several (`convergence_from_csv` dicts)."""
+    out = {"max_residual": None, "unconverged_solves": 0, "rows_without_record": 0}
+    for p in parts:
+        out["max_residual"] = nan_max(out["max_residual"], p.get("max_residual"))
+        out["unconverged_solves"] += int(p.get("unconverged_solves", 0))
+        out["rows_without_record"] += int(p.get("rows_without_record", 0))
+    out["max_residual_nonfinite"] = out["max_residual"] is not None and not math.isfinite(out["max_residual"])
+    return out
+
+
+def convergence_note(max_residual, unconverged):
+    """' res <max> unconverged <n>' for a log line (empty when nothing was solved)."""
+    if max_residual is None:
+        return ""
+    return f" res {max_residual:.1e}" + (f" UNCONVERGED {unconverged}" if unconverged else "")
+
+
 # ---- the run ------------------------------------------------------------------------------------
 class PoolSampler:
     """B chains in equilibrium at lambda_0 (fermionic HMC on the shared QCDAction)."""
@@ -902,6 +1012,8 @@ def summarize(out, batch, protocol):
                     max_abs_coeff_max=float(np.nanmax(t["max_abs_coeff"])) if known.any() else None,
                     injectivity_ratio_max=float(ratio[known].max()) if known.any() else None,
                     injectivity_exceeded_steps=int((ratio[known] >= 1.0).sum()))
+    convergence = {"training": convergence_from_csv(tpath, "step"), "evaluation": convergence_from_csv(spath, "batch")}
+    summary["convergence"] = dict(merge_convergence(*convergence.values()), **convergence)
     if not spath.exists():
         return summary
     s = read_observables(spath)
@@ -1021,6 +1133,7 @@ def main(argv=None):
         U, source = start_links(args, geometry, device, args.batch, beta0, kappa0, bc0)
     pool = PoolSampler(args, action, lam0, U)
     counter = Counter(action.fermion)
+    monitor = SolveMonitor(action.fermion)
 
     if args.resume:  # CSVs of a run started before columns were added
         for name, fields in (("samples", SAMPLE_FIELDS), ("blocks", BLOCK_FIELDS), ("training", TRAIN_FIELDS)):
@@ -1096,6 +1209,7 @@ def main(argv=None):
         _sync(device)
         info["therm_seconds"] = time.perf_counter() - t0
         info["therm_acceptance"] = float(np.mean(acc))
+        info["therm_max_residual"], info["therm_unconverged_solves"] = monitor.interval()
         _log(args, f"thermalised {args.therm} trajectories at {args.protocol} = {lam0}: acceptance "
                    f"{np.mean(acc):.3f}, {info['therm_seconds']:.1f} s")
     if not args.resume:
@@ -1105,6 +1219,7 @@ def main(argv=None):
     skipped = 0
     if phase == "train":
         for step in range(progress, args.train_steps):
+            monitor.interval()  # the step's record starts with its decorrelation trajectories
             pool.advance(args.n_between, generator)
             snap = counter.snapshot()
             _sync(device)
@@ -1142,9 +1257,11 @@ def main(argv=None):
                    "grad_norm": grad_norm, "solves": solves, "cg_iter": cg_iter, "wall_s": wall,
                    "lr": lr, "param_abs_mean": param_abs_mean, "max_abs_coeff": diag["max_abs_coeff"],
                    "injectivity_ratio": diag["injectivity_ratio"]}
+            row["max_residual"], row["unconverged_solves"] = monitor.interval()
             writers["training"].write_rows([row])
             _log(args, f"train {step:5d} loss {row['loss']:+.5f} ess {row['ess']:.3f} acc {acc:.2f} "
-                       f"|g| {grad_norm:.2e} solves {solves} {wall:.2f} s")
+                       f"|g| {grad_norm:.2e} solves {solves}{convergence_note(row['max_residual'], row['unconverged_solves'])} "
+                       f"{wall:.2f} s")
             if args.checkpoint_every and (step + 1) % args.checkpoint_every == 0 and step + 1 < args.train_steps:
                 checkpoint("train", step + 1)
         phase, progress = "eval", 0
@@ -1159,6 +1276,7 @@ def main(argv=None):
         if progress:
             works = list(read_observables(paths["samples"])["work"])
         for k in range(progress, n_batches):
+            monitor.interval()  # the batch's record starts with its decorrelation trajectories
             snap = counter.snapshot()
             _sync(device)
             t0 = time.perf_counter()
@@ -1182,20 +1300,26 @@ def main(argv=None):
             ess_c = effective_sample_size(torch.tensor(works)) if len(works) > 1 else 1.0
             S0, Sf = flow.last_run["S0"].cpu(), flow.last_run["S_final"].cpu()
             pl = int_obs[:, -1, 5]
+            max_res, unconverged = monitor.interval()
             rows = [{"batch": k, "replica": b, "sample": k * args.batch + b, "work": float(W[b]),
                      "heat": float(Q[b]), "logJ": float(logJ[b]), "S0": float(S0[b]), "S_final": float(Sf[b]),
                      "plaquette": float(pl[b]), "solves": solves, "cg_iter": cg_iter, "pool_solves": pool_solves,
-                     "wall_s": wall, "pool_wall_s": pool_wall, "ess_batch": ess_b, "ess_cumulative": ess_c}
+                     "wall_s": wall, "pool_wall_s": pool_wall, "ess_batch": ess_b, "ess_cumulative": ess_c,
+                     "max_residual": max_res, "unconverged_solves": unconverged}
                     for b in range(args.batch)]
             writers["samples"].write_rows(rows)
             writers["blocks"].write_rows(block_rows(k, protocol, flow, int_obs))
             _log(args, f"eval {k:5d} <W> {W.mean():+.5f} ess(batch) {ess_b:.3f} ess(all) {ess_c:.3f} "
-                       f"solves {solves} {wall:.2f} s")
+                       f"solves {solves}{convergence_note(max_res, unconverged)} {wall:.2f} s")
             if args.checkpoint_every and (k + 1) % args.checkpoint_every == 0 and k + 1 < n_batches:
                 checkpoint("eval", k + 1)
         phase, progress = "done", n_batches
 
     summary = checkpoint("done", progress, final=True)
+    conv = summary.get("convergence", {})
+    if conv.get("max_residual") is not None:
+        _log(args, f"solver: largest true relative residual {conv['max_residual']:.2e}, "
+                   f"{conv['unconverged_solves']} unconverged solves (--on-unconverged {args.on_unconverged})")
     if "dF" in summary:
         _log(args, f"done: {summary['n_samples']} samples, dF {summary['dF']:.6f} +- {summary['dF_error']:.6f}, "
                    f"ESS {summary['ess']:.4f}, <W> {summary['work_mean']:.5f}, "

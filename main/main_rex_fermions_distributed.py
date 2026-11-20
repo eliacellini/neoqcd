@@ -43,7 +43,9 @@ Output directory (--out, alias --output-dir; default output/rex_fermions_distrib
                         (OBS_FIELDS): plaquette = mean over chains of the configuration carrying the
                         rung after the step, exp_mdH of the trajectories run at that rung, swaps of the
                         pair (rung, rung + 1), HMC acceptance of all replicas; solves and cg_iter are
-                        summed over the ranks, wall_s is the slowest rank's step time;
+                        summed over the ranks, wall_s is the slowest rank's step time, max_residual
+                        the largest true relative CG residual of the step on any rank (NaN-sticky) and
+                        unconverged_solves the sum over the ranks (`main_snf_fermions.SolveMonitor`);
     replica_history.npz (rank 0) measured steps only: labels (steps, world_size, n_chains) int8, the
                         rung of each chain slot after the step (`replica_history.rung_indices`);
                         plaquette, defect_action (S_D = dS/dc at the slot's bc, `rex.defect_action`),
@@ -117,16 +119,20 @@ for _p in (ROOT / "src", ROOT / "main"):
 from main_hmc import _sync  # noqa: E402
 from main_rex_fermions import OBS_FIELDS, add_rex_args, resolve_ladder, swap_meta  # noqa: E402
 from main_snf_fermions import (  # noqa: E402
+    SolveMonitor,
     action_kwargs,
     add_physics_args,
     build_defect_mask,
     clean_json,
+    convergence_from_csv,
     defect_key,
     fermion_kwargs,
+    nan_max,
     run_info,
     staggered_key,
     start_links,
     state_couplings,
+    upgrade_csv_header,
     validate_common,
 )
 
@@ -162,6 +168,8 @@ RANK_FILES = tuple(f"{stem}_{g}{ext}" for g in SLOTS
 LEGACY_RANK_FILES = ("checkpoint.pt", "checkpoint.json", "rex_state.pt")  # single-generation layout (no resume)
 RANK_DIR = re.compile(r"rank\d{3}")
 N_PACK = 4  # per-chain values gathered each step: plaquette, defect action, exp(-dH), HMC accepted
+# per-rank values gathered after them: solves, CG iterations, wall time, largest residual (-1: no solve), unconverged
+N_TAIL = 5
 
 
 # ---- arguments ----------------------------------------------------------------------------------
@@ -423,7 +431,8 @@ class History:
 def summarize(history, csv_path, ladder, path):
     """Pure-gauge "replica_history" block and the cost summary of the measured steps."""
     n_r = len(ladder)
-    summary = {"steps_measured": len(history)}
+    summary = {"steps_measured": len(history),
+               "convergence": convergence_from_csv(csv_path, "step")}  # every step, thermalisation included
     if len(history) == 0:
         return summary, None
     a = history.arrays()
@@ -583,8 +592,11 @@ def run(args, argv, device, backend):
                     **action_kwargs(args), **fermion_kwargs(args))
     target = FermionREXTarget(qcd, tau=args.tau, n_steps=args.n_steps, integrator=args.integrator_levels)
     fermion = qcd.fermion
+    monitor = SolveMonitor(fermion)
 
     def open_writer():
+        if resume:  # an observables.csv written before columns were added
+            upgrade_csv_header(csv_path, OBS_FIELDS, log=log0)
         w = ObservableWriter(csv_path, OBS_FIELDS, trajectory_field="step")
         if resume:
             w.truncate(n_done)
@@ -697,10 +709,12 @@ def run(args, argv, device, backend):
             s_d = torch.zeros(C, dtype=torch.float64)
         else:  # one set of plaquette fields for both (rex.step_observables)
             plaq, s_d = step_observables(qcd, U, pt.local_parameters.to(torch.float64).cpu())
+        max_res, unconverged = monitor.interval()
         pack = torch.cat([plaq.cpu(), s_d.cpu().reshape(-1),
                           hmc_stats["exp_minus_dH"].to(torch.float64).cpu().reshape(-1),
                           hmc_stats["accepted"].to(torch.float64).cpu().reshape(-1),
-                          torch.tensor([fermion.stats["solves"] - s0, fermion.stats["cg_iterations"] - c0, wall],
+                          torch.tensor([fermion.stats["solves"] - s0, fermion.stats["cg_iterations"] - c0, wall,
+                                        -1.0 if max_res is None else max_res, unconverged],
                                        dtype=torch.float64)]).to(device)
         gathered = [torch.zeros_like(pack) for _ in range(world)] if rank == 0 else None
         dist.gather(pack, gather_list=gathered, dst=0)
@@ -708,7 +722,7 @@ def run(args, argv, device, backend):
 
         def record():
             nonlocal link_accepted, link_proposed, swap_attempts
-            g = torch.stack(gathered, dim=0).cpu().numpy()  # (world, N_PACK * C + 3)
+            g = torch.stack(gathered, dim=0).cpu().numpy()  # (world, N_PACK * C + N_TAIL)
             per_chain = g[:, :N_PACK * C].reshape(world, N_PACK, C)
             plaq_w, sd_w, x_w, acc_w = (per_chain[:, i] for i in range(N_PACK))
             labels = rung_indices(pt.parameter_matrix, pt.ladder).cpu().numpy()  # (world, C)
@@ -720,7 +734,12 @@ def run(args, argv, device, backend):
                 link_accepted = [a + b for a, b in zip(link_accepted, la)]
                 link_proposed = [a + b for a, b in zip(link_proposed, lp)]
                 swap_attempts += 1
-            solves, cg_iter, wall_max = float(g[:, -3].sum()), float(g[:, -2].sum()), float(g[:, -1].max())
+            tail = g[:, N_PACK * C:]
+            solves, cg_iter, wall_max = float(tail[:, 0].sum()), float(tail[:, 1].sum()), float(tail[:, 2].max())
+            max_res = None
+            for r in tail[:, 3]:  # NaN-sticky over the ranks; -1: that rank did not solve
+                max_res = max_res if (not np.isnan(r) and r < 0) else nan_max(max_res, float(r))
+            unconverged = int(tail[:, 4].sum())
             plaq_r, x_r = _per_rung(plaq_w, labels, world), _per_rung(x_w, traj_labels, world)
             hmc_acc = float(acc_w.mean())
             writer.write_rows([{"step": step, "therm": int(thermal), "rung": k, "bc": ladder[k],
@@ -728,13 +747,17 @@ def run(args, argv, device, backend):
                                 "swap_accepted": la[k] if k < n_links else None,
                                 "swap_proposed": lp[k] if k < n_links else None,
                                 "hmc_acceptance": hmc_acc, "solves": int(solves), "cg_iter": int(cg_iter),
-                                "wall_s": wall_max} for k in range(world)])
+                                "wall_s": wall_max, "max_residual": max_res, "unconverged_solves": unconverged}
+                               for k in range(world)])
+            if unconverged and not args.quiet:
+                print(f"WARNING: step {step}: {unconverged} unconverged solves (all ranks), largest true relative "
+                      f"residual {max_res:.2e} (--on-unconverged {args.on_unconverged})", file=sys.stderr, flush=True)
             if (step + 1) % args.log_every == 0 or step == 0:
                 cum = [a / p if p else float("nan") for a, p in zip(link_accepted, link_proposed)]
                 if not args.quiet:
                     print(f"step {step:5d}{' (therm)' if thermal else ''} plaq/rung {[round(v, 5) for v in plaq_r]} "
                           f"hmc acc {hmc_acc:.2f} swaps {la}/{lp} link acc {[round(v, 3) for v in cum]} "
-                          f"solves {int(solves)} {wall_max:.2f} s", flush=True)
+                          f"solves {int(solves)} res {max_res} unconverged {unconverged} {wall_max:.2f} s", flush=True)
                 if len(history):
                     history.save(hist_path, ladder, args.therm)
         comm.rank0(record, f"output of step {step}")
@@ -749,6 +772,10 @@ def run(args, argv, device, backend):
         result["meta"] = meta
         if not args.quiet and meta is not None:
             h = meta.get("replica_history", {})
+            conv = meta["summary"].get("convergence", {})
+            if conv.get("max_residual") is not None:
+                print(f"solver: largest true relative residual {conv['max_residual']:.2e}, "
+                      f"{conv['unconverged_solves']} unconverged solves", flush=True)
             print(f"done: {meta['steps_completed']} measured steps, round trips {h.get('round_trips')}, "
                   f"round-trip steps {h.get('round_trip_steps')}, link acceptance {meta['swap']['link_acceptance']}, "
                   f"{meta['summary'].get('seconds_per_step')} s/step", flush=True)
