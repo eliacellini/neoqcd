@@ -198,32 +198,39 @@ class MainHMCTest(unittest.TestCase):
 
     @staticmethod
     def _ar1(seed=33, phi=0.5, n=50, B=16):
-        """AR(1) series (tau_int ~ 1.5-3) that makes Obs.gamma_method raise in _compute_drho
-        (odd w_max = 25: the mirrored rho slice is one element short)."""
+        """AR(1) series (tau_int ~ 1.5-3) with an odd w_max = 25, on which Obs.gamma_method raised in
+        _compute_drho before the fix of obs.py on main (8f83515: the mirrored rho slice was one
+        element short)."""
         rng = np.random.default_rng(seed)
         x = np.zeros((n, B))
         for t in range(1, n):
             x[t] = phi * x[t - 1] + rng.normal(size=B)
         return x
 
-    def test_gamma_summary_falls_back_when_gamma_method_raises(self):
+    def test_gamma_summary_on_the_series_that_made_obs_raise(self):
+        """With the obs.py fix the Gamma method goes through on the series that made it raise."""
         x = self._ar1()
         s = MAIN.gamma_summary(x, S=2.0)
-        self.assertTrue(s["status"].startswith("gamma_failed: "), s["status"])
+        self.assertEqual(s["status"], "gamma")
+        self.assertAlmostEqual(s["value"], float(x.mean()))
+        for key in ("error", "tau_int", "window"):
+            self.assertTrue(np.isfinite(s[key]) and s[key] > 0, f"{key} = {s[key]}")
+
+    def test_gamma_summary_falls_back_when_gamma_method_raises(self):
+        # forced failure through a monkeypatched Obs method (no natural failure is left since the obs.py fix)
+        from neoqcd import obs as obs_mod
+        x = self._ar1()
+        orig = obs_mod.Obs.gamma_method
+        try:
+            obs_mod.Obs.gamma_method = lambda self, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+            s = MAIN.gamma_summary(x, S=2.0)
+        finally:
+            obs_mod.Obs.gamma_method = orig
+        self.assertEqual(s["status"], "gamma_failed: RuntimeError: boom")
         self.assertAlmostEqual(s["value"], float(x.mean()))
         self.assertEqual(s["error_method"], "replica_means")
         self.assertAlmostEqual(s["error"], float(x.mean(axis=0).std(ddof=1) / 4.0))
         self.assertEqual(sorted(s["binned_errors"], key=int), ["1", "2", "4", "8", "16"])
-        # forced failure through a monkeypatched Obs method (independent of the obs.py bug)
-        from neoqcd import obs as obs_mod
-        orig = obs_mod.Obs.gamma_method
-        try:
-            obs_mod.Obs.gamma_method = lambda self, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
-            s = MAIN.gamma_summary(self._ar1(seed=0), S=2.0)
-        finally:
-            obs_mod.Obs.gamma_method = orig
-        self.assertEqual(s["status"], "gamma_failed: RuntimeError: boom")
-        self.assertIsNotNone(s["error"])
 
     def test_summary_failure_does_not_kill_checkpoint_and_stale_meta_resumes(self):
         out = self.tmp / "run"
