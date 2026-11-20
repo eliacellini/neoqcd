@@ -19,8 +19,12 @@
 # 4^4 SU(3), N_f = 2 Wilson, protocol kappa 0.153 -> 0.1545 at beta = 5.6 (Model C of Abbott et al.,
 # on 4^4), 8 protocol steps, one HMC trajectory per block:
 #   nemcmc  NE-MCMC, pool thermalised from cold (100 trajectories at kappa = 0.153), 256 samples;
-#   snf     stout (smearing) layers, starting from the pool checkpoint of `nemcmc` (no new
-#           thermalisation), 20 Adam steps on mean(W), then 128 samples;
+#   snf     signed stout layers (--layers smearing_signed) started exactly at the identity
+#           (--rho-init 0, a regular point), lr 1e-3 with a 5-step warm-up, from the pool checkpoint
+#           of `nemcmc` (no new thermalisation), 20 Adam steps on mean(W), then 128 samples. (Until
+#           20 November this point ran the |rho| stout layer with --rho-init 1e-3 --lr 1e-3, which
+#           the driver now refuses: Adam's first step sends every rho to ~0 or ~2e-3 and flips
+#           signs; its output directory was snf_smearing_..., the new one is snf_signed_...);
 #   residual (optional, not in the default POINTS) static residual layers (--layers residual, one
 #           per step) with two frozen-link convolutions (--residual-n-pt 2, mask mod 2), started
 #           exactly at the identity (--residual-coeff-init 0, a regular point), default
@@ -52,7 +56,7 @@ POINTS="${POINTS:-nemcmc snf}"
 SEED="${SEED:-1234}"
 BASE="output/snf_fermions"
 NEMCMC_OUT="${BASE}/nemcmc_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
-SNF_OUT="${BASE}/snf_smearing_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
+SNF_OUT="${BASE}/snf_signed_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
 RESIDUAL_OUT="${BASE}/snf_residual_npt2_kappa0.153to0.1545_n8_b5.6_4x4p3_fast"
 
 COMMON=(--D 4 --T 4 --L 4 --N 3 --beta 5.6 --kappa 0.153
@@ -74,8 +78,8 @@ for point in $POINTS; do
     nemcmc) run_point "$NEMCMC_OUT" "${COMMON[@]}" --mode nemcmc --therm 100 --eval-samples 256 "${@}" ;;
     snf)
       if [[ ! -f "${NEMCMC_OUT}/pool.json" ]]; then echo "snf needs ${NEMCMC_OUT}/pool.json" >&2; exit 2; fi
-      run_point "$SNF_OUT" "${COMMON[@]}" --mode snf --layers smearing --rho-init 1e-3 --lr 1e-3 \
-        --train-steps 20 --eval-samples 128 --start-config "${NEMCMC_OUT}/pool" "${@}" ;;
+      run_point "$SNF_OUT" "${COMMON[@]}" --mode snf --layers smearing_signed --rho-init 0 --lr 1e-3 \
+        --lr-warmup 5 --train-steps 20 --eval-samples 128 --start-config "${NEMCMC_OUT}/pool" "${@}" ;;
     residual)
       if [[ ! -f "${NEMCMC_OUT}/pool.json" ]]; then echo "residual needs ${NEMCMC_OUT}/pool.json" >&2; exit 2; fi
       run_point "$RESIDUAL_OUT" "${COMMON[@]}" --mode snf --layers residual --residual-n-pt 2 \

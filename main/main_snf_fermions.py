@@ -6,10 +6,15 @@ S(U, phi; lambda) = S_g(U; beta, bc) + S_pf(U, phi; kappa) (`neoqcd.fermions.act
     --protocol ... --initial lambda_0 --protocol-file f                       (lambda_1 .. lambda_n).
 --mode nemcmc: `snf.FermionNEMCMC` (HMC blocks only, --layers none);
 --mode snf:    `snf_layers.FermionSNF` (a pure-gauge layer before every HMC block, --layers
-               smearing|smearing_signed|residual|hyper-residual, trained on mean(W) with Adam for
-               --train-steps steps; smearing_signed --rho-init 0 starts at the identity and trains,
-               --lr-warmup ramps the learning rate). Adam's first steps move every parameter by
-               about --lr, so --lr should be well below --rho-init.
+               smearing_signed (default)|smearing|residual|hyper-residual, trained on mean(W) with
+               Adam for --train-steps steps; the default smearing_signed --rho-init 0 starts exactly
+               at the identity and trains, --lr-warmup ramps the learning rate). --layers smearing
+               (the pure-gauge |rho| stout layer) needs --lr < |--rho-init| to train: Adam's first
+               steps move every parameter by about --lr, so a larger rate sends rho to ~0 or
+               ~2 rho_init and flips signs (refused). Residual layers whose conditioning steps d_i
+               are all zero (--residual-delta step with --n-step 1, a constant protocol) are the
+               identity and are refused. Options a layer kind ignores (--rho-init for the residual
+               kinds, residual options for the stout kinds, given at their default value) warn once.
 Residual layers (`ResidualCouplingLayer`, pure-gauge spelling of main_nemcmc_snf.py
 --nf-architecture): --layers residual (static coefficients) or hyper-residual (coefficients from a
 hyper-network of the conditioning value), --residual-n-pt, --residual-mask-mod,
@@ -112,6 +117,7 @@ from neoqcd.fermions.snf_layers import (  # noqa: E402
     RESIDUAL_OPTIONS,
     FermionSNF,
     default_sharing,
+    layer_conditioning,
     layer_diagnostics_message,
     make_gauge_layers,
     residual_options,
@@ -223,14 +229,16 @@ def parse_args(argv=None):
     p.add_argument("--protocol-file", type=str, default=None, help="Text file with lambda_1 .. lambda_n.")
     p.add_argument("--mode", choices=("nemcmc", "snf"), default="nemcmc")
     p.add_argument("--layers", choices=("none",) + LAYER_KINDS, default=None,
-                   help="Default: none for nemcmc, smearing for snf. smearing_signed: stout with a signed "
-                        "rho (snf_layers.SignedCouplingLayer), trainable from --rho-init 0 (the identity).")
-    p.add_argument("--rho-init", type=float, default=1e-3,
-                   help="Initial stout rho of every slot of every smearing layer (default 1e-3), the value "
-                        "used by the first training step (param_abs_mean of training step 0). With --layers "
-                        "smearing it must be nonzero for training: that layer uses |rho|, whose gradient at "
-                        "rho = 0 is zero, so the layers would never move; use --layers smearing_signed "
-                        "--rho-init 0 for a trainable identity start. Unused with --layers none or residual.")
+                   help="Default: none for nemcmc, smearing_signed for snf (stout with a signed rho, "
+                        "snf_layers.SignedCouplingLayer: trainable from --rho-init 0, the identity). smearing: "
+                        "the pure-gauge |rho| stout layer (needs --lr < |--rho-init| to train).")
+    p.add_argument("--rho-init", type=float, default=0.0,
+                   help="Initial stout rho of every slot of every smearing layer (default 0: the identity, "
+                        "trainable with the default smearing_signed), the value used by the first training "
+                        "step (param_abs_mean of training step 0). With --layers smearing training needs "
+                        "|rho-init| > --lr: that layer uses |rho|, whose gradient at rho = 0 is zero, and "
+                        "Adam's first steps move rho by about lr (a larger lr flips signs); refused otherwise. "
+                        "Ignored (with a warning) by the residual kinds.")
     add_residual_args(p)
     p.add_argument("--load-flow", type=str, default=None,
                    help="flow.pt of a previous snf run (layer weights); its flow.json sidecar must record the "
@@ -238,7 +246,8 @@ def parse_args(argv=None):
     p.add_argument("--train-steps", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3,
                    help="Adam learning rate. Adam's first steps move every parameter by about lr whatever "
-                        "the gradient size, so lr should be well below --rho-init (or use --lr-warmup).")
+                        "the gradient size (--lr-warmup ramps it); with --layers smearing it must be below "
+                        "|--rho-init|.")
     p.add_argument("--lr-warmup", type=int, default=0,
                    help="Linear learning-rate warm-up: lr * min(1, (step + 1) / k) at training step `step` "
                         "(0: off). Stateless in the step index, so a resume continues it exactly.")
@@ -251,7 +260,25 @@ def parse_args(argv=None):
     p.add_argument("--out", type=str, default=None)
     args = p.parse_args(argv)
     validate_args(args)
+    for action in p._actions:  # second pass with no defaults: the options given on the command line
+        action.default = argparse.SUPPRESS
+    warn_ignored_options(args, set(vars(p.parse_args(argv))))
     return args
+
+
+def warn_ignored_options(args, given):
+    """One RuntimeWarning listing the options the chosen layer kind ignores although they were given
+    (at a value the checks accept): --rho-init with the residual kinds or without layers, residual
+    options at their default value with the stout kinds or without layers (other values exit)."""
+    ignored = []
+    if "rho_init" in given and args.layers not in ("smearing", "smearing_signed"):
+        ignored.append("--rho-init")
+    if args.layers not in RESIDUAL_KINDS:
+        ignored += [f"--{k.replace('_', '-')}" for k in RESIDUAL_ARG_DEFAULTS if k in given]
+    if ignored:
+        msg = f"--layers {args.layers} ignores {', '.join(ignored)}"
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    return ignored
 
 
 def add_residual_args(p):
@@ -441,7 +468,7 @@ def validate_args(args):
     args.n_step = len(args.protocol_values)
     args.final = args.protocol_values[-1]
     if args.layers is None:
-        args.layers = "none" if args.mode == "nemcmc" else "smearing"
+        args.layers = "none" if args.mode == "nemcmc" else "smearing_signed"
     if args.mode == "nemcmc" and args.layers != "none":
         raise SystemExit("--mode nemcmc has no layers (use --layers none or --mode snf)")
     if args.mode == "snf" and args.layers == "none":
@@ -450,7 +477,12 @@ def validate_args(args):
         raise SystemExit("--train-steps / --load-flow need --mode snf")
     if args.layers == "smearing" and args.rho_init == 0.0 and args.train_steps:
         raise SystemExit("--layers smearing with --rho-init 0 cannot train (the gradient of |rho| vanishes at 0): "
-                         "use --layers smearing_signed for an identity start")
+                         "use --layers smearing_signed (the default) for an identity start")
+    if args.layers == "smearing" and args.train_steps and not args.lr < abs(args.rho_init):
+        raise SystemExit(f"--layers smearing with --lr {args.lr:g} >= |--rho-init| {abs(args.rho_init):g}: the layer "
+                         "uses |rho| and Adam's first steps move every rho by about lr, so rho goes to ~0 or "
+                         "~2 rho_init and its sign flips; use --layers smearing_signed (default, e.g. --rho-init 0) "
+                         "or an --lr well below |--rho-init|")
     if args.lr_warmup < 0:
         raise SystemExit("--lr-warmup must be >= 0")
     for name in ("batch", "n_traj"):
@@ -463,6 +495,15 @@ def validate_args(args):
     uses_defect = args.protocol == "bc" or args.bc != 1.0
     args.uses_defect = uses_defect
     validate_residual_args(args)
+    if args.layers in RESIDUAL_KINDS:
+        steps = [d for _, d in layer_conditioning(args.initial, args.protocol_values, args.residual_condition,
+                                                  args.residual_delta)]
+        if all(d == 0.0 for d in steps):
+            why = "one step" if args.residual_delta == "step" and len(steps) == 1 else "a constant protocol"
+            raise SystemExit(f"--layers {args.layers}: every conditioning step d_i is 0 (--residual-delta "
+                             f"{args.residual_delta} with {why}), so every layer is exactly the identity: nothing "
+                             "to train (no gradient) and the run would be plain NE-MCMC labelled snf; use "
+                             "--residual-delta fraction or a protocol that moves")
 
 
 def default_name(args):

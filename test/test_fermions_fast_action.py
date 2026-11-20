@@ -529,7 +529,7 @@ class DriversFastTest(unittest.TestCase):
                 SNF.parse_args(stag + extra)
         with self.assertRaises(SystemExit):  # untrainable identity start of the |rho| layer
             SNF.parse_args(LATTICE + ["--protocol", "beta", "--final", "5.2", "--n-step", "1", "--mode", "snf",
-                                      "--rho-init", "0", "--train-steps", "1"])
+                                      "--layers", "smearing", "--rho-init", "0", "--train-steps", "1"])
         args = SNF.parse_args(LATTICE + ["--protocol", "beta", "--final", "5.2", "--n-step", "1", "--mode", "snf",
                                          "--layers", "smearing_signed", "--rho-init", "0", "--train-steps", "1",
                                          "--lr-warmup", "4"])
