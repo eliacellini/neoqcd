@@ -459,11 +459,20 @@ class SolveTimer:
                 self.seconds += time.perf_counter() - t0
                 last = term.stats.get("last_residual")
                 if last is not None:
-                    worst = float(last.max().item())
-                    self.max_residual = worst if self.max_residual is None else max(self.max_residual, worst)
+                    self.max_residual = worse_residual(self.max_residual, float(last.max().item()))
             return x
 
         return timed
+
+
+def worse_residual(a, b):
+    """The larger of two residuals, a non-finite one sticky whatever the order (Python's max drops a
+    NaN that comes second: max(1e-10, nan) = 1e-10); NaN wins over inf. None is "no solve yet"."""
+    if a is None:
+        return b
+    if math.isnan(a) or math.isnan(b):
+        return math.nan
+    return max(a, b)
 
 
 def initial_links(args, geometry, device, generator):

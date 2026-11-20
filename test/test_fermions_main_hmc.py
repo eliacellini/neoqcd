@@ -181,6 +181,33 @@ class MainHMCTest(unittest.TestCase):
         MAIN.main(COMMON + ["--fermions", "none", "--n-traj", "2", "--out", str(out)])
         self.assertTrue(np.all(np.isnan(read_observables(out / "observables.csv")["max_residual"])))
 
+    def test_solve_timer_keeps_a_non_finite_residual(self):
+        """max_residual of a trajectory is NaN (or inf) as soon as one solve's residual is, in
+        either order of the solves (torch's max propagates NaN within a solve; Python's max
+        between solves dropped a NaN that came second)."""
+        nan, inf = float("nan"), float("inf")
+
+        class Term:
+            def __init__(self, values):
+                self.values = list(values)
+                self.stats = {"last_residual": None}
+
+            def _solve(self):
+                self.stats["last_residual"] = torch.tensor(self.values.pop(0), dtype=torch.float64)
+
+        for seq, want in (([nan, 1e-10], nan), ([1e-10, nan], nan), ([[1e-10, nan], [1e-12, 1e-12]], nan),
+                          ([1e-10, inf, 1e-12], inf), ([inf, nan], nan), ([nan, inf], nan),
+                          ([1e-10, 1e-8, 1e-12], 1e-8)):
+            with self.subTest(seq=seq):
+                term = Term(seq)
+                timer = MAIN.SolveTimer(term, torch.device("cpu"))
+                for _ in seq:
+                    term._solve()
+                if np.isnan(want):
+                    self.assertTrue(np.isnan(timer.max_residual), timer.max_residual)
+                else:
+                    self.assertEqual(timer.max_residual, want)
+
     def test_mixed_cost_columns(self):
         """--precision mixed: cg_iter counts complex64 loop + complex128 outer applications."""
         out = self.tmp / "mixed"
