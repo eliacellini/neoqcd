@@ -61,13 +61,15 @@ __all__ = [
     "load_md_backend",
     "gauge_force",
     "md_update",
+    "fermion_force",
     "FusedWilsonGaugeAction",
+    "FusedForceTwoFlavourWilson",
     "FusedHMC",
 ]
 
 MD_TARGETS = ("cuda", "cpu")
 # the components that can run through the kernels (main_hmc.py --md-kernels)
-MD_COMPONENTS = ("gauge_force", "update")
+MD_COMPONENTS = ("gauge_force", "update", "fermion_force")
 _SUPPORTED_D = (2, 4)
 _SUPPORTED_N = (2, 3)
 _MAX_D = 4
@@ -433,6 +435,141 @@ static int md_gauge_dispatch(const NqGaugeArgs& a, void* stream) {
     return -1;
 }
 
+// ---- pseudofermion force (HalfLatticeWilson.hopping_derivative, times 2 kappa^2) --------------------
+// Arguments of nq_fermion_force (_FermionForceArgs).
+struct NqFermionForceArgs {
+    const void* a[2];             // (B, V2, S, N) complex: a_e, a_o (half-lattice fields)
+    const void* b[2];             // (B, V2, S, N) complex: b_e, b_o
+    const void* links[2];         // (BL, V2, 2D, N, N) complex: HalfLatticeWilson._links[t]; entry k < D is L_mu(x)^T
+    const int32_t* nbr[2];        // (V2, 2D): entry k < D is the position of x_i + mu in the other parity
+    const int64_t* sites[2];      // (V2,): full-lattice site of position i of parity t
+    const void* scale;            // (B or 1,) real: 2 kappa^2
+    const void* mom;              // NULL (write F) or (B, D, V, N, N) complex momenta: write P - coef F
+    void* out;                    // (B, D, V, N, N) complex
+    double coef;
+    double reserved;
+    int64_t batch, half_volume, link_batch_stride, scale_batch_stride;
+    int32_t D, N, dtype, device;
+    int32_t proj_perm[8][2];      // spin_projection_tables (not daggered): term k, row j
+    double proj_coef[8][2][2];    // (re, im)
+};
+
+// One link (b, mu, x), x the i-th site of parity t: with the half spinors h = R_k^dag psi of the
+// projector of term k (k = mu: 1 - gamma_mu, k = D + mu: 1 + gamma_mu),
+//   O1 = sum_j h_mu(b(x + mu))_j h_mu(a(x))_j^dag,  O2 = sum_j h_{D+mu}(b(x))_j h_{D+mu}(a(x + mu))_j^dag,
+//   Q = L O1 - O2 L^dag,  F = scale P_ht(i Q)  (the formula of HalfLatticeWilson.hopping_derivative).
+template <typename T, int D, int N, bool KICK>
+MD_HD void md_fforce_link(const NqFermionForceArgs& a, int64_t tid) {
+    typedef MdC<T> C;
+    constexpr int S = (D == 4) ? 4 : 2;
+    constexpr int H = S / 2;
+    constexpr int K = 2 * D;
+    constexpr int NN = N * N;
+    const int64_t V2 = a.half_volume;
+    const int64_t i = tid % V2;
+    int64_t r = tid / V2;
+    const int t = (int)(r % 2);
+    r /= 2;
+    const int mu = (int)(r % D);
+    const int64_t b = r / D;
+    const int n = 1 - t;
+    const int64_t y = a.nbr[t][i * K + mu];
+    const C* ax = static_cast<const C*>(a.a[t]) + (b * V2 + i) * (S * N);
+    const C* ay = static_cast<const C*>(a.a[n]) + (b * V2 + y) * (S * N);
+    const C* bx = static_cast<const C*>(a.b[t]) + (b * V2 + i) * (S * N);
+    const C* by = static_cast<const C*>(a.b[n]) + (b * V2 + y) * (S * N);
+    const int kf = mu, kb = D + mu;
+    C haf[H][N], hbf[H][N], hbb[H][N], hab[H][N];
+    MD_UNROLL
+    for (int j = 0; j < H; ++j) {
+        const C cf = c_make<T>((T)a.proj_coef[kf][j][0], (T)a.proj_coef[kf][j][1]);
+        const C cb = c_make<T>((T)a.proj_coef[kb][j][0], (T)a.proj_coef[kb][j][1]);
+        const int pf = (H + a.proj_perm[kf][j]) * N, pb = (H + a.proj_perm[kb][j]) * N;
+        MD_UNROLL
+        for (int c = 0; c < N; ++c) {
+            haf[j][c] = c_add(ax[j * N + c], c_mul(cf, ax[pf + c]));
+            hbf[j][c] = c_add(by[j * N + c], c_mul(cf, by[pf + c]));
+            hbb[j][c] = c_add(bx[j * N + c], c_mul(cb, bx[pb + c]));
+            hab[j][c] = c_add(ay[j * N + c], c_mul(cb, ay[pb + c]));
+        }
+    }
+    C O1[NN], O2[NN];
+    MD_UNROLL
+    for (int c1 = 0; c1 < N; ++c1) {
+        MD_UNROLL
+        for (int c2 = 0; c2 < N; ++c2) {
+            C s1 = c_mul(hbf[0][c1], c_conj(haf[0][c2])), s2 = c_mul(hbb[0][c1], c_conj(hab[0][c2]));
+            MD_UNROLL
+            for (int j = 1; j < H; ++j) {
+                s1 = c_add(s1, c_mul(hbf[j][c1], c_conj(haf[j][c2])));
+                s2 = c_add(s2, c_mul(hbb[j][c1], c_conj(hab[j][c2])));
+            }
+            O1[N * c1 + c2] = s1;
+            O2[N * c1 + c2] = s2;
+        }
+    }
+    // Lt[a][c] = L[c][a]
+    C Lt[NN];
+    m_load<T, N>(Lt, static_cast<const C*>(a.links[t]) + b * a.link_batch_stride + (i * K + mu) * NN);
+    C Q[NN];
+    MD_UNROLL
+    for (int row = 0; row < N; ++row) {
+        MD_UNROLL
+        for (int c = 0; c < N; ++c) {
+            C s1 = c_mul(Lt[row], O1[c]);                     // sum_a L[row][a] O1[a][c]
+            C s2 = c_mul(O2[N * row], c_conj(Lt[c]));        // sum_a O2[row][a] conj(L[c][a])
+            MD_UNROLL
+            for (int k = 1; k < N; ++k) {
+                s1 = c_add(s1, c_mul(Lt[N * k + row], O1[N * k + c]));
+                s2 = c_add(s2, c_mul(O2[N * row + k], c_conj(Lt[N * k + c])));
+            }
+            Q[N * row + c] = c_sub(s1, s2);
+        }
+    }
+    // M = i Q; F = scale (M + M^dag) / 2 minus the trace / N
+    C G[NN];
+    MD_UNROLL
+    for (int row = 0; row < N; ++row) {
+        MD_UNROLL
+        for (int c = 0; c < N; ++c) {
+            const C m = c_make<T>(-Q[N * row + c].im, Q[N * row + c].re);
+            const C md = c_make<T>(-Q[N * c + row].im, -Q[N * c + row].re);  // conj(i Q[c][row])
+            G[N * row + c] = c_scale((T)0.5, c_add(m, md));
+        }
+    }
+    C tr = G[0];
+    MD_UNROLL
+    for (int k = 1; k < N; ++k) tr = c_add(tr, G[(N + 1) * k]);
+    const C trN = c_make<T>(tr.re / (T)N, tr.im / (T)N);
+    const T sc = static_cast<const T*>(a.scale)[b * a.scale_batch_stride];
+    const int64_t V = 2 * V2;
+    const int64_t link = (b * D + mu) * V + a.sites[t][i];
+    C* out = static_cast<C*>(a.out) + link * NN;
+    const C* P = KICK ? static_cast<const C*>(a.mom) + link * NN : (const C*)0;
+    MD_UNROLL
+    for (int e = 0; e < NN; ++e) {
+        const C g = (e % (N + 1) == 0) ? c_sub(G[e], trN) : G[e];
+        const C f = c_scale(sc, g);
+        out[e] = KICK ? c_sub(P[e], c_scale((T)a.coef, f)) : f;
+    }
+}
+
+template <typename T, int D, int N, bool KICK> struct MdFermionForceFn {
+    static MD_HD void run(const NqFermionForceArgs& a, int64_t tid) { md_fforce_link<T, D, N, KICK>(a, tid); }
+};
+
+static int md_fforce_dispatch(const NqFermionForceArgs& a, void* stream) {
+    if (a.dtype != 0) return -1;  // complex128 only
+    const int64_t total = a.batch * (int64_t)a.D * 2 * a.half_volume;
+#define MD_CASE(DD, NN) \
+    if (a.D == DD && a.N == NN) \
+        return a.mom ? md_launch<MdFermionForceFn<double, DD, NN, true> >(a, total, stream) \
+                     : md_launch<MdFermionForceFn<double, DD, NN, false> >(a, total, stream);
+    MD_CASE(4, 3) MD_CASE(4, 2) MD_CASE(2, 3) MD_CASE(2, 2)
+#undef MD_CASE
+    return -1;
+}
+
 template <typename T, int N, bool KICK, bool MOVE> struct MdUpdateFn {
     static MD_HD void run(const NqUpdateArgs& a, int64_t tid) { md_update_link<T, N, KICK, MOVE>(a, tid); }
 };
@@ -484,6 +621,14 @@ int nq_md_is_cuda(void) {
 
 int nq_gauge_args_size(void) { return (int)sizeof(NqGaugeArgs); }
 int nq_update_args_size(void) { return (int)sizeof(NqUpdateArgs); }
+int nq_fforce_args_size(void) { return (int)sizeof(NqFermionForceArgs); }
+
+int nq_fermion_force(const NqFermionForceArgs* a, void* stream) {
+    MD_DEVICE_GUARD_BEGIN(a->device)
+    int code = md_fforce_dispatch(*a, stream);
+    MD_DEVICE_GUARD_END(code)
+    return code;
+}
 
 int nq_md_update(const NqUpdateArgs* a, void* stream) {
     MD_DEVICE_GUARD_BEGIN(a->device)
@@ -569,10 +714,36 @@ class _UpdateArgs(ctypes.Structure):
     ]
 
 
+class _FermionForceArgs(ctypes.Structure):
+    _fields_ = [
+        ("a", ctypes.c_void_p * 2),
+        ("b", ctypes.c_void_p * 2),
+        ("links", ctypes.c_void_p * 2),
+        ("nbr", ctypes.c_void_p * 2),
+        ("sites", ctypes.c_void_p * 2),
+        ("scale", ctypes.c_void_p),
+        ("mom", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("coef", ctypes.c_double),
+        ("reserved", ctypes.c_double),
+        ("batch", ctypes.c_int64),
+        ("half_volume", ctypes.c_int64),
+        ("link_batch_stride", ctypes.c_int64),
+        ("scale_batch_stride", ctypes.c_int64),
+        ("D", ctypes.c_int32),
+        ("N", ctypes.c_int32),
+        ("dtype", ctypes.c_int32),
+        ("device", ctypes.c_int32),
+        ("proj_perm", (ctypes.c_int32 * 2) * 8),
+        ("proj_coef", ((ctypes.c_double * 2) * 2) * 8),
+    ]
+
+
 _ENTRY_POINTS = (
     # (function, argument structure, size function)
     ("nq_gauge_force", _GaugeArgs, "nq_gauge_args_size"),
     ("nq_md_update", _UpdateArgs, "nq_update_args_size"),
+    ("nq_fermion_force", _FermionForceArgs, "nq_fforce_args_size"),
 )
 
 
@@ -795,6 +966,83 @@ def md_update(P, U=None, F=None, coef=0.0, h=None, backend=None):
     return P_out, U_out
 
 
+_FORCE_TABLES = {}
+
+
+def _force_tables(op):
+    """(nbr int32 (V/2, 2D) per target parity, sites int64 (V/2,) per parity) of a HalfLatticeWilson,
+    cached per geometry and device (the neighbour positions of `site_tables`' hop_index)."""
+    key = (op.geometry, str(op.device))
+    hit = _FORCE_TABLES.get(key)
+    if hit is None:
+        K = 2 * op.geometry.D
+        tab = op._tables
+        nbr = [(tab["hop_index"][t].view(-1, K) // K).to(torch.int32).contiguous() for t in (0, 1)]
+        sites = [tab["sites"][t].to(torch.int64).contiguous() for t in (0, 1)]
+        hit = _FORCE_TABLES[key] = (nbr, sites)
+    return hit
+
+
+def fermion_force(op, a_e, a_o, b_e, b_o, scale, mom=None, coef=0.0, backend=None):
+    """scale * `HalfLatticeWilson.hopping_derivative`(a_e, a_o, b_e, b_o) through the kernel, shape
+    (B, D, lattice, N, N); with `mom` the kicked momenta mom - coef F instead. `op` is the
+    complex128 half-lattice operator (its gathered links, site and spin tables), the fields are
+    half-lattice (B, V/2, S, N) complex128, `scale` a (B,) or (1,) real tensor (2 kappa^2)."""
+    _refuse_autograd("fermion_force", a_e=a_e, a_o=a_o, b_e=b_e, b_o=b_o, mom=mom, links=op.U)
+    geo = op.geometry
+    reason = kernel_supports(geo, op.dtype)
+    if reason is not None:
+        raise ValueError(reason)
+    dev = op.device
+    backend = load_md_backend(_target_of(dev), dev) if backend is None else backend
+    D, H, N = geo.D, op._spin["H"], geo.N
+    K = 2 * D
+    fields = [a_e, a_o, b_e, b_o]
+    B = a_e.shape[0]
+    for f in fields:
+        if tuple(f.shape) != (B, geo.volume // 2, geo.spin, N) or f.dtype != op.dtype or f.device != dev:
+            raise ValueError(f"fermion_force: half-lattice complex128 fields of shape {(B, geo.volume // 2, geo.spin, N)} "
+                             f"on {dev}, got {tuple(f.shape)} {f.dtype} {f.device}")
+    a_e, a_o, b_e, b_o = [_raw(f) for f in fields]
+    links = [_raw(l) for l in op._links]
+    if links[0].shape[0] not in (1, B):
+        raise ValueError(f"field batch {B} does not match the link batch {links[0].shape[0]}")
+    nbr, sites = _force_tables(op)
+    scale = _raw(torch.as_tensor(scale, dtype=torch.float64, device=dev).reshape(-1))
+    if scale.numel() not in (1, B):
+        raise ValueError(f"scale of {scale.numel()} values for a batch of {B}")
+    a = _FermionForceArgs()
+    for t in (0, 1):
+        a.a[t] = (a_e, a_o)[t].data_ptr()
+        a.b[t] = (b_e, b_o)[t].data_ptr()
+        a.links[t] = links[t].data_ptr()
+        a.nbr[t] = nbr[t].data_ptr()
+        a.sites[t] = sites[t].data_ptr()
+    a.scale = scale.data_ptr()
+    a.scale_batch_stride = 0 if scale.numel() == 1 else 1
+    a.batch, a.half_volume = B, geo.volume // 2
+    a.link_batch_stride = 0 if links[0].shape[0] == 1 else links[0][0].numel()
+    a.D, a.N, a.dtype, a.device = D, N, 0, _device_index(dev)
+    pp = op._spin["proj_perm"].reshape(K, H)
+    pc = op._spin["proj_coef"].reshape(K, H)
+    for k in range(K):
+        for j in range(H):
+            a.proj_perm[k][j] = int(pp[k, j])
+            a.proj_coef[k][j][0] = float(pc[k, j].real)
+            a.proj_coef[k][j][1] = float(pc[k, j].imag)
+    shape = geo.link_shape(B)
+    if mom is not None:
+        if tuple(mom.shape) != tuple(shape) or mom.dtype != op.dtype or mom.device != dev:
+            raise ValueError(f"mom must be ({shape}) complex128 on {dev}")
+        mom = _raw(mom)
+        a.mom = mom.data_ptr()
+        a.coef = float(coef)
+    out = torch.empty(shape, dtype=op.dtype, device=dev)
+    a.out = out.data_ptr()
+    _launch(backend, "nq_fermion_force", a, dev)
+    return out
+
+
 class _KernelChoice:
     """Lazy per-device choice between a compiled MD kernel and the torch code (module docstring)."""
 
@@ -861,6 +1109,11 @@ class FusedWilsonGaugeAction(WilsonGaugeAction):
     def kernel_used(self):
         return self._choice.last_used
 
+    @property
+    def fuses_kicks(self):
+        """True when the force kernel is requested: `FusedHMC` then kicks through `force_kick`."""
+        return self._choice.target is not None
+
     def _packed_weights(self, U):
         w = self.plaquette_weights
         if w is None:
@@ -906,6 +1159,66 @@ class FusedWilsonGaugeAction(WilsonGaugeAction):
                            backend=backend)
 
 
+# ---- pseudofermion term -----------------------------------------------------------------------------
+class FusedForceTwoFlavourWilson(FusedTwoFlavourWilson):
+    """`fused.FusedTwoFlavourWilson` (fused hop) whose force runs through the fermion-force kernel.
+
+    The force is the parent's, 2 kappa^2 grad Re[(Y + Z)^dag H (X + W)] from the half fields X (the
+    solve), W = H_oe X, Y = X - kappa^2 H_eo W (the axpy fused into the compiled hop), Z = (H^dag)_oe Y,
+    with `HalfLatticeWilson.hopping_derivative` and the factor 2 kappa^2 replaced by one kernel pass
+    (`fermion_force`). `force_kick(U, P, c)` is P - c F(U) with the kick in the same pass.
+    Extra args `md_target` ("cuda", "cpu" or None: the parent's torch force) and `md_strict`; the
+    rest as the parent (kernel, link_layout, strict, solver settings). The path of the last force
+    is `force_kernel_used` ("cuda", "cpu" or "torch").
+    """
+
+    def __init__(self, kappa, geometry, md_target=None, md_strict=False, **kwargs):
+        self._force_choice = _KernelChoice(md_target, md_strict, "fermion force")
+        super().__init__(kappa, geometry, **kwargs)
+
+    @property
+    def force_kernel_used(self):
+        return self._force_choice.last_used
+
+    @property
+    def fuses_kicks(self):
+        """True when the force kernel is requested: `FusedHMC` then kicks through `force_kick`."""
+        return self._force_choice.target is not None
+
+    def _force_fields(self, op, X):
+        W = op.hop(X, 1)
+        if getattr(op, "compiled", False):
+            Y = op._hop_kernel(W, 0, scale=op._scale_neg_k2, add=X)
+        else:
+            Y = op.hop(W, 0).mul_(-op._k2).add_(X)
+        Z = op.hop(Y, 1, dagger=True)
+        return Y, Z, X, W
+
+    def _force_backend(self, op):
+        return self._force_choice.backend(op.device, self.geometry, op.dtype)
+
+    def force_from_solution(self, op, X):
+        """The force of `FastTwoFlavourWilson.force_from_solution` (kernel when it runs here)."""
+        backend = self._force_backend(op)
+        if backend is None:
+            self._force_choice.last_used = "torch"
+            return FusedTwoFlavourWilson.force_from_solution(op, X)
+        self._force_choice.last_used = backend.target
+        return fermion_force(op, *self._force_fields(op, X), 2.0 * op.kappa ** 2, backend=backend)
+
+    def force_kick(self, U, P, coefficient):
+        """P - coefficient * force(U): one force solve, then the kernel with the kick fused."""
+        op = self.operator(U)
+        backend = self._force_backend(op)
+        if backend is None or tuple(P.shape) != tuple(U.shape) or P.dtype != op.dtype or P.device != op.device:
+            return P - coefficient * self.force(U)
+        self.stats["force_calls"] += 1
+        X = self._solve_as("force", op, self.solver_tol)
+        self._force_choice.last_used = backend.target
+        return fermion_force(op, *self._force_fields(op, X), 2.0 * op.kappa ** 2, mom=P, coef=coefficient,
+                             backend=backend)
+
+
 # ---- integrator ------------------------------------------------------------------------------------
 def _default_exp(method, N):
     """True if `algebra.expi(Q, method)` is the exponential of the update kernel for SU(N)."""
@@ -916,7 +1229,8 @@ class _FusedMDState(_MDState):
     """`hmc._MDState` with the momentum kicks and the position updates through the kernels.
 
     Same lazy kicks and the same sequence of updates as the parent (level 0 first at a flush). A
-    level whose only term has `force_kick` (the fused gauge or fermion force) kicks in one pass;
+    level whose only term fuses its kicks (`fuses_kicks`: the gauge or fermion force kernel is
+    requested) kicks through the term's `force_kick` in one pass;
     other levels compute F with `level_force` and kick through the update kernel. At a move, the
     last pending level is kicked together with the move: in the force kernel when its term has
     `force_kick_move` (the gauge force: F, the kick and exp(i h P) U in one pass), else by the
@@ -933,8 +1247,11 @@ class _FusedMDState(_MDState):
                        "move_torch": 0}
 
     def _single_term(self, level):
+        """The only term of `level` when it fuses its kicks (`fuses_kicks`), else None."""
         terms = self.hamiltonian.levels[level][0]
-        return terms[0] if len(terms) == 1 and self.fuse_force_kicks else None
+        if len(terms) == 1 and self.fuse_force_kicks and getattr(terms[0], "fuses_kicks", False):
+            return terms[0]
+        return None
 
     def _kick(self, level, c):
         term = self._single_term(level)
@@ -1063,8 +1380,9 @@ class FusedMDHamiltonian(Hamiltonian):
 
     Levels as there: the fermion term outside, the gauge term inside with `n_gauge_substeps`.
     `md_kernels`: components of MD_COMPONENTS (`parse_md_kernels`) run through the compiled target
-    `md_target` ("cuda" or "cpu"; None: none of them) with `md_strict`; "gauge_force" makes the
-    gauge term a `FusedWilsonGaugeAction`. The "update" component is the integrator's
+    `md_target` ("cuda" or "cpu"; None: none of them) with `md_strict`: "gauge_force" for the gauge
+    term (`FusedWilsonGaugeAction`), "fermion_force" for the fermion term
+    (`FusedForceTwoFlavourWilson`; with the component off it is `FusedTwoFlavourWilson`'s force). The "update" component is the integrator's
     (`FusedHMC(target=...)`, `md_hmc_target(ham)`). Other keyword arguments go to
     `FusedTwoFlavourWilson` (kernel, link_layout, strict, solver settings, ...).
     """
@@ -1078,7 +1396,8 @@ class FusedMDHamiltonian(Hamiltonian):
         def target(component):
             return md_target if component in self.md_kernels else None
 
-        self.fermion = FusedTwoFlavourWilson(kappa, geometry, **fermion_kwargs)
+        self.fermion = FusedForceTwoFlavourWilson(kappa, geometry, md_target=target("fermion_force"),
+                                                  md_strict=md_strict, **fermion_kwargs)
         self.gauge = FusedWilsonGaugeAction(beta, geometry, plaquette_weights, target=target("gauge_force"),
                                             strict=md_strict)
         super().__init__([([self.fermion], 1), ([self.gauge], n_gauge_substeps)])

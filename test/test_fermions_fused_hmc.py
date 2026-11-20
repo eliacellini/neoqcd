@@ -27,7 +27,7 @@ from neoqcd.fermions import fused as F  # noqa: E402
 from neoqcd.fermions import fused_hmc as M  # noqa: E402
 from neoqcd.fermions._gauge import SUN_haar, SUN_mul  # noqa: E402
 from neoqcd.fermions.algebra import algebra_basis, expi, random_algebra, unitarize  # noqa: E402
-from neoqcd.fermions.fused import FusedTwoFlavourHamiltonian  # noqa: E402
+from neoqcd.fermions.fast import FastTwoFlavourWilson, HalfLatticeWilson, to_half  # noqa: E402
 from neoqcd.fermions.hmc import (  # noqa: E402
     HMC,
     Hamiltonian,
@@ -279,14 +279,15 @@ def _gauge_hmc(geo, target, beta=5.6, weights=None, tau=0.5, n_steps=5, integrat
                       target=target, strict=target is not None, **kw)
 
 
-def _fermion_hmc(geo, target, kappa=0.13, n_gauge=3, tau=0.5, n_steps=4, weights=None, **kw):
-    ham = FusedTwoFlavourHamiltonian(5.6, kappa, geo, n_gauge_substeps=n_gauge, plaquette_weights=weights,
-                                     kernel="cpu" if md_reason("cpu") is None else "loop",
-                                     solver_tol=1e-12, action_tol=1e-13, **kw)
-    gauge = M.FusedWilsonGaugeAction(5.6, geo, weights, target=target, strict=target is not None)
-    ham.gauge = gauge
-    ham.levels[1] = ([gauge], n_gauge)
-    return M.FusedHMC(geo, ham, tau=tau, n_steps=n_steps, target=target, strict=target is not None)
+def _fermion_hmc(geo, target, kappa=0.13, n_gauge=3, tau=0.5, n_steps=4, weights=None, md_kernels="all", **kw):
+    """Fused-hop Hamiltonian (host build of the hop, or "loop") with the MD kernels of `md_kernels` on
+    `target` (None: all off, the torch molecular dynamics)."""
+    ham = M.FusedMDHamiltonian(5.6, kappa, geo, n_gauge_substeps=n_gauge, plaquette_weights=weights,
+                               md_kernels=md_kernels if target is not None else "none", md_target=target,
+                               md_strict=target is not None,
+                               kernel="cpu" if md_reason("cpu") is None else "loop",
+                               solver_tol=1e-12, action_tol=1e-13, **kw)
+    return M.FusedHMC(geo, ham, tau=tau, n_steps=n_steps, target=ham.md_hmc_target(), strict=target is not None)
 
 
 class _IntegratorTest(_Target):
@@ -305,7 +306,7 @@ class _IntegratorTest(_Target):
                 accs.append(acc)
             out[target] = (U, torch.stack(dHs), torch.stack(accs), hmc)
         (U0, dH0, acc0, h0), (U1, dH1, acc1, h1) = out[None], out[self.target]
-        self.assertEqual(h1.kernel_used, self.target)
+        self.assertEqual(h1.kernel_used, self.target if h1._choice.target is not None else "torch")
         self.assertEqual(h0.kernel_used, "torch")
         self.assertLess((dH1 - dH0).abs().max().item(), 1e-9)
         self.assertTrue(torch.equal(acc1, acc0))
@@ -334,6 +335,20 @@ class _IntegratorTest(_Target):
                 counts = hmc.last_counts
                 self.assertGreater(counts["move_fused"], 0)
                 self.assertEqual(counts["kick_torch"] + counts["move_torch"], 0)
+
+    def test_each_component_alone(self):
+        """Every MD component alone (and none) gives the torch trajectory to rounding."""
+        for comp in M.MD_COMPONENTS:
+            with self.subTest(component=comp):
+                hmc = self._compare(lambda t: _fermion_hmc(G46, t, md_kernels=comp), G46, B=2, n_traj=1)
+                ham = hmc.hamiltonian
+                used = {"gauge_force": ham.gauge.kernel_used, "fermion_force": ham.fermion.force_kernel_used,
+                        "update": hmc.kernel_used}
+                for name, path in used.items():
+                    self.assertEqual(path, self.target if name == comp else "torch", name)
+                if comp == "update":  # forces from torch, kicks and moves through the update kernel
+                    self.assertEqual(hmc.last_counts["kick_fused"] + hmc.last_counts["move_fused"], 0)
+                    self.assertGreater(hmc.last_counts["move_kernel"], 0)
 
     def test_unfused_force_kicks_use_the_update_kernel(self):
         hmc = self._compare(lambda t: _gauge_hmc(G46, t, fuse_force_kicks=False), G46)
@@ -372,6 +387,85 @@ class _IntegratorTest(_Target):
             self.assertLess(r, 0.32)
 
 
+def half_fields(geo, B, seed):
+    g = torch.Generator().manual_seed(seed)
+    return [to_half(torch.randn(geo.wilson_shape(B), dtype=C, generator=g), geo, p) for p in (0, 1, 0, 1)]
+
+
+def torch_fermion_force(op, fields, scale):
+    G = op.hopping_derivative(*fields)
+    return scale.view((-1,) + (1,) * (G.dim() - 1)).to(G.dtype) * G
+
+
+class _FermionForceEquality(_Target):
+    def test_force_equals_hopping_derivative(self):
+        """fermion_force = 2 kappa^2 HalfLatticeWilson.hopping_derivative (and the kick) to 1e-14:
+        SU(2), SU(3), 2D, 4D, unequal extents, both time signs, per-sample kappa, batch 3."""
+        k = torch.tensor([0.11, 0.12, 0.13], dtype=torch.float64)
+        for geo in GEOMETRIES:
+            U = self.dev(links(geo, 3, 50))
+            fields = [self.dev(f) for f in half_fields(geo, 3, 51)]
+            for ts in (-1.0, 1.0):
+                with self.subTest(geo=geo, time_sign=ts):
+                    op = HalfLatticeWilson(U, k, geo, time_sign=ts)
+                    sc = 2.0 * op.kappa ** 2
+                    want = torch_fermion_force(op, fields, sc)
+                    self.assertLess(rel(M.fermion_force(op, *fields, sc), want), 1e-14)
+                    P = self.dev(momenta(geo, 3, 52))
+                    got = M.fermion_force(op, *fields, sc, mom=P, coef=0.3)
+                    self.assertLess((got - (P - 0.3 * want)).abs().max().item(), 1e-14)
+
+    def test_shared_links_views_and_autograd(self):
+        geo = G46
+        U = self.dev(links(geo, 1, 53))
+        op = HalfLatticeWilson(U, 0.12, geo)
+        fields = [self.dev(f) for f in half_fields(geo, 3, 54)]
+        sc = 2.0 * op.kappa ** 2
+        want = torch_fermion_force(op, fields, sc)
+        self.assertEqual(want.shape[0], 3)
+        self.assertLess(rel(M.fermion_force(op, *fields, sc), want), 1e-14)
+        views = [fields[0].conj().resolve_conj().conj(), torch._neg_view(-fields[1]),
+                 fields[2].transpose(-1, -2).contiguous().transpose(-1, -2), fields[3]]
+        self.assertLess(rel(M.fermion_force(op, *views, sc), want), 1e-14)
+        with self.assertRaisesRegex(RuntimeError, "not differentiable"):
+            M.fermion_force(op, fields[0].clone().requires_grad_(), *fields[1:], sc)
+        with self.assertRaises(ValueError):
+            M.fermion_force(op.to(C64), *[f.to(C64) for f in fields], sc)
+
+    def test_term_force_and_kick_equal_the_fast_term(self):
+        """FusedForceTwoFlavourWilson: action and force equal FastTwoFlavourWilson (same draws), the
+        force kick equals P - c F, one force solve each, double and mixed precision."""
+        geo = G46
+        k = torch.tensor([0.12, 0.13], dtype=torch.float64)
+        U = self.dev(links(geo, 2, 55))
+        hop = "cpu" if self.target == "cpu" else "cuda"
+        for precision in ("double", "mixed"):
+            with self.subTest(precision=precision):
+                gen = torch.Generator(device=self.device)
+                fast = FastTwoFlavourWilson(k, geo, solver_tol=1e-12, action_tol=1e-13, precision=precision)
+                fast.refresh(U, gen.manual_seed(56))
+                F_ref = fast.force(U)
+                term = M.FusedForceTwoFlavourWilson(k, geo, md_target=self.target, md_strict=True, kernel=hop,
+                                                    strict=True, solver_tol=1e-12, action_tol=1e-13,
+                                                    precision=precision)
+                term.refresh(U, gen.manual_seed(56))
+                self.assertLess(rel(term.force(U), F_ref), 1e-9)
+                self.assertEqual(term.force_kernel_used, self.target)
+                P = self.dev(momenta(geo, 2, 57))
+                solves = term.stats["solves"]
+                kicked = term.force_kick(U, P, 0.25)
+                self.assertEqual(term.stats["solves"], solves + 1)
+                self.assertLess((kicked - (P - 0.25 * F_ref)).abs().max().item(), 1e-9 * F_ref.abs().max().item())
+
+
+class CpuFermionForceTest(_FermionForceEquality, unittest.TestCase):
+    target, device = "cpu", "cpu"
+
+
+class CudaFermionForceTest(_FermionForceEquality, unittest.TestCase):
+    target, device = "cuda", "cuda"
+
+
 class CpuUpdateTest(_UpdateEquality, unittest.TestCase):
     target, device = "cpu", "cpu"
 
@@ -385,12 +479,16 @@ class CpuIntegratorTest(_IntegratorTest, unittest.TestCase):
 
 
 class CudaIntegratorTest(_IntegratorTest, unittest.TestCase):
-    """CUDA twin (fermion parts on the fused hop "cpu" kernel are skipped: the links are on the GPU)."""
+    """CUDA twin (the fermion trajectories use the host build of the hop: skipped on the GPU, where
+    main_hmc runs them with --kernel cuda)."""
 
     target, device = "cuda", "cuda"
 
     def test_fermion_trajectories(self):
-        self.skipTest("the fermion trajectory test uses the host build of the hop (test_fermions_fused_hmc main_hmc)")
+        self.skipTest("the fermion trajectory test uses the host build of the hop")
+
+    def test_each_component_alone(self):
+        self.skipTest("the fermion trajectory test uses the host build of the hop")
 
     def test_reversibility(self):
         self.skipTest("covered on the CPU emulation; the CUDA build is checked by the equality tests")
