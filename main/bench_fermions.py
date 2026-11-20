@@ -66,6 +66,26 @@ and a device synchronisation around each timed block:
     gauge_force        WilsonGaugeAction.force
     expi_update        U <- SUN_mul(expi(h P), U) (one link update of the integrator)
     staggered_mee      StaggeredEvenOdd.apply (M_ee = m^2 - K_eo K_oe)
+    trajectory         (--trajectory-configs lattice:batch ..., after the grid; --trajectory-only skips
+                       the grid) one N_f = 2 Wilson HMC trajectory (beta, kappa of the arguments,
+                       --trajectory-tau / -steps / -gauge-substeps, omelyan, solver tolerance
+                       --solve-tol) with the fused hop (compiled: cuda on CUDA, the host build on the
+                       CPU; soa links) and, for each --trajectory-md setting (none, all, or one
+                       component of neoqcd.fermions.fused_hmc.MD_COMPONENTS), the MD kernels on or
+                       off. Start: a rough configuration (the identity times three exp(i 0.25 P)),
+                       --trajectory-warmup untimed trajectories, then --trajectory-repeats timed
+                       ones, every setting from the same start and seed (the same trajectories up to
+                       rounding). Rows: variant md_<setting>, seconds per trajectory without
+                       instrumentation (notes: dH, CG iterations, solves, kernel paths, rel. dH
+                       difference to md_none); trajectory_part rows md_<setting>:<part>, the
+                       seconds per trajectory of each part from a second, instrumented pass
+                       (device synchronised around every call of a part, so the parts add up to the
+                       instrumented total; exclusive times: a solve inside a force counts as
+                       solve): solve (CG: hops + linear algebra), fermion_force (after the solve),
+                       gauge_force (with the fused kick and move when they run in its kernel),
+                       update (kicks and moves outside the force kernels), energy (Metropolis
+                       action differences outside the solves), refresh, other (momenta, unitarize,
+                       plaquette, Python).
 
 Columns: seconds per call (median over trials, and minimum), seconds per call per site per batch
 entry, and site-updates per second = V * B / seconds (V = full-lattice volume for every kernel,
@@ -121,6 +141,8 @@ from neoqcd.fermions.fast import (  # noqa: E402
     to_half,
 )
 from neoqcd.fermions.fused import BackendUnavailable, FusedHalfLatticeWilson  # noqa: E402
+from neoqcd.fermions import fused_hmc  # noqa: E402
+from neoqcd.fermions import hmc as hmc_mod  # noqa: E402
 
 COLOUR_MODES = ("matmul", "broadcast", "broadcast_sum")
 from neoqcd.fermions.hmc import WilsonGaugeAction  # noqa: E402
@@ -797,6 +819,99 @@ class Bench:
             else:
                 self.emit(ctx, "solve", f"mixed_precision_fused_{label}", status="not_converged", notes=note)
 
+    # ---- trajectory breakdown ----
+    def trajectory(self, geo, batch):
+        """Rows of one --trajectory-configs entry (module docstring, "trajectory")."""
+        args, device = self.args, self.device
+        ctx = (geo, batch, "complex128")
+        target = "cuda" if device.type == "cuda" else "cpu"
+        g = torch.Generator().manual_seed(args.seed)
+        U0 = rough_links(geo, batch, g, device)
+        reference = None
+        for setting in args.trajectory_md:
+            variant = f"md_{setting}"
+            try:
+                md = fused_hmc.parse_md_kernels(setting)
+                ham = fused_hmc.FusedMDHamiltonian(
+                    args.beta, args.kappa, geo, n_gauge_substeps=args.trajectory_gauge_substeps, md_kernels=md,
+                    md_target=target if md else None, md_strict=True, kernel=target, strict=True,
+                    solver_tol=args.solve_tol, max_iter=args.solve_max_iter, check_every=args.check_every,
+                    on_unconverged="warn")
+                hmc = fused_hmc.FusedHMC(geo, ham, tau=args.trajectory_tau, n_steps=args.trajectory_steps,
+                                         target=ham.md_hmc_target(), strict=True)
+            except (BackendUnavailable, ValueError) as exc:
+                self.emit(ctx, "trajectory", variant, status="skipped", notes=_short(exc, 400))
+                continue
+            try:
+                row = self._trajectory_rows(ctx, variant, ham, hmc, U0, reference)
+            except RuntimeError as exc:
+                status = "oom" if "out of memory" in str(exc).lower() else "error"
+                self.emit(ctx, "trajectory", variant, status=status, notes=_short(exc, 400))
+                self._free()
+                continue
+            if setting == "none":
+                reference = row
+            del ham, hmc
+            self._free()
+
+    def _run_trajectories(self, hmc, U0, n, timer=None):
+        """`n` trajectories from U0 after the warm-up ones, same seed every time: (seconds per
+        timed trajectory, dH of the last, CG iterations and solves per timed trajectory)."""
+        args, device = self.args, self.device
+        gen = torch.Generator(device=device).manual_seed(args.seed + 1)
+        U = U0.clone()
+        for _ in range(args.trajectory_warmup):
+            U, _, _, _ = hmc.trajectory(U, gen)
+        fermion = hmc.hamiltonian.fermion
+        it0, s0 = fermion.stats["cg_iterations"], fermion.stats["solves"]
+        if timer is not None:
+            timer.reset()
+        synchronize(device)
+        t0 = time.perf_counter()
+        dH = None
+        for _ in range(n):
+            U, _, dH, _ = hmc.trajectory(U, gen)
+        synchronize(device)
+        total = (time.perf_counter() - t0) / n
+        return total, dH, (fermion.stats["cg_iterations"] - it0) / n, (fermion.stats["solves"] - s0) / n
+
+    def _trajectory_rows(self, ctx, variant, ham, hmc, U0, reference):
+        args = self.args
+        n = max(1, args.trajectory_repeats)
+        total, dH, cg_it, solves = self._run_trajectories(hmc, U0, n)
+        paths = (f"gauge={ham.gauge.kernel_used}; fermion_force={ham.fermion.force_kernel_used}; "
+                 f"cg={ham.fermion.cg_kernel_used}; update={hmc.kernel_used}")
+        note = (f"tau={args.trajectory_tau:g}; steps={args.trajectory_steps}x{args.trajectory_gauge_substeps}; "
+                f"cg_iter/traj={cg_it:.0f}; solves/traj={solves:.0f}; dH={dH.mean().item():+.3e}; {paths}")
+        if reference is not None:
+            note += f"; max|dH - dH(md_none)|={(dH - reference['dH']).abs().max().item():.1e}"
+        self.emit(ctx, "trajectory", variant, t=total, t_min=total, repeats=n, iterations=int(round(cg_it)),
+                  notes=note)
+        timer = PartTimer(self.device)
+        fermion, gauge = ham.fermion, ham.gauge
+        try:
+            timer.wrap(fermion, "_solve", "solve")
+            for name in ("force", "force_kick"):
+                timer.wrap(fermion, name, "fermion_force")
+            for name in ("force", "force_kick", "force_kick_move"):
+                timer.wrap(gauge, name, "gauge_force")
+            timer.wrap(fermion, "refresh", "refresh")
+            timer.wrap(ham, "energy_difference", "energy")
+            for cls in (hmc_mod._MDState, fused_hmc._FusedMDState):
+                for name in ("move", "flush", "_kick"):
+                    timer.wrap(cls, name, "update")
+            timed_total, _, _, _ = self._run_trajectories(hmc, U0, n, timer)
+        finally:
+            timer.restore()
+        parts = {k: v / n for k, v in timer.seconds.items()}
+        parts["other"] = max(0.0, timed_total - sum(v for k, v in parts.items() if k != "other"))
+        for part in TRAJECTORY_PARTS:
+            calls = timer.calls[part] / n
+            self.emit(ctx, "trajectory_part", f"{variant}:{part}", t=parts[part], t_min=parts[part], repeats=n,
+                      notes=f"calls/traj={calls:g}; share={parts[part] / timed_total:.3f}; "
+                            f"instrumented total {timed_total:.4f} s")
+        return {"total": total, "dH": dH}
+
     def _compiled(self, ctx, key, measurement, fns, x, ref, tol):
         if not hasattr(torch, "compile"):
             self.meta_compile[key] = "torch.compile not available"
@@ -906,6 +1021,77 @@ class Bench:
         return n
 
 
+# ---- trajectory breakdown -----------------------------------------------------------------------------
+TRAJECTORY_PARTS = ("solve", "fermion_force", "gauge_force", "update", "energy", "refresh", "other")
+
+
+class PartTimer:
+    """Exclusive wall time per part of a trajectory: wrapped calls synchronise the device before and
+    after, and a call's time minus the time of the wrapped calls nested in it goes to its part."""
+
+    def __init__(self, device):
+        self.device = device
+        self.seconds = {k: 0.0 for k in TRAJECTORY_PARTS}
+        self.calls = {k: 0 for k in TRAJECTORY_PARTS}
+        self._stack = []
+        self._restore = []
+
+    def reset(self):
+        for k in TRAJECTORY_PARTS:
+            self.seconds[k] = 0.0
+            self.calls[k] = 0
+
+    def _wrapped(self, fn, part):
+        def timed(*a, **k):
+            synchronize(self.device)
+            t0 = time.perf_counter()
+            self._stack.append(0.0)
+            try:
+                return fn(*a, **k)
+            finally:
+                synchronize(self.device)
+                dt = time.perf_counter() - t0
+                nested = self._stack.pop()
+                self.seconds[part] += dt - nested
+                self.calls[part] += 1
+                if self._stack:
+                    self._stack[-1] += dt
+        return timed
+
+    def wrap(self, obj, name, part):
+        """Wrap obj.name (an instance attribute shadowing the method, or a class attribute: restored
+        by `restore`)."""
+        if not hasattr(obj, name):
+            return
+        if isinstance(obj, type):
+            original = obj.__dict__.get(name)
+            if original is None:
+                return
+            setattr(obj, name, self._wrapped(original, part))
+            self._restore.append((obj, name, original))
+        else:
+            setattr(obj, name, self._wrapped(getattr(obj, name), part))
+            self._restore.append((obj, name, None))
+
+    def restore(self):
+        for obj, name, original in reversed(self._restore):
+            if original is None:
+                obj.__dict__.pop(name, None)
+            else:
+                setattr(obj, name, original)
+        self._restore = []
+
+
+def rough_links(geo, batch, generator, device):
+    """The identity times three exp(i 0.25 P), P Gaussian momenta: a start with CG counts closer to a
+    thermalised configuration than a cold or Haar one."""
+    U = torch.eye(geo.N, dtype=torch.complex128).expand(geo.link_shape(batch)).clone()
+    for _ in range(3):
+        P = random_algebra(U.shape, generator=generator, dtype=torch.complex128)
+        U = SUN_mul(expi(0.25 * P), U)
+    return U.to(device)
+
+
 def _short(exc, n=160):
     s = f"{type(exc).__name__}: {exc}".replace("\n", " ").replace(",", ";")
     return s[:n]
@@ -969,6 +1155,17 @@ def build_parser():
     p.add_argument("--no-profile", action="store_true", help="skip torch.profiler kernel counts")
     p.add_argument("--time-budget", type=float, default=None,
                    help="seconds; configurations not started within it are skipped")
+    p.add_argument("--trajectory-configs", nargs="*", default=[],
+                   help="lattice:batch pairs of the per-component HMC trajectory breakdown (module docstring)")
+    p.add_argument("--trajectory-md", nargs="+", default=["none", "all"],
+                   help="--md-kernels settings of the trajectory rows: none, all or one component of "
+                        f"{', '.join(fused_hmc.MD_COMPONENTS)}")
+    p.add_argument("--trajectory-only", action="store_true", help="skip the kernel grid, run the trajectory rows")
+    p.add_argument("--trajectory-tau", type=float, default=1.0)
+    p.add_argument("--trajectory-steps", type=int, default=10)
+    p.add_argument("--trajectory-gauge-substeps", type=int, default=4)
+    p.add_argument("--trajectory-warmup", type=int, default=1)
+    p.add_argument("--trajectory-repeats", type=int, default=2)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--out", default="output/bench_fermions")
     p.add_argument("--quiet", action="store_true")
@@ -1030,7 +1227,7 @@ def main(argv=None):
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
         bench = Bench(args, device, writer, handle)
-        for dtype_name in dtypes:
+        for dtype_name in ([] if args.trajectory_only else dtypes):
             for lat in args.lattices:
                 geo = parse_lattice(lat, args.N)
                 for batch in args.batches:
@@ -1055,6 +1252,16 @@ def main(argv=None):
                         skipped.append(f"{label} ({_short(exc)})")
                         print(f"--- {label} failed: {_short(exc)}", flush=True)
                         bench._free()
+        for spec in args.trajectory_configs:
+            lat, batch = parse_config(spec)
+            geo = parse_lattice(lat, args.N)
+            print(f"--- trajectory {spec} (V = {geo.volume}) {time.perf_counter() - start:.0f} s", flush=True)
+            try:
+                bench.trajectory(geo, batch)
+            except RuntimeError as exc:
+                skipped.append(f"trajectory {spec} ({_short(exc)})")
+                print(f"--- trajectory {spec} failed: {_short(exc)}", flush=True)
+                bench._free()
     print_table(bench.rows)
     meta.update({
         "skipped": skipped,

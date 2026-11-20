@@ -175,5 +175,69 @@ class MDKernelsDriverTest(unittest.TestCase):
                                 "--resume"])
 
 
+class CudaDriverTest(unittest.TestCase):
+    """CUDA twin (skipped without a CUDA device and nvcc): main_hmc on the GPU with --kernel cuda and
+    --md-kernels all reproduces the --kernel cuda chain (4D 4^4, batch 4): dH to 1e-9, the same
+    accept decisions and CG counts; each component alone too."""
+
+    @classmethod
+    def setUpClass(cls):
+        import torch
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("no CUDA device")
+        for ok, why in (F.backend_status("cuda"), M.md_backend_status("cuda")):
+            if not ok:
+                raise unittest.SkipTest(f"cuda kernels unavailable: {why}")
+
+    def test_cuda_md_kernels_reproduce_the_fused_hop_run(self):
+        base = [a for a in COMMON if a != "cpu"]
+        base[base.index("--device") + 1:base.index("--device") + 1] = ["cuda"]
+        base += ["--D", "4", "--T", "4", "--L", "4", "--beta", "5.6", "--batch", "4", "--kappa", "0.13",
+                 "--kernel", "cuda", "--n-traj", "3"]
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "ref"
+            MAIN.main(base + ["--out", str(ref)])
+            for md in ["all"] + list(M.MD_COMPONENTS):
+                with self.subTest(md=md):
+                    out = Path(tmp) / md
+                    MAIN.main(base + ["--md-kernels", md, "--out", str(out)])
+                    for x, y in zip(_rows(ref), _rows(out)):
+                        self.assertLess(abs(float(x["dH"]) - float(y["dH"])), 1e-9)
+                        for col in ("accepted", "solves", "cg_iter"):
+                            self.assertEqual(x[col], y[col], col)
+                    info = json.loads((out / "run_meta.json").read_text())["run"]["md_kernels"]
+                    self.assertEqual(info["target"], "cuda")
+
+
+class BenchTrajectoryTest(unittest.TestCase):
+    def test_trajectory_rows(self):
+        """main/bench_fermions.py --trajectory-only: one md_<setting> row per setting and its parts;
+        with the kernels on, the dH of md_none to rounding (notes)."""
+        reason = _cpu_reason()
+        if reason is not None:
+            self.skipTest(f"host build unavailable: {reason}")
+        spec = importlib.util.spec_from_file_location("bench_fermions_md", ROOT / "main" / "bench_fermions.py")
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            bench.main(["--device", "cpu", "--trajectory-only", "--trajectory-configs", "2^3x4:2",
+                        "--trajectory-md", "none", "all", "gauge_force", "--trajectory-steps", "2",
+                        "--trajectory-gauge-substeps", "2", "--trajectory-repeats", "1", "--trajectory-warmup", "0",
+                        "--quiet", "--out", tmp])
+            with open(Path(tmp) / "bench.csv", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertTrue(all(r["status"] == "ok" for r in rows), rows)
+        totals = {r["variant"]: r for r in rows if r["measurement"] == "trajectory"}
+        self.assertEqual(sorted(totals), ["md_all", "md_gauge_force", "md_none"])
+        parts = [r for r in rows if r["measurement"] == "trajectory_part"]
+        self.assertEqual(len(parts), 3 * len(bench.TRAJECTORY_PARTS))
+        self.assertIn("update=cpu", totals["md_all"]["notes"])
+        self.assertIn("update=torch", totals["md_gauge_force"]["notes"])
+        diff = float(totals["md_all"]["notes"].split("max|dH - dH(md_none)|=")[1])
+        self.assertLess(diff, 1e-9)
+        for r in parts:
+            self.assertGreaterEqual(float(r["seconds_per_call"]), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
