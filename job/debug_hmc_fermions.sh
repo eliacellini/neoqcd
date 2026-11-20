@@ -31,12 +31,20 @@
 #        start, 20 thermalisation + 60 trajectories, checkpoint every 10 (n-steps 16: a first
 #        guess for the 16x larger volume; adjust after the first acceptance numbers). It needs
 #        more than one 30-minute debug slot: resubmit to extend (--resume is automatic).
+# DD-HMC (Luescher hep-lat/0409106, --dd-blocks; optional, not in the default POINTS):
+#   dd8  the physics of w8f (8^4 SU(3), beta = 5.6, kappa = 0.153, batch 16) with 4^4 blocks
+#        (active-link fraction 0.094), the paper's translations (--dd-translation luscher), tau 0.5,
+#        Schur 4 x block 2 x gauge 4 steps, cold start, 100 thermalisation + 100 trajectories,
+#        reference operators (directory suffix _dd). A pilot: compare the plaquette with w8f /
+#        openQCD 0.5661(5) (the small active fraction makes the autocorrelation long) and read the
+#        acceptance and the Schur/block cost split in run_meta.json ("run"."dd").
 # Outputs in output/hmc_fermions/<name>/ (observables.csv, run_meta.json, checkpoint.*).
 # A point whose checkpoint exists is resumed (--resume), so resubmitting extends a run that hit
 # the wall time; to restart from scratch remove its directory first.
 # Usage: sbatch job/debug_hmc_fermions.sh            (both points)
 #        POINTS="w8" sbatch job/debug_hmc_fermions.sh [extra flags for main/main_hmc.py]
 #        POINTS="w4f w8f" sbatch job/debug_hmc_fermions.sh      (fused kernel validation)
+#        POINTS="dd8" sbatch job/debug_hmc_fermions.sh           (DD-HMC pilot)
 
 set -euo pipefail
 
@@ -54,7 +62,7 @@ POINTS="${POINTS:-w4 w8}"
 SEED="${SEED:-1234}"
 
 run_point() {
-  # run_point <name> <suffix: fast|fused> <main_hmc.py arguments...>
+  # run_point <name> <suffix: fast|fused|dd> <main_hmc.py arguments...>
   local name="$1" suffix="$2"; shift 2
   local out="output/hmc_fermions/${name}_${suffix}"
   local resume=()
@@ -91,6 +99,11 @@ for point in $POINTS; do
           --tau 1.0 --n-steps 16 --n-gauge-substeps 4 --integrator omelyan --start cold \
           --therm 20 --n-traj 60 --meas-every 1 --checkpoint-every 10 \
           --fast --kernel cuda --precision double "${@}" ;;
+    dd8) run_point "wilson_8x8_b5.6_k0.153" dd \
+          --D 4 --T 8 --L 8 --N 3 --fermions wilson --beta 5.6 --kappa 0.153 --batch 16 \
+          --tau 0.5 --n-steps 4 --n-block-substeps 2 --n-gauge-substeps 4 --integrator omelyan --start cold \
+          --dd-blocks 4,4,4,4 --dd-translation luscher \
+          --therm 100 --n-traj 100 --meas-every 10 --checkpoint-every 25 "${@}" ;;
     *) echo "unknown point $point" >&2; exit 2 ;;
   esac
 done

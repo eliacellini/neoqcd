@@ -57,6 +57,24 @@ fermion terms; solve_s and max_residual cover the light and heavy MD/action solv
 heavy solve inside the ratio refresh (guarded by the term itself). kappa_heavy and the layout
 are recorded in run_meta.json and are part of the resume key.
 
+DD-HMC (Wilson): --dd-blocks b0,b1,... (block extents, one per direction or one for all; even,
+>= 4, each lattice extent an even multiple of its block extent) runs Luescher's domain-decomposed
+HMC (hep-lat/0409106, neoqcd.fermions.ddhmc): DDHMCHamiltonian with three integrator levels, the
+Schur-complement term (global solves) outermost with --n-steps steps, the block term with
+--n-block-substeps steps per Schur position update, the masked gauge force with
+--n-gauge-substeps steps per block position update (--integrator: one scheme or three); only the
+active links move, and every trajectory is preceded by a translation of the gauge field
+(DDHMC.cycle; --dd-translation random (default) | luscher (appendix C) | odometer | none, the
+last not ergodic, with a WARNING line). Without --dd-blocks the run is plain HMC, bitwise as
+before. Refused with staggered or no fermions and with --kappa-heavy. The CSV columns are those of
+plain HMC (cost columns: Schur + block solves; block solves are global CGs on the block operator,
+one operator application per iteration like a full solve); run_meta.json "run"."dd" records the
+blocks, the active-link fraction (measured and the formula of the paper), the translation and its
+period, the levels and the Schur/block split of the solves and iterations of this process. The
+block extents and the translation are part of the resume key (older checkpoints count as plain
+HMC); the checkpoint stores the state of the "luscher"/"odometer" sequence (extra.dd_state), so a
+resumed run is bitwise the uninterrupted one.
+
 Convergence (Wilson, and staggered with --fast): every solve is checked on its true relative residual
 (neoqcd.fermions.pseudofermion, convergence policy); --on-unconverged raise (default) | warn |
 ignore. `max_residual` is the largest true relative residual of the solves of the trajectory
@@ -106,6 +124,7 @@ from neoqcd.fermions.io import (  # noqa: E402
 from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_product  # noqa: E402
 from neoqcd.fermions.fast_terms import FastHasenbuschHamiltonian, FastStaggeredHamiltonian  # noqa: E402
 from neoqcd.fermions import fused as fused_mod  # noqa: E402
+from neoqcd.fermions.ddhmc import DDHMC, BlockDecomposition, DDHMCHamiltonian  # noqa: E402
 from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian  # noqa: E402
@@ -169,6 +188,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="With --kappa-heavy: steps of the ratio level per HMC outer step (default 1).")
     p.add_argument("--n-heavy-substeps", type=int, default=None,
                    help="With --kappa-heavy --hasenbusch-layout nested: heavy steps per ratio position update (default 1).")
+    p.add_argument("--dd-blocks", type=str, default=None,
+                   help="Wilson: domain-decomposed HMC (Luescher hep-lat/0409106) with these block extents "
+                        "b0,b1,... (one per direction, or one value for all); absent = plain HMC.")
+    p.add_argument("--dd-translation", choices=("random", "luscher", "odometer", "none"), default=None,
+                   help="With --dd-blocks: translation of the gauge field before every trajectory (default random; "
+                        "luscher = appendix C of the paper; none is not ergodic).")
+    p.add_argument("--n-block-substeps", type=int, default=None,
+                   help="With --dd-blocks: block-force steps per Schur-force position update (default 1).")
     p.add_argument("--precision", choices=("double", "mixed"), default="double",
                    help="With --fast: 'mixed' uses complex64 inner CG with complex128 residuals.")
     p.add_argument("--colour-product", choices=("auto", "matmul", "broadcast", "broadcast_sum"), default=None,
@@ -281,8 +308,11 @@ def validate_args(args):
         raise SystemExit("--max-outer must be >= 1 and --inner-tol > 0")
     if args.resume and args.overwrite:
         raise SystemExit("--resume and --overwrite exclude each other")
+    validate_dd(args)
     levels = 1 if args.fermions == "none" else 2
     if args.kappa_heavy is not None and args.hasenbusch_layout == "nested":
+        levels = 3
+    if args.dd_blocks is not None:
         levels = 3
     integrator = [s.strip().lower() for s in args.integrator.split(",")]
     if len(integrator) == 1:
@@ -292,6 +322,97 @@ def validate_args(args):
     args.integrator_levels = integrator
 
 
+def parse_dd_blocks(text, D):
+    """'4,4,4,4' or '4' -> a tuple of D ints (SystemExit on anything else)."""
+    try:
+        blocks = tuple(int(x) for x in str(text).split(","))
+    except ValueError:
+        raise SystemExit(f"--dd-blocks: integers separated by commas, got {text!r}")
+    if len(blocks) == 1:
+        blocks = blocks * D
+    if len(blocks) != D:
+        raise SystemExit(f"--dd-blocks: one extent per direction ({D}) or one for all, got {text!r}")
+    return blocks
+
+
+def validate_dd(args):
+    """--dd-blocks and its options (module doc, DD-HMC). Sets args.dd_blocks to a tuple, the
+    translation and the block substeps to their defaults."""
+    if args.dd_blocks is None:
+        for name in ("dd_translation", "n_block_substeps"):
+            if getattr(args, name) is not None:
+                raise SystemExit(f"--{name.replace('_', '-')} needs --dd-blocks")
+        return
+    if args.fermions != "wilson":
+        raise SystemExit("--dd-blocks is for --fermions wilson (DD-HMC is N_f = 2 Wilson only)")
+    if args.kappa_heavy is not None:
+        raise SystemExit("--dd-blocks does not combine with Hasenbusch (--kappa-heavy)")
+    if args.fast:
+        raise SystemExit("--dd-blocks does not support --fast yet")
+    blocks = parse_dd_blocks(args.dd_blocks, args.D)
+    lattice = (args.T,) + (args.L,) * (args.D - 1)
+    for mu, (n, b) in enumerate(zip(lattice, blocks)):
+        if b < 4 or b % 2:
+            raise SystemExit(f"--dd-blocks: block extents must be even and >= 4 (a block extent 2 leaves no "
+                             f"active link), got {b} in direction {mu}")
+        if n % b or (n // b) % 2:
+            raise SystemExit(f"--dd-blocks: the extent {n} in direction {mu} must be an even multiple of the "
+                             f"block extent {b} (chessboard of blocks)")
+    args.dd_blocks = blocks
+    args.dd_translation = "random" if args.dd_translation is None else args.dd_translation
+    args.n_block_substeps = 1 if args.n_block_substeps is None else args.n_block_substeps
+    if args.n_block_substeps < 1:
+        raise SystemExit("--n-block-substeps must be >= 1")
+
+
+def dd_key(args):
+    """Resume-key entry of DD-HMC: None for plain HMC, else the block extents and the translation."""
+    if args.dd_blocks is None:
+        return None
+    return {"blocks": [int(b) for b in args.dd_blocks], "translation": args.dd_translation}
+
+
+def dd_translation(args):
+    """The `DDHMC(translation=...)` value of --dd-translation ("none" -> None)."""
+    return None if args.dd_translation == "none" else args.dd_translation
+
+
+def dd_state(hmc):
+    """Checkpoint entry of the "luscher"/"odometer" translation sequence (`DDHMC._k`, `_offset`)."""
+    offset = getattr(hmc, "_offset", None)
+    return {"k": int(hmc._k), "offset": None if offset is None else offset.cpu().tolist()}
+
+
+def restore_dd_state(hmc, state, device):
+    """Put the translation sequence of a checkpoint back into `hmc` (`dd_state`)."""
+    hmc._k = int(state["k"])
+    hmc._offset = None if state["offset"] is None else torch.tensor(state["offset"], dtype=torch.long, device=device)
+
+
+def dd_cost(ham):
+    """Integer counters (solves, CG iterations, calls, ...) of the Schur and block terms since this
+    process started: the split of the cost between the global and the block solves."""
+    return {name: {k: v for k, v in term.stats.items() if isinstance(v, int)}
+            for name, term in (("schur", ham.schur), ("block", ham.block))}
+
+
+def dd_run_info(args, ham, hmc):
+    """run_meta.json "run"."dd": blocks, translation, active-link fraction, levels, cost split."""
+    bd = ham.blocks
+    sequence = args.dd_translation in ("luscher", "odometer")
+    return {
+        "blocks": list(bd.block_size), "n_blocks": list(bd.n_blocks), "translation": args.dd_translation,
+        "n_regular": hmc.n_regular if sequence else None,
+        "luscher_step": list(hmc.luscher_step) if args.dd_translation == "luscher" else None,
+        "active_fraction": bd.active_fraction, "expected_active_fraction": bd.expected_active_fraction(),
+        "schur_components": ham.schur.n_components,
+        "levels": [[[type(t).__name__ for t in terms], n] for terms, n in ham.levels],
+        "n_schur_steps": args.n_steps, "n_block_substeps": args.n_block_substeps,
+        "n_gauge_substeps": args.n_gauge_substeps,
+        "cost_this_process": dd_cost(ham),
+    }
+
+
 def default_name(args):
     if args.fermions == "wilson":
         f = f"wilson_k{args.kappa:g}" + ("" if args.kappa_heavy is None else f"_hb{args.kappa_heavy:g}")
@@ -299,6 +420,8 @@ def default_name(args):
         f = f"staggered_m{args.mass:g}"
     else:
         f = "quenched"
+    if args.dd_blocks is not None:
+        f += "_dd" + "x".join(str(b) for b in args.dd_blocks)
     lat = f"{args.T}x{args.L}^{args.D - 1}".replace("^", "p")
     return f"{f}_b{args.beta:g}_D{args.D}_{lat}_SU{args.N}_B{args.batch}_s{args.seed}"
 
@@ -316,6 +439,7 @@ def physics_key(args):
         "hasenbusch_layout": args.hasenbusch_layout,
         "kernel": args.kernel, "link_layout": args.link_layout,
         "solver": solver_key(vars(args)),
+        "dd": dd_key(args),
     }
 
 
@@ -436,8 +560,22 @@ class FermionTerms:
         return out
 
 
-def build_hamiltonian(args, geometry):
-    """Hamiltonian and its fermion term (None for --fermions none; `FermionTerms` for Hasenbusch)."""
+def build_dd_hamiltonian(args, geometry, device=None):
+    """DD-HMC Hamiltonian (Schur > block > gauge) and its two fermion terms as one `FermionTerms`."""
+    blocks = BlockDecomposition(geometry, args.dd_blocks, device=device)
+    common = dict(solver_tol=args.solver_tol, action_tol=args.action_tol, max_iter=args.max_iter,
+                  on_unconverged=args.on_unconverged)
+    ham = DDHMCHamiltonian(args.beta, args.kappa, blocks, n_block_substeps=args.n_block_substeps,
+                           n_gauge_substeps=args.n_gauge_substeps, time_sign=args.time_sign,
+                           block_kwargs=dict(common, reuse_guess=args.reuse_guess), schur_kwargs=common)
+    return ham, FermionTerms([ham.schur, ham.block])
+
+
+def build_hamiltonian(args, geometry, device=None):
+    """Hamiltonian and its fermion term (None for --fermions none; `FermionTerms` for Hasenbusch
+    and DD-HMC). `device` is where the DD-HMC block masks are built (default CPU)."""
+    if args.dd_blocks is not None:
+        return build_dd_hamiltonian(args, geometry, device)
     kw = dict(time_sign=args.time_sign, solver_tol=args.solver_tol, action_tol=args.action_tol,
               max_iter=args.max_iter, reuse_guess=args.reuse_guess)
     fast_kw = dict(precision=args.precision, check_every=args.check_every, colour_product=args.colour_product,
@@ -669,12 +807,14 @@ def main(argv=None):
     torch.manual_seed(int(args.seed))  # no global draws are made; kept for hygiene
 
     started = datetime.now().isoformat(timespec="seconds")
+    resumed_dd_state = None
     if args.resume:
         if not state_prefix.with_suffix(".json").exists():
             raise SystemExit(f"--resume: no checkpoint in {out}")
         U, meta, rng_state = load_state(state_prefix, device=device)
         stored = {k: meta[k] for k in ("geometry", "batch", "beta", "fermions", "kappa", "mass", "time_sign")}
-        stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout", "link_layout")})
+        stored.update({k: meta.get("extra", {}).get(k) for k in ("kappa_heavy", "hasenbusch_layout", "link_layout",
+                                                                  "dd")})  # older checkpoints: plain HMC
         stored["kernel"] = meta.get("extra", {}).get("kernel", "off")  # older checkpoints: --kernel off
         stored["solver"], solver_source = stored_solver_key(meta.get("extra", {}), meta_path)
         if stored != physics_key(args):
@@ -685,6 +825,9 @@ def main(argv=None):
         if meta["rng"]["device"].split(":")[0] != device.type:
             raise SystemExit(f"--resume: checkpoint RNG is for {meta['rng']['device']}, run on {device}")
         restore_generator(generator, rng_state)
+        resumed_dd_state = meta.get("extra", {}).get("dd_state")
+        if args.dd_blocks is not None and resumed_dd_state is None:
+            raise SystemExit("--resume: the DD-HMC checkpoint has no translation state (extra.dd_state)")
         traj_done = int(meta["trajectory"])
         writer = ObservableWriter(csv_path, OBS_FIELDS)
         writer.truncate(traj_done)
@@ -708,9 +851,20 @@ def main(argv=None):
             print(line, file=sys.stderr, flush=True)
         else:
             _log(args, line)
-    ham, fermion = build_hamiltonian(args, geometry)
+    ham, fermion = build_hamiltonian(args, geometry, device)
     integrator = args.integrator_levels
-    hmc = HMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator)
+    if args.dd_blocks is None:
+        hmc = HMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator)
+        update = hmc.trajectory
+    else:
+        hmc = DDHMC(geometry, ham, tau=args.tau, n_steps=args.n_steps, integrator=integrator,
+                    translation=dd_translation(args))
+        update = hmc.cycle  # translation of the gauge field, then a trajectory on the active links
+        if args.resume:
+            restore_dd_state(hmc, resumed_dd_state, device)
+        if args.dd_translation == "none":
+            print("WARNING: --dd-translation none: only the active links of the fixed block grid are updated; "
+                  "the chain is not ergodic", file=sys.stderr, flush=True)
     timer = SolveTimer(fermion, device) if fermion is not None else None
 
     total = args.therm + args.n_traj
@@ -732,6 +886,7 @@ def main(argv=None):
                        {"kappa_heavy": args.kappa_heavy, "layout": args.hasenbusch_layout,
                         "levels": [[[type(t).__name__ for t in terms], n] for terms, n in ham.levels]}),
         "on_unconverged": args.on_unconverged,
+        "dd": None if args.dd_blocks is None else dd_run_info(args, ham, hmc),
         "cg_iter_definition": (
             "complex64 inner loop applications + complex128 outer applications per trajectory (real cost)"
             if args.fast and args.precision == "mixed" else
@@ -739,13 +894,15 @@ def main(argv=None):
     }
 
     def checkpoint(final=False):
+        extra = {"seed": args.seed, "final": bool(final), "kappa_heavy": args.kappa_heavy,
+                 "hasenbusch_layout": args.hasenbusch_layout, "kernel": args.kernel,
+                 "link_layout": args.link_layout, "solver": solver_key(vars(args))}
+        if args.dd_blocks is not None:  # plain runs keep the checkpoint they always had
+            extra.update(dd=dd_key(args), dd_state=dd_state(hmc))
+            run_info["dd"]["cost_this_process"] = dd_cost(ham)
         save_state(state_prefix, U, geometry=geometry, beta=args.beta, fermions=args.fermions,
                    trajectory=traj_done, time_sign=args.time_sign, kappa=args.kappa, mass=args.mass,
-                   generator=generator, extra={"seed": args.seed, "final": bool(final),
-                                               "kappa_heavy": args.kappa_heavy,
-                                               "hasenbusch_layout": args.hasenbusch_layout,
-                                               "kernel": args.kernel, "link_layout": args.link_layout,
-                                               "solver": solver_key(vars(args))})
+                   generator=generator, extra=extra)
         try:
             summary, _ = summarize(csv_path, args.batch, args.gamma_S)
         except Exception as exc:  # checkpoint files are already written; never die on statistics
@@ -759,6 +916,11 @@ def main(argv=None):
 
     _log(args, f"HMC {args.fermions} N_f={n_flavours(args.fermions, args.D)} lattice {geometry.lattice} SU({args.N}) "
                f"beta={args.beta} kappa={args.kappa} mass={args.mass} B={args.batch} device={device} -> {out}")
+    if args.dd_blocks is not None:
+        dd = run_info["dd"]
+        _log(args, f"DD-HMC blocks {dd['blocks']} ({dd['n_blocks']} per direction), translation {dd['translation']}, "
+                   f"active-link fraction {dd['active_fraction']:.4f}, steps Schur {args.n_steps} x block "
+                   f"{args.n_block_substeps} x gauge {args.n_gauge_substeps}")
     while traj_done < total:
         if fermion is not None:
             s0 = dict(fermion.stats)
@@ -767,7 +929,7 @@ def main(argv=None):
             timer.max_residual = None
         _sync(device)
         t0 = time.perf_counter()
-        U, accepted, dH, stats = hmc.trajectory(U, generator)
+        U, accepted, dH, stats = update(U, generator)
         _sync(device)
         wall = time.perf_counter() - t0
 
