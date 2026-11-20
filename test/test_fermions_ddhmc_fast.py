@@ -381,7 +381,7 @@ class FastDDTrajectoryTest(unittest.TestCase):
             say(f"DD cycles {G.lattice} time_sign {time_sign:+g}: dH reference {ref[1].tolist()}, max |fast - ref| "
                 + ", ".join(f"{k} {(v[1] - ref[1]).abs().max().item():.1e}" for k, v in out.items()))
 
-    @unittest.skipUnless(SLOW, "~2-3 min on one CPU thread: NEOQCD_SLOW=1")
+    @unittest.skipUnless(SLOW, "~6 min on one CPU thread: NEOQCD_SLOW=1")
     def test_statistics_fast_vs_reference(self):
         """2D 8x8 SU(3), 4x4 blocks, beta = 5.0, kappa = 0.22, B = 32 chains from a cold start,
         luscher translations: <exp(-dH)> = 1 for the fast DD-HMC, and its plaquette equals the

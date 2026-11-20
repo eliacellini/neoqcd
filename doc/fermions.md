@@ -290,6 +290,12 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 - Fast path (Wilson, §5b): `--fast`, `--precision double|mixed`, `--colour-product`,
   `--check-every`, `--inner-tol`, `--max-outer` (all rejected without `--fast`; the last two
   need `--precision mixed`).
+- DD-HMC (Wilson, §5c): `--dd-blocks b0,b1,…` (absent: plain HMC, bitwise as before),
+  `--dd-translation random|luscher|odometer|none`, `--n-block-substeps` (Schur level `--n-steps`,
+  gauge level `--n-gauge-substeps`, three integrator levels), with or without the fast options
+  above (`--fast` runs both DD terms on the half lattice, `--kernel` the fused hop). Blocks and
+  translation are in the resume key and the translation sequence in the checkpoint;
+  run_meta.json `run.dd` has the active-link fraction and the Schur/block cost split.
 - Run length: `--batch --start cold|hot --therm --n-traj --meas-every --checkpoint-every`.
 - `--exact-logdet` measures the dense log det for dense dimension ≤ `--exact-max-dim`
   (default 3072).
@@ -440,6 +446,11 @@ kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
 - `job/debug_hmc_fermions.sh` (`POINTS="w4 w8"`):
   - w4: 4^4 SU(3), β = 1, κ = 0.1, B = 4, 50 + 300 trajectories, exact log det every trajectory.
   - w8: 8^4, β = 5.6, κ = 0.153, 100 + 200 trajectories.
+  - dd8 (optional, `POINTS="dd8r dd8"`): DD-HMC with the w8f physics (8^4, β = 5.6, κ = 0.153,
+    B = 16, `--fast --kernel cuda`), 4^4 blocks (active fraction 0.094), luscher translations,
+    τ = 0.5, Schur 4 × block 2 × gauge 4 steps, 200 + 300 trajectories (`_ddfused`); dd8r is the
+    same chain on the reference operators for 20 trajectories (`_dd`), whose rows must reproduce
+    the first 20 of dd8 (the GPU check of the fused DD path).
 - `job/debug_snf_fermions.sh` (`POINTS="nemcmc snf"`), 4^4, β = 5.6, κ 0.153 → 0.1545 in 8 steps:
   - nemcmc: 100 thermalisation trajectories and 256 samples.
   - snf: starts from the nemcmc pool, 20 Adam steps with signed stout layers from the identity
@@ -630,7 +641,7 @@ sample indices; `"warn"` warns once per kind and term; `"ignore"` only counts
 silently. `main_hmc.py --on-unconverged` sets it; `max_residual` in observables.csv records the
 largest residual per trajectory.
 
-## 5c. DD-HMC (`ddhmc.py`, first stage)
+## 5c. DD-HMC (`ddhmc.py`, `fast_ddhmc.py`; `main_hmc.py --dd-blocks`)
 
 Lüscher's domain-decomposition HMC (hep-lat/0409106) for N_f = 2 Wilson fermions. The lattice is
 cut into a chessboard of blocks (black Ω, white Ω*), with even block sizes and an even number of
@@ -694,6 +705,95 @@ No link is missed in a period for cubic blocks from 10⁴ to 20⁴ either. In 2D
 vectors, and the least visited link has 26 visits against 20 (8 chains; the spread ratio is
 0.60–0.73 over 20 seeds).
 
+**Integrator levels** (`DDHMCHamiltonian`). The paper's hierarchy: the Schur force (global
+solves, the smallest force and the most expensive) on the outer level with the HMC `n_steps`, the
+block force with `n_block_substeps` steps per Schur position update, the masked gauge force with
+`n_gauge_substeps` steps per block position update; one integrator scheme per level (Omelyan by
+default). All forces vanish off the active links.
+
+**Bookkeeping and convergence.** `BlockDecomposition(geometry, b, device=...)` builds its bool
+masks on the device; `field_mask` / `link_mask` of its own attributes return a broadcast real mask
+cached per (mask, device, real dtype), so a trajectory makes no host-device copy (temporaries such
+as `~active_links` are converted on every call; the cached tensors are shared, never modified in
+place). `SchurTwoFlavour` has the stats keys of `TwoFlavourWilson` (`refresh_calls`,
+`action_calls`, `force_calls`, `solves`, `cg_iterations`, `cg_iterations_per_sample`,
+`last_iterations`, `last_residual`, `unconverged_solves`; the old `iterations` key is gone) and its
+`on_unconverged` policy (§5b, convergence policy; kinds `refresh` for the two block solves of R η,
+`action`, `force`). The residual checked is the true |b − D x|/|b| of the full or block system.
+Every solve goes through the instance's `_solve(op, b, tol)` (`DDOperators(..., solver=...)`), so
+`main_hmc.py`'s `SolveTimer` wraps it as for the other terms. Per trajectory: refresh 2 block
+solves, Metropolis 1 full solve, every Schur force 2 full solves, every block force 1 block solve.
+
+**Fast path** (`fast_ddhmc.py`, `main_hmc.py --dd-blocks --fast`; ground truth: the reference
+classes).
+- `FastBlockTwoFlavour` / `FusedBlockTwoFlavour`: `FastTwoFlavourWilson` / `FusedTwoFlavourWilson`
+  with the half-lattice operator built on U · inblock_mask (cut links zero: the fused kernel reads
+  full links, so no kernel change), cached on the unmasked links (identity and `_version`) and the
+  operator key; the force is the parent's half-lattice force times the active-link mask. Same heat
+  bath draws as `BlockTwoFlavour`, same stats and policy, `precision` double/mixed, all kernels and
+  link layouts.
+- `FastSchurTwoFlavour`: the Schur term with φ_R and every intermediate field as a pair of
+  half-lattice fields. A solve D x = b (full) or D_bl x = b (block) is `prepare_rhs_half`, CGNE on
+  D̂†D̂ with `lean_cg` or `mixed_precision_cg` from zero, `reconstruct_odd`; the residual checked
+  is the reference's (|rhs − D̂ x_e|/|b|, one extra D̂). The hops between colours use the full
+  operator and site masks only, D_∂Ω = −κ P_Ω H P_Ω*: the in-block hops join sites of one colour,
+  so this equals the reference's hop through the cut links term by term, and no cut-link operator
+  is gathered. The force is −2κ `HalfLatticeWilson.hopping_derivative`(ζ, x) with
+  ζ = γ5 D⁻¹ γ5 χ, masked. The full operator (and its complex64 copy) is cached per links tensor;
+  the block operator is built in the refresh only. Extra stats `cg_loop_iterations`,
+  `outer_iterations`, `double_applications`; `kernel` (`off` or a fused kernel), `link_layout`,
+  `strict`.
+- `FastDDHMCHamiltonian(beta, kappa, blocks, ..., fast_kwargs={precision, check_every, inner_tol,
+  max_outer, colour_product}, kernel="off", link_layout="soa", strict=False, fast_schur=True)`: both
+  terms fast (`fast_schur=False` keeps the reference Schur term); the levels, masks and
+  translations are those of `DDHMCHamiltonian` / `DDHMC`.
+- Memory: up to three gathered link copies (2 × the gauge field each: the Schur term's full
+  operator, the block term's operator, the temporary block operator of the refresh), each with its
+  `soa` copy under the fused kernel and a complex64 copy with mixed precision.
+- Measured on the Mac CPU (one thread, complex128, one DD cycle, B = 2, τ = 0.5, Schur 2 × block 2
+  × gauge 2 steps, luscher translation, Haar start; speed-up over the reference in brackets):
+
+| lattice | reference | fast double | fast mixed | fused `cpu` | fused `cpu` mixed |
+|---|---|---|---|---|---|
+| 2D 8×8 SU(3), β = 5.0, κ = 0.2 | 0.25 s | 0.17 s (1.5×) | 0.21 s (1.2×) | 0.10 s (2.5×) | 0.13 s (1.9×) |
+| 4D 8^4 SU(3), β = 5.6, κ = 0.153 | 26.5 s | 16.1 s (1.6×) | 16.0 s (1.7×) | 6.6 s (4.0×) | 7.0 s (3.8×) |
+
+  Per cycle 13 Schur solves (2 block solves of the refresh, 10 full solves of 5 force evaluations,
+  1 full solve for the Metropolis step) and 18 block solves (17 forces, 1 action); in 4D about 37
+  and 23 CG iterations per solve (equal counts on both paths). dH of fast and reference agree to
+  2e-9 at the default tolerances. On the CPU the gain is that of the plain fast path (`matmul`);
+  the GPU gain (§5b: 6-9× per solve with `broadcast_sum`, a further 7-12× per operator application
+  with the fused kernel) is to be measured (`dd8r`, `dd8`).
+
+**What is not fast (and not planned here).** Every solve, block solves included, is a global CG on
+the half lattice: a block solve costs as many operator applications per iteration as a full one
+and is cheaper only through its condition number (fewer iterations). There are no block-local
+field layouts, no block-local solvers, no Schwarz-preconditioned GCR (the paper's solver for the
+full system) and no chronological guess for the Schur solves; these are a separate project.
+
+**Driver** (`main_hmc.py`, §5): `--dd-blocks b0,b1,…` (or one value for all directions; even,
+≥ 4, every extent an even multiple), `--dd-translation random|luscher|odometer|none` (default
+random; none prints a WARNING, not ergodic), `--n-block-substeps` (default 1; `--n-steps` is the
+Schur level, `--n-gauge-substeps` the gauge level, `--integrator` one scheme or three), and the
+fast options of plain HMC (`--fast`, `--precision`, `--colour-product`, `--check-every`,
+`--inner-tol`, `--max-outer`, `--kernel`, `--link-layout`). Wilson N_f = 2 only: staggered, no
+fermions and `--kappa-heavy` are refused with a message. Each trajectory is `DDHMC.cycle`
+(translation, then the trajectory on the active links). Outputs:
+- observables.csv: the plain-HMC columns; `solves`, `cg_iter`, `cg_iter_replica`, `solve_s`,
+  `max_residual` cover both terms (with `--precision mixed`, `cg_iter` is the real cost of both:
+  complex64 loop plus complex128 outer applications);
+- run_meta.json `run.dd`: blocks, blocks per direction, translation, `n_regular` and
+  `luscher_step`, `active_fraction` (measured) and `expected_active_fraction` (the paper's
+  formula), the number of Schur components, the levels (term classes and substeps), and
+  `cost_this_process` (the integer counters of the Schur and of the block term since the process
+  started: the split of solves and iterations between global and block solves);
+- resume: the block extents and the translation are in the resume key (`dd`; checkpoints without
+  it are plain HMC), the solver path as for plain HMC (`solver_key`, `--kernel`); the checkpoint
+  stores the luscher/odometer sequence (`extra.dd_state`: position in the period and the offset
+  from the period's random vector), so a run resumed mid-period is bitwise the uninterrupted one
+  (unit test; a DD checkpoint without the state is refused). Plain runs are bitwise unchanged,
+  checkpoint sidecar included.
+
 **Naming.** The code's labels are colour-mirrored with respect to the paper. The code takes the
 Schur complement on Ω*, and its "∂Ω*" (`exterior_boundary`) is the set of white sites with a
 black neighbour, which is the paper's ∂Ω. The determinant is the same. There are two exact
@@ -718,6 +818,40 @@ repo convention.
 - behind `NEOQCD_SLOW`, DD-HMC with `"random"` and with `"luscher"` translations against plain HMC
   and the exact-determinant Metropolis on 2D 8×8, κ = 0.22 (~20 min).
 
+- `BookkeepingTest`: the mask cache (per device and dtype, temporaries not cached), the stats keys
+  and counts of the Schur term, an instance wrapper of `_solve` seeing every solve, the
+  `on_unconverged` policy (raise, warn once per kind, ignore) and its route through
+  `DDHMCHamiltonian(schur_kwargs=...)`.
+
+`test_fermions_ddhmc_fast.py` (CPU, ~25 s; the fused `cpu` variants need a host C++ compiler):
+- block term and Schur term against `BlockTwoFlavour` / `SchurTwoFlavour` on Haar links, batch 2,
+  2D 8×8 SU(3) at both time signs (fast double and mixed, fused `loop` double and mixed, fused
+  `cpu` in both link layouts) and 4D 8^4 SU(2) (two variants): refresh (same draws), action,
+  action difference and force to 1e-9 relative (measured 1e-14 / 1e-12), zero force off the
+  active links, per-chain κ;
+- the fast Schur term against dense matrices (2D 8×8, both time signs): the dense
+  P(φ − D⁻¹ D_∂Ω φ) of the fast φ_R is η (R⁻¹ R = 1, to 5e-16), the action, the full-operator hops
+  against the dense cut-link hops (1e-13), the force against autograd of the dense action on every
+  active link (2e-15);
+- operator caches (on the unmasked links; `_version`; κ), stats, timer hook and policy of the fast
+  Schur term;
+- whole DD cycles (translation, refresh, three-level MD, Metropolis) of every fast variant against
+  the reference from the same generator: dH to 1e-8 (measured 3e-13 to 1e-12 in 2D, 6e-12 in 4D),
+  the same accept decisions, links to 1e-10 (2D both time signs; 4D 8^4 SU(2) one short cycle);
+- behind `NEOQCD_SLOW`, fast against reference DD-HMC on 2D 8×8, κ = 0.22, 32 chains, 90 measured
+  luscher cycles (~6 min): ⟨e^{−ΔH}⟩ = 1 and the plaquette (measured: ⟨P⟩ 0.3639(14) fast,
+  0.3647(12) reference; ⟨e^{−ΔH}⟩ 0.9993(5) fast, 1.0011(5) reference);
+- `CudaDDTest` (skipped without CUDA, not yet run): masks on the GPU, DD cycles of the fast
+  (`broadcast_sum`) and fused CUDA (`soa` double, `site` mixed) Hamiltonians against the reference
+  on the same GPU, 2D 8×8 and 4D 8^4 SU(3).
+
+`test_fermions_main_hmc_dd.py` (CPU, ~20 s): outputs and run_meta of a DD run; bitwise resume
+mid-period for luscher and odometer, and a different chain when the sequence state is not
+restored; the driver's chain equals the library `DDHMC.cycle` loop bitwise; resume key (blocks,
+translation, batch, plain vs DD, missing state); argument checks; `--fast`, `--kernel loop|cpu` and
+`--precision mixed` runs equal to the reference DD run (dH to 1e-8, the same accept pattern) with
+the mixed cost columns.
+
 `test_fermions_ddhmc_translation.py` (16 s) checks the translations against the paper:
 - Wilson-operator covariance D[T_s U](σ T_s ψ) = σ T_s(D[U]ψ), with σ = time_sign on the wrapped
   time slices, on 4⁴ SU(3) and 8×4³ SU(2) for time_sign = ±1. Without σ it fails on every
@@ -734,10 +868,15 @@ repo convention.
 - 12 `"luscher"` cycles: ⟨e^{−ΔH}⟩ = 1, and inactive links bitwise equal to the translated input.
 
 **Limits.**
-- The block solves use a global CG on the block operator, not block-local solvers.
+- The block solves use a global CG on the block operator, not block-local solvers (reference and
+  fast path).
 - The Schur solves have no chronological guess.
 - There is no Schwarz preconditioner.
-- DD-HMC is not wired into the drivers or into the fast path.
+- The fast path is tested on the CPU only (`cpu` and `loop` fused kernels included); the CUDA
+  kernel on masked links and the driver on a GPU are not yet run (`CudaDDTest`, debug points
+  `dd8r`, `dd8`). No DD-HMC run has been compared with openQCD.
+- Only `main_hmc.py` runs DD-HMC: the SNF/REX drivers and `QCDAction` do not (`PseudofermionAction`
+  refuses the DD terms by exact type).
 - There is no defect. A translation is a symmetry only without a boundary-condition defect.
   `DDHMCHamiltonian` takes no `plaquette_weights`, and `DDHMC.cycle` raises if the gauge term
   carries some. `translation=None` is allowed, but the fixed grid alone is not ergodic.
