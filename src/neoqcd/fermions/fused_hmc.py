@@ -1,47 +1,86 @@
 """Opt-in fused kernels for the molecular dynamics of the N_f = 2 Wilson HMC (beyond the hop).
 
-`fused.py` runs the half-lattice Wilson hop through one compiled kernel. This module adds, with the
-same build machinery (`fused._build_spec` / `fused.load_backend` with `_MDBackend`: kernel source in
-a string, plain nvcc or the host C++ compiler, ctypes, on-disk cache keyed on source, compiler and
-GPU architecture, atomic writes), kernels for the rest of a trajectory:
+`fused.py` runs the half-lattice Wilson hop through one compiled kernel. This module moves the rest
+of a trajectory to compiled kernels, with the same build machinery (`fused.load_backend` with
+`_MDBackend`: kernel source in a string, plain nvcc or the host C++ compiler, ctypes, on-disk cache
+keyed on source, compiler and GPU architecture, atomic writes, a bad cached file rebuilt once):
 
-    gauge force    `FusedWilsonGaugeAction`: the staple sum of every link (with the plaquette
-                   weights of the gauge-only defect), Omega = U A and its projection, in one pass;
-                   optionally the momentum kick P - c F in the same pass (F never stored).
+    component      class / function                what runs in the kernel
+    gauge_force    FusedWilsonGaugeAction          staple sum with the plaquette weights of the
+                                                   gauge-only defect, Omega = U A, projection;
+                                                   optionally the kick P - c F (F never stored) and
+                                                   the move exp(i h P') U in the same pass
+    update         FusedHMC (_FusedMDState)        P' = P - c F and U' = exp(i h P') U per link
+                                                   (exact SU(3) / SU(2) exponential, md_update)
+    fermion_force  FusedForceTwoFlavourWilson      the pseudofermion force per link from the
+                                                   half-lattice solve (hopping derivative, 2 kappa^2),
+                                                   optionally the kick (fermion_force)
+    cg             FusedCGStep (lean_cg step)      the CG linear algebra between the hops: three
+                                                   passes per iteration (FusedCGStep)
 
-The torch implementations (`hmc.WilsonGaugeAction`, ...) stay the ground truth: the kernels agree
-with them to rounding (test/test_fermions_fused_hmc.py), never bitwise, so a run with the kernels is
-a different (equally valid) chain from the same seed. Nothing here is used unless asked for
-(`main_hmc.py --kernel ... --md-kernels ...`).
+`FusedMDHamiltonian` is the fused-hop Hamiltonian of `fused.py` with a set of components on;
+`main_hmc.py --kernel cuda|cpu|auto --md-kernels all|none|<list>` selects them. The torch code stays
+the ground truth: the kernels agree with it to rounding (test/test_fermions_fused_hmc*.py), never
+bitwise, so a run with them is a different, equally valid chain from the same seed. Nothing here
+runs unless asked for; with every component off the classes are their parents exactly.
 
 Targets: "cuda" (compiled with nvcc, run on torch's current stream of the tensors' device, made
-current through torch as for the hop) and "cpu" (the same source built for the host and run as a
-loop over the CUDA thread index: the CPU emulation the tests use). complex128 only for the forces
-(the molecular dynamics stays in double precision: reversibility); D in (2, 4), N in (2, 3).
-Anything else (another dtype, D, N, device, an input that requires grad with grad mode on, ...)
-runs the torch code (once-per-reason RuntimeWarning when a compiled kernel was requested
-explicitly; strict=True raises instead), except autograd inputs, which are an error as in
-`fused.FusedHalfLatticeWilson`.
+current through torch as for the hop, return codes checked) and "cpu" (the same source built for
+the host and run as a loop over the CUDA thread index: the CPU emulation the tests use; not a fast
+CPU path). complex128 only for the forces and the update (the molecular dynamics stays in double:
+reversibility), complex128 and complex64 for the CG (the inner solves of mixed precision); D in
+(2, 4), N in (2, 3). Anything else (dtype, D, N, a device of the other kind) runs the torch code,
+with one RuntimeWarning per reason (strict=True raises BackendUnavailable instead); an input that
+requires grad with grad mode on is an error, as in `fused.FusedHalfLatticeWilson`. Inputs are made
+plain first (`fused._raw`: lazy conj/neg bits resolved, strides and offsets materialised); every
+output is a new tensor (no in-place write to U or P: the operator caches keyed on the links'
+identity and _version stay valid), except the CG vectors x, r, p of `lean_cg`, which are local.
 
 Kernel conventions (MD_KERNEL_SOURCE)
 -------------------------------------
-Links and momenta: (B, D, V, N, N) complex, contiguous (the lattice flattened in lexicographic
-order (t, x_1, ...), last index fastest), complex numbers as (re, im) pairs. The neighbour
-"x + mu" of the code (torch.roll(f, +1, axis_mu): array index n - e_mu) and "x - mu" (n + e_mu)
-are computed in the kernel from the site index, the extents and the strides (periodic).
+Links, momenta, forces: (B, D, V, N, N) complex, contiguous (the lattice flattened in lexicographic
+order (t, x_1, ...), last index fastest). The neighbour "x + mu" of the code (torch.roll(f, +1,
+axis_mu): array index n - e_mu) and "x - mu" (n + e_mu) are computed in the kernel from the site
+index, the extents and the strides (periodic). One thread per link (or per chunk for the CG), 128
+threads per block; the host build loops over the same thread index.
 
-Gauge force (`nq_gauge_force`), one thread per link (b, mu, x), tid = (b D + mu) V + x:
+Gauge force (`nq_gauge_force`), tid = (b D + mu) V + x:
     A = sum_{nu != mu} [ w_{mu nu}(x) U_nu(x + mu) U_mu(x + nu)^dag U_nu(x)^dag
                        + w_{mu nu}(x - nu) U_nu(x + mu - nu)^dag U_mu(x - nu)^dag U_nu(x - nu) ],
     Omega = U_mu(x) A,  Z = Omega - Omega^dag - tr(Omega - Omega^dag) / N,
     F = -i beta / (2N) Z                                       (= WilsonGaugeAction.force);
-the weights are a (BW, P, V) real tensor (BW = 1 or B, plane p = nu (nu - 1) / 2 + mu for mu < nu,
-the order of `WilsonGaugeAction._weighted_retr`), absent without a defect; beta is (B or 1,).
-Written: F, or (kick) P - c F.
+the weights are a (BW, P, V) float64 tensor (BW = 1 or B, plane p = nu (nu - 1) / 2 + mu for
+mu < nu, the order of `WilsonGaugeAction._weighted_retr`; every layout of the parent is packed by
+`plaquette_weight_tensor`), absent without a defect; beta is (B or 1,). Written: F, or P - c F, or
+(P - c F, exp(i h (P - c F)) U).
+
+Exponential (`md_expi`, as `algebra.expi` "auto"): SU(3) exp(iQ) = f0 + f1 Q + f2 Q^2 with the
+coefficients of `smearing_jacobian.exp_coefficients`: for c1 = tr(Q^2)/2 < C1_SERIES the Taylor
+series truncated after N_SERIES terms (the recursion of series_polynomials), above it the closed
+forms of Morningstar and Peardon at |c0| with the |c0|/c0max clamp and xi0 from its Taylor series
+below |w| = XI_SERIES (constants and XI_TAYLOR taken from smearing_jacobian when the source is
+generated); SU(2) the closed form cos q + i sin(q)/q Q. Update (`nq_md_update`): per link P' =
+P - c F and / or U' = exp(i h P') U.
+
+Fermion force (`nq_fermion_force`), tid = ((b D + mu) 2 + t) V/2 + i for the i-th site x of parity
+t: the half spinors h = R_k^dag psi of the projectors 1 - gamma_mu (k = mu) and 1 + gamma_mu
+(k = D + mu) of a(x), b(x + mu), b(x), a(x + mu) (the `spin_projection_tables` of fast.py),
+O1 = sum_j h(b(x + mu))_j h(a(x))_j^dag, O2 = sum_j h(b(x))_j h(a(x + mu))_j^dag, Q = L O1 - O2 L^dag
+with L from the gathered links of the operator (boundary phase included), F = 2 kappa^2 P_ht(i Q):
+`HalfLatticeWilson.hopping_derivative` link by link. Inputs (a_e, a_o, b_e, b_o) = (Y, Z, X, W) of
+`FastTwoFlavourWilson.force_from_solution`.
+
+CG (`nq_cg`), per iteration after A p (the operator stays the fused hop): op 0 the partial sums of
+Re <p, Ap>; op 1 alpha (the pAp <= tiny guard), x += alpha p, r -= alpha Ap and the partial sums of
+|r|^2; op 2 beta (the rr <= tiny guard), p = beta p + r, iterations += !converged,
+converged |= |r|^2 <= target. Thread t of sample b handles the elements t, t + nchunk, ...
+(nchunk = n/8: coalesced on the GPU), partial sums in double in a fixed order, summed by torch:
+deterministic. On the CPU emulation this access pattern is cache-hostile (the serial loop jumps by
+nchunk), so the cg component is slower than torch there; it is designed for the GPU, where it
+replaces about 25 small launches per iteration by 5.
 """
 
 import ctypes
-import warnings
 
 import torch
 

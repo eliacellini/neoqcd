@@ -577,6 +577,104 @@ addresses that.
   accept pattern, double and mixed) and operator-level on the A100; the first HMC validation on
   the GPU (`w4f`, `w8f` against the table below, then `w16`) is still to be run.
 
+**Fused MD kernels** (`fused_hmc.py`, opt-in; `main_hmc.py --fast --kernel cuda|cpu|auto --md-kernels ...`).
+
+- Why: with the fused hop a trajectory at 8^4 (B = 16, A100) costs about 0.20 s per replica and the
+  solves are only ~44% of it; the rest is torch code that launches many small, memory-bound
+  kernels: the gauge force (161 per trajectory at 10 × 4 omelyan steps), the link and momentum
+  updates (160 moves, ~180 kicks), the fermion force (21) and the CG linear algebra (about 25
+  launches per iteration besides the hops).
+- What runs where (components of `--md-kernels`, `fused_hmc.MD_COMPONENTS`; `all`, `none` or a
+  comma list):
+  - `gauge_force` (`FusedWilsonGaugeAction`): one thread per link builds the staple sum with the
+    plaquette weights of the gauge-only defect (every layout of `WilsonGaugeAction`, packed once per
+    weights dict, repacked when a weight field changes in place), Omega = U A and its projection,
+    β per sample; in the integrator the kick P − cF and, for the last kick before a position update,
+    the move U ← exp(ihP′)U happen in the same pass (F never stored).
+  - `update` (`FusedHMC`, `md_update`): P′ = P − cF and U′ = exp(ihP′)U per link, the exponential
+    exact as `algebra.expi` "auto": SU(3) Cayley-Hamilton with the coefficients of
+    `exp_coefficients` (the 25-term series below c1 = tr Q²/2 = 3, the Morningstar-Peardon closed
+    forms with the |c0|/c0max clamp and the ξ0 Taylor series above; constants taken from
+    `smearing_jacobian`), SU(2) the closed form. Kicks of a level whose term has its force kernel on
+    go through the term (`force_kick`); otherwise F comes from torch and the kick (and the move) from
+    this kernel. Other `exp_method`s run the torch moves.
+  - `fermion_force` (`FusedForceTwoFlavourWilson`): after the solve, W, Y (axpy fused into the
+    compiled hop) and Z by the hop kernel, then one thread per link: the four half spinors of
+    1 ∓ γ_μ at x and x + μ, O1, O2, Q = L O1 − O2 L†, 2κ² P_ht(iQ), or the kick with it.
+  - `cg` (`FusedCGStep`, the `step` hook of `lean_cg` / `mixed_precision_cg`): per iteration, after
+    the hops, three passes (Re⟨p, Ap⟩; α with its guard, x and r updates and |r|²; β, p, the
+    per-sample iteration count and convergence flag) with per-sample partial sums in double in a
+    fixed order, summed by torch (deterministic); complex128 and the complex64 inner solves.
+- Precision and exactness: the force and update kernels are complex128 only (the molecular dynamics
+  stays in double: reversibility); results agree with the torch code to rounding, not bitwise, so a
+  run with `--md-kernels` is a different, equally valid chain from the same seed (checked: dH within
+  1e-9 and the same accept decisions and CG counts over short runs). Without `--md-kernels` (or with
+  `none`) every run is the old one bitwise: checked against the driver of `7495125` (reference,
+  `--fast`, `--kernel cpu` double and mixed, `--kernel loop` with periodic time, quenched, fast
+  staggered: observables and final links bitwise) and an old checkpoint resumes.
+- Selection: the compiled target is the resolved hop kernel's (`cuda`, or `cpu` = the host build);
+  `--md-kernels` needs `--kernel cuda|cpu|auto` (not `loop`, not with `--dd-blocks`); an explicit
+  `cuda`/`cpu` whose MD library is unavailable is a SystemExit; `auto` without a compiled target
+  runs the torch code with one log line (WARNING on a GPU). The components are in the resume key
+  (older checkpoints: none) and in run_meta.json (`run.md_kernels`: requested, target, backend
+  status). In Python: `FusedMDHamiltonian(beta, kappa, geometry, md_kernels="all", md_target="cuda",
+  kernel="cuda", ...)` and `FusedHMC(geometry, ham, tau, n_steps, target=ham.md_hmc_target())`.
+- Safety as for the hop: inputs made plain (`fused._raw`), autograd inputs refused, device made
+  current through torch and torch's current stream, return codes checked, one library
+  (`neoqcd_md_<target>_<hash>.so`) built and cached by `fused.load_backend(..., backend_class=
+  fused_hmc._MDBackend)` (the hop library keeps its name, hash and calls); fallback to torch per
+  reason with one RuntimeWarning, `strict` raises. Every output is a new tensor (P and U are never
+  written in place, so the operator cache keyed on the links' identity and `_version` stays valid).
+- Tests (`test_fermions_fused_hmc`, `test_fermions_fused_hmc_main`; CPU emulation, with CUDA twins
+  that skip without a GPU): each kernel against the torch code on Haar links (batch 3, SU(2) and
+  SU(3), 2D and 4D, unequal extents, both time signs, per-sample β/κ, defect weights in every
+  layout, strided/conj/neg views, autograd refused, special exponentials: zero, degenerate spectra
+  of both signs of c0, c1 just below and above 3, c1 ≈ 50); CG in complex128 and complex64 with the
+  same iteration counts, zero and NaN samples (healthy samples bitwise as alone); trajectories
+  (pure gauge, defect, fermions, each component alone) with dH within 1e-9 of the torch integrator
+  and the same accept decisions, reversibility (1e-12 pure gauge, 1e-10 fermions), dH ∝ ε²; the
+  driver (all and each component reproduce `--kernel cpu`, none and `auto` without target bitwise,
+  resume key, bitwise resume); the bench trajectory rows; clang's CUDA front end on the source.
+- Measured on the CPU emulation only (Apple M3 Max, one thread, the host build at -O2, 2026-11-20,
+  machine shared with other jobs: ±15%): one 8^4 trajectory, B = 2, β = 5.6, κ = 0.153, τ = 1,
+  10 × 4 omelyan steps, 22 solves, 1894 CG iterations, fused hop `cpu` (`bench_fermions.py
+  --device cpu --trajectory-only --trajectory-configs 8^4:2 --trajectory-md none all gauge_force
+  update fermion_force cg --trajectory-repeats 1`). Seconds per trajectory (exclusive parts of the
+  instrumented pass); the component rows are each component alone:
+
+| Part | `none` | component alone | `all` |
+|---|---|---|---|
+| solve (hops + CG algebra) | 6.54 | 7.84 (`cg`) | 7.65 |
+| gauge force (161 calls) | 3.33 | 1.11 (`gauge_force`) | 1.68 (with the 160 fused kicks + moves) |
+| kicks and moves (321 calls) | 2.42 | 0.68 (`update`) | 0.03 (integrator bookkeeping: the kicks and moves run in the force kernels) |
+| fermion force after the solve (21) | 0.47 | 0.21 (`fermion_force`) | 0.19 |
+| total (uninstrumented) | 13.1 | | 9.7 |
+
+  So on the CPU the gauge force is 3×, the updates 3.5×, the fermion force 2.3× faster, the
+  gauge + update part 3.4× with the fused kick + move; the `cg` component is slower there
+  (≈ 1.3 s of CG algebra instead of ≈ 0.5 s: the coalesced access pattern of the GPU, element
+  t + k·nchunk per thread, is cache-hostile in the serial emulation), so `all` gains 1.35× on the
+  CPU and `gauge_force,update,fermion_force` would gain ≈ 1.5×. dH agrees with `none` within 1e-12.
+- Expected on the A100 (to be measured): the torch MD parts are launch- and bandwidth-bound there
+  (a gauge force is ~190 small kernels, a torch move ~50 kernels and a host sync in
+  `exp_coefficients`, a CG iteration ~25 launches besides the 4 hop kernels), while each fused pass
+  reads the links/momenta about once: at 8^4 B = 16 a fused gauge force should cost ~0.1-0.2 ms
+  (150 MB of traffic, ~3 kflop per link) instead of a few ms, and the CG algebra ~0.07 ms per
+  iteration instead of ~0.2 ms. If so the non-solve part (~56% of 0.20 s per replica) nearly
+  disappears and the solves drop by ~30%: about 0.07-0.09 s per replica, 2-3× per trajectory;
+  at 16^4 the hops weigh more and the gain is smaller.
+- To run on a GPU (Leonardo, from the test worktree): `GRID=0 sbatch job/debug_bench_fermions.sh`
+  (CUDA twins of the kernel tests, `test_fermions_fused_hmc_main` with the main_hmc CUDA twin, then
+  the trajectory breakdown: 8^4 B16 with none, all and each component; 16^4 B16 none and all;
+  rows `trajectory` / `trajectory_part` in output/bench_fermions/<job>/trajectory_8 and _16); then
+  `MODE=validate sbatch job/debug_bench_fermions.sh`, repeated until run_meta.json says finished
+  (w8f physics with `--md-kernels all`, 100 + 400 trajectories, resumable): the plaquette must agree
+  with w8f / openQCD 0.5661(5) and the acceptance and ⟨e^{−ΔH}⟩ with w8f.
+- Limits: plain HMC of `main_hmc.py` only (not DD-HMC, Hasenbusch, staggered, the SNF/REX drivers or
+  `QCDAction`); the kernels are not autograd functions (the SNF layers keep the torch code); the
+  CUDA build is checked by the clang CUDA front end and by the CPU emulation of the same source,
+  never yet run on a GPU.
+
 **Validation against openQCD 2.4.3** (Wilson N_f = 2, c_sw = 0, antiperiodic quarks; openQCD
 plaquette = 3 × ours, converted):
 
