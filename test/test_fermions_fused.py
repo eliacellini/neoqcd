@@ -9,12 +9,14 @@ CUDA front end when available (`CudaSourceTest`).
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -461,6 +463,126 @@ class FallbackTest(unittest.TestCase):
             op.normal(x.to(C64))
         with self.assertRaises(ValueError):
             op.hop(to_half(field(geo, 3, 12), geo), 0)  # batch 3 vs link batch 2
+
+
+_STUB_LIBRARY = r"""
+// a library with the entry points of KERNEL_SOURCE but another argument layout (a stale build)
+extern "C" {
+int nq_args_size(void) { return 1; }
+int nq_is_cuda(void) { return 0; }
+int nq_hop(const void*, void*) { return 0; }
+const char* nq_error_string(int) { return "stub"; }
+}
+"""
+
+
+class BuildCacheTest(unittest.TestCase):
+    """On-disk cache of the compiled library (host build, in a cache directory of its own): a
+    cached file that does not load is rebuilt once and replaced; a build that does not load
+    either is reported; temporary build files have a host + pid + random name and never stay."""
+
+    def setUp(self):
+        reason = cpu_reason()
+        if reason is not None:
+            self.skipTest(f"host build of the kernel source unavailable: {reason}")
+        self._tmp = tempfile.TemporaryDirectory(prefix="neoqcd_cache_")
+        self._env = os.environ.get("NEOQCD_KERNEL_CACHE")
+        os.environ["NEOQCD_KERNEL_CACHE"] = self._tmp.name
+        self._saved = dict(F._BACKENDS)
+        F._BACKENDS.clear()
+
+    def tearDown(self):
+        F._BACKENDS.clear()
+        F._BACKENDS.update(self._saved)
+        if self._env is None:
+            os.environ.pop("NEOQCD_KERNEL_CACHE", None)
+        else:
+            os.environ["NEOQCD_KERNEL_CACHE"] = self._env
+        self._tmp.cleanup()
+
+    def _lib(self):
+        lib = F._build_spec("cpu")[3]
+        lib.parent.mkdir(parents=True, exist_ok=True)
+        return lib
+
+    def _leftovers(self):
+        return sorted(p.name for p in Path(self._tmp.name).iterdir() if p.name.endswith(".tmp"))
+
+    def _check_operator(self):
+        geo = G4s
+        U = links(geo, 2, 60)
+        x = to_half(field(geo, 2, 61), geo)
+        op = FusedHalfLatticeWilson(U, 0.12, geo, kernel="cpu", strict=True)
+        self.assertLess(rel(op.normal(x), HalfLatticeWilson(U, 0.12, geo).normal(x)), 1e-14)
+
+    def test_empty_cached_library_is_rebuilt(self):
+        lib = self._lib()
+        lib.write_bytes(b"")  # e.g. a full file system or a copy interrupted outside neoqcd
+        ok, why = backend_status("cpu")
+        self.assertTrue(ok, why)
+        self.assertEqual(why, str(lib))
+        self.assertGreater(lib.stat().st_size, 0)
+        self.assertIsNotNone(F.load_backend("cpu").rebuilt_from)
+        self._check_operator()
+        self.assertEqual(self._leftovers(), [])
+        F._BACKENDS.clear()  # a later job: the repaired file loads as it is
+        self.assertIsNone(F.load_backend("cpu").rebuilt_from)
+
+    def test_stale_argument_layout_is_rebuilt(self):
+        lib = self._lib()
+        src = Path(self._tmp.name) / "stub.cpp"
+        src.write_text(_STUB_LIBRARY)
+        res = subprocess.run([F._find_cxx(), "-shared", "-fPIC", "-o", str(lib), str(src)], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        backend = F.load_backend("cpu")
+        self.assertIn("argument layout mismatch", backend.rebuilt_from)
+        self.assertEqual(backend.path, str(lib))
+        self._check_operator()  # the fresh build, not the stub already mapped at that path
+        self.assertEqual(self._leftovers(), [])
+
+    def test_rebuild_is_tried_once_then_reported(self):
+        lib = self._lib()
+        lib.write_bytes(b"")
+        calls = []
+
+        def broken_toolchain(target, compiler, flags, suffix, out):
+            calls.append(Path(out))
+            Path(out).write_bytes(b"")
+
+        with mock.patch.object(F, "_compile", broken_toolchain):
+            ok, why = backend_status("cpu")
+            self.assertEqual(backend_status("cpu"), (ok, why))  # cached for the process: no retry
+        self.assertFalse(ok)
+        self.assertIn("does not load", why)
+        self.assertIn("rebuilt because the cached", why)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._leftovers(), [])
+
+    def test_partial_file_name_unique_and_removed_on_failure(self):
+        lib = self._lib()
+        seen = []
+        real_run = subprocess.run
+
+        def killed_compiler(cmd, *a, **k):
+            if "--version" in cmd:
+                return real_run(cmd, *a, **k)
+            out = Path(cmd[cmd.index("-o") + 1])
+            seen.append(out)
+            out.write_bytes(b"half a library")
+            raise subprocess.TimeoutExpired(cmd, 900)
+
+        with mock.patch.object(F.subprocess, "run", killed_compiler):
+            for _ in range(2):
+                with self.assertRaisesRegex(BackendUnavailable, "failed to run"):
+                    F._build("cpu")
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])  # random part: two ranks of one pid on two nodes differ
+        host = "".join(c if c.isalnum() or c in "-_" else "_" for c in socket.gethostname())
+        for path in seen:
+            self.assertEqual(path.parent, lib.parent)
+            self.assertTrue(path.name.startswith(f".{lib.name}.{host}.{os.getpid()}."), path.name)
+        self.assertEqual(self._leftovers(), [])
+        self.assertFalse(lib.exists())
 
 
 class FusedTermTest(unittest.TestCase):

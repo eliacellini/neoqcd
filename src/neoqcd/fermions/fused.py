@@ -56,7 +56,12 @@ statically; it shares the device's primary context with torch, sets the device o
 before the launch and restores the previous one.
 Build cache: $NEOQCD_KERNEL_CACHE, default ~/.cache/neoqcd/kernels, one file per source hash,
 compiler and GPU architecture. nvcc is looked up in $CUDA_HOME/bin, $CUDA_PATH/bin, then PATH;
-the host compiler in $CXX, then c++, g++, clang++.
+the host compiler in $CXX, then c++, g++, clang++. A build writes a temporary file named after the
+host, the pid and a random suffix (jobs on several nodes may share the cache), removed on any
+failure or timeout, and renames it atomically. A cached file that does not load (empty, truncated,
+a stale argument layout) is rebuilt once: the fresh build is loaded under its temporary name and
+then moved over the bad file (atomic), so later jobs find a good library; if it does not load
+either, the backend is unavailable with both reasons (`_load`).
 
 Kernel design (KERNEL_SOURCE)
 -----------------------------
@@ -106,7 +111,9 @@ import copy
 import ctypes
 import hashlib
 import os
+import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import warnings
@@ -414,8 +421,8 @@ def _version(compiler):
         return ""
 
 
-def _build(target, device=None):
-    """Compile KERNEL_SOURCE for target ("cuda" or "cpu") into the cache; returns the library path."""
+def _build_spec(target, device=None):
+    """(compiler, flags, source suffix, library path in the cache) of target "cuda" or "cpu"."""
     if target == "cuda":
         compiler = _find_nvcc()
         if compiler is None:
@@ -435,29 +442,90 @@ def _build(target, device=None):
     else:
         raise ValueError(f"unknown target {target!r}")
     tag = hashlib.sha256("\n".join([KERNEL_SOURCE, compiler, _version(compiler)] + flags).encode()).hexdigest()[:16]
-    cache = _cache_dir()
-    lib = cache / f"neoqcd_hop_{target}_{tag}.so"
+    return compiler, flags, suffix, _cache_dir() / f"neoqcd_hop_{target}_{tag}.so"
+
+
+def _partial_path(lib):
+    """A temporary name next to `lib`, unique across the nodes sharing the cache directory and the
+    processes of a node (host name, pid and a random suffix; the pid alone is not unique across
+    nodes). Not created here: the compiler creates it with the usual permissions."""
+    host = "".join(c if c.isalnum() or c in "-_" else "_" for c in socket.gethostname()) or "host"
+    return lib.parent / f".{lib.name}.{host}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _compile(target, compiler, flags, suffix, out):
+    """Compile KERNEL_SOURCE into the file `out`; on any failure (error, timeout, interrupt) the
+    partial output is removed and BackendUnavailable (or the interrupt) propagates."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="neoqcd_hop_") as tmp:
+            src = Path(tmp) / f"neoqcd_hop{suffix}"
+            src.write_text(KERNEL_SOURCE)
+            cmd = [compiler] + flags + ["-o", str(out), str(src)]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise BackendUnavailable(f"{target} build failed to run: {exc}")
+            if res.returncode != 0:
+                msg = (res.stderr or res.stdout).strip().splitlines()
+                raise BackendUnavailable(f"{target} build failed ({compiler}): " + " | ".join(msg[-6:]))
+            if not os.path.isfile(out) or os.path.getsize(out) == 0:
+                raise BackendUnavailable(f"{target} build ({compiler}) produced no library")
+    except BaseException:
+        _unlink(out)
+        raise
+
+
+def _build(target, device=None):
+    """Compile KERNEL_SOURCE for target ("cuda" or "cpu") into the cache unless the library is
+    already there; returns the library path (it is not loaded or checked here: `load_backend`)."""
+    compiler, flags, suffix, lib = _build_spec(target, device)
     if lib.is_file():
         return lib
-    cache.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="neoqcd_hop_") as tmp:
-        src = Path(tmp) / f"neoqcd_hop{suffix}"
-        src.write_text(KERNEL_SOURCE)
-        partial = cache / f".{lib.name}.{os.getpid()}.tmp"
-        cmd = [compiler] + flags + ["-o", str(partial), str(src)]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise BackendUnavailable(f"{target} build failed to run: {exc}")
-        if res.returncode != 0:
-            try:
-                partial.unlink()
-            except OSError:
-                pass
-            msg = (res.stderr or res.stdout).strip().splitlines()
-            raise BackendUnavailable(f"{target} build failed ({' '.join(cmd[:1])}): " + " | ".join(msg[-6:]))
-        os.replace(partial, lib)  # atomic: concurrent builds and killed jobs leave no half file
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(lib)
+    _compile(target, compiler, flags, suffix, partial)
+    os.replace(partial, lib)  # atomic: concurrent builds and killed jobs leave no half file
     return lib
+
+
+def _load(target, device=None):
+    """The `_Backend` of target: the cached library if it loads; otherwise (none cached, or a cached
+    file that does not load: truncated or empty, a stale argument layout, ...) one fresh build.
+
+    The fresh build is loaded under its own temporary name and only then moved over the cache entry
+    (atomic os.replace), so a bad cached file is replaced for later jobs, and the process never
+    re-opens a path whose stale library the dynamic loader may already hold (dlopen of a path
+    already loaded returns the loaded library). If the fresh build does not load either, the
+    partial file is removed and BackendUnavailable says why (with the cached file's failure)."""
+    compiler, flags, suffix, lib = _build_spec(target, device)
+    stale = None
+    if lib.is_file():
+        try:
+            return _Backend(target, lib)
+        except Exception as exc:  # noqa: BLE001 - any loading problem: rebuild once
+            stale = f"{type(exc).__name__}: {exc}"
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(lib)
+    _compile(target, compiler, flags, suffix, partial)
+    try:
+        backend = _Backend(target, partial)
+    except Exception as exc:  # noqa: BLE001
+        _unlink(partial)
+        why = f"{target} library built but it does not load: {type(exc).__name__}: {exc}"
+        if stale is not None:
+            why += f" (rebuilt because the cached {lib.name} did not load: {stale})"
+        raise BackendUnavailable(why)
+    os.replace(partial, lib)  # replaces a bad cached file atomically; the mapping stays valid
+    backend.path = str(lib)
+    backend.rebuilt_from = stale
+    return backend
 
 
 class _Backend:
@@ -466,6 +534,7 @@ class _Backend:
     def __init__(self, target, path):
         self.target = target
         self.path = str(path)
+        self.rebuilt_from = None  # set by _load: why the cached library had to be rebuilt
         lib = ctypes.CDLL(self.path)
         lib.nq_args_size.restype = ctypes.c_int
         lib.nq_is_cuda.restype = ctypes.c_int
@@ -489,7 +558,8 @@ class _Backend:
 
 def load_backend(target, device=None):
     """The kernel library for target "cuda" or "cpu" (built at first use, cached per process and
-    on disk); raises BackendUnavailable with the reason."""
+    on disk; a cached file that does not load is rebuilt once, `_load`); raises BackendUnavailable
+    with the reason (also cached for the process: no retry)."""
     if target == "cuda":
         if not torch.cuda.is_available():
             raise BackendUnavailable("CUDA is not available to torch")
@@ -507,7 +577,7 @@ def load_backend(target, device=None):
     if isinstance(hit, BackendUnavailable):
         raise hit
     try:
-        backend = _Backend(target, _build(target, device))
+        backend = _load(target, device)
     except BackendUnavailable as exc:
         _BACKENDS[key] = exc
         raise
