@@ -24,7 +24,8 @@
 # Epoch = 1 HMC trajectory per replica (tau = 1, 8 Omelyan steps, 4 gauge substeps), swaps, PG loss
 # (pure-gauge part + pseudofermion term: 2 CG solves per chain), one Adam step (lr 1e-3).
 # 20 thermalisation trajectories at fixed labels and 5 REX steps before the first epoch, then 60 epochs,
-# checkpoint every 5. Cold start.
+# checkpoint every 5. Cold start. Fast even-odd operator (--fast, fp64: trajectories and the two loss
+# solves on the half lattice); the output directory ends in _fast.
 # Outputs in output/pg_fermions/<name>/ (metrics.jsonl, config.json, run_info.json, cnf_checkpoint.pt,
 # cnf_checkpoint.rank<r>.slot<s>.pt). The checkpoint is resumed when present (--resume), so resubmitting
 # extends a killed run; to restart from scratch pass --overwrite.
@@ -53,7 +54,7 @@ MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
 SEED="${SEED:-1234}"
-OUT="${OUT:-output/pg_fermions/pgf_r${NPROC}_c4_cube2_b5.6_k0.153_8x8p3_dhs_class}"
+OUT="${OUT:-output/pg_fermions/pgf_r${NPROC}_c4_cube2_b5.6_k0.153_8x8p3_dhs_class_fast}"
 
 extra=()
 if [[ -f "${OUT}/cnf_checkpoint.pt" ]]; then
@@ -68,10 +69,10 @@ echo "=== ${OUT} $(date -Is) nproc=${NPROC} ${extra[*]:-}"
 srun python -m torch.distributed.run \
   --nnodes="$SLURM_NNODES" --node_rank="$SLURM_NODEID" --nproc_per_node="$NPROC" \
   --rdzv_id="$SLURM_JOB_ID" --rdzv_backend=c10d --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
-  main/main_pg_fermions.py --device cuda --seed "$SEED" --output-dir "$OUT" "${extra[@]}" \
+  main/main_pg_fermions.py --device cuda --seed "$SEED" --output-dir "$OUT" ${extra[@]+"${extra[@]}"} \
   --D 4 --T 8 --L 8 --N 3 --beta 5.6 --fermions wilson --kappa 0.153 \
   --defect-shape cube --defect-size 2 --time-slice 4 --space-slice 3 \
   --parameter-min 0.0 --parameter-max 1.0 --replicas "$NPROC" --batch-size 4 --swap-parity alternating \
   --tau 1.0 --n-steps 8 --n-gauge-substeps 4 --integrator omelyan \
   --architecture defect-hyper-smearing --hyper-smearing-mode class --hidden-dim 16 --depth 2 \
-  --therm 20 --warmup 5 --epochs 60 --save-every 5 --lr 1e-3 --grad-clip-norm 1.0 "$@"
+  --therm 20 --warmup 5 --epochs 60 --save-every 5 --lr 1e-3 --grad-clip-norm 1.0 --fast "$@"

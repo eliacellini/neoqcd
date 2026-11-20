@@ -49,7 +49,12 @@ are counted in a `LossSolveCounter`, not in the term's `stats` (the drivers spli
 loss costs).
 
 Supported terms (exact type): `TwoFlavourWilson` and `ParametricTwoFlavourWilson` even-odd (the
-`QCDAction` default). Anything else raises TypeError.
+`QCDAction` default), and on the fast path (`QCDAction(..., fast=True)`) `fast.FastTwoFlavourWilson`
+and `ParametricFastTwoFlavourWilson`: the same formulas on half-lattice fields with
+`fast.HalfLatticeWilson` (the term's colour product; autograd through its gathered links) and the
+term's solver (`lean_cg`, or `mixed_precision_cg` with precision "mixed", converging to the same
+tolerance); equal to the reference to the solver tolerance (unit tests). Anything else (staggered,
+Hasenbusch, clover, DD-HMC, the fused-kernel term, subclasses) raises TypeError.
 
 Joint loss (`fermion_path_gradient_loss`): the pure-gauge `cnf.path_gradient_loss` with the gauge
 action of the ladder, unchanged, plus Re <grad_U xi_f, i F_theta U> (the loss is linear in xi):
@@ -71,8 +76,9 @@ import torch.distributed as dist
 
 from neoqcd.fermions._gauge import SUN_identity, is_uniform, mean_plaquette, plaquette_fields
 from neoqcd.fermions._gauge_cnf import ParallelTempering, PTConfig, ladder_action, lie_tangent, path_gradient_loss
-from neoqcd.fermions.action import ParametricTwoFlavourWilson, QCDAction
+from neoqcd.fermions.action import ParametricFastTwoFlavourWilson, ParametricTwoFlavourWilson, QCDAction
 from neoqcd.fermions.dirac import WilsonDirac
+from neoqcd.fermions.fast import FastTwoFlavourWilson, HalfLatticeWilson, lean_cg, mixed_precision_cg, to_half
 from neoqcd.fermions.pseudofermion import (
     ON_UNCONVERGED,
     TwoFlavourWilson,
@@ -169,27 +175,46 @@ class LossSolveCounter:
 
 # ---- dispatch ---------------------------------------------------------------------------------
 _REFERENCE_TERMS = (TwoFlavourWilson, ParametricTwoFlavourWilson)
+_FAST_TERMS = (FastTwoFlavourWilson, ParametricFastTwoFlavourWilson)
 
 
 def pg_fermion_kind(fermion):
-    """"wilson" for the reference even-odd terms (exact type); TypeError / ValueError otherwise."""
+    """"wilson" (reference even-odd terms) or "wilson_fast" (`fast.FastTwoFlavourWilson` and its
+    parametric variant), by exact type; TypeError for any other term (staggered, Hasenbusch, clover,
+    DD-HMC, the fused-kernel term, subclasses) and ValueError for the full-lattice reference term."""
     if type(fermion) in _REFERENCE_TERMS:
         if not fermion.even_odd:
             raise ValueError("the PG pseudofermion term is even-odd only (TwoFlavourWilson(even_odd=True), the "
                              "QCDAction default)")
         return "wilson"
+    if type(fermion) in _FAST_TERMS:
+        return "wilson_fast"
+    names = ", ".join(c.__name__ for c in _REFERENCE_TERMS + _FAST_TERMS)
     raise TypeError(f"unsupported fermion term {type(fermion).__name__}: the PG pseudofermion term handles "
-                    f"{', '.join(c.__name__ for c in _REFERENCE_TERMS)} (N_f = 2 Wilson, even-odd)")
+                    f"{names} (N_f = 2 Wilson, even-odd)")
 
 
 # ---- operators --------------------------------------------------------------------------------
 class _ReferenceOps:
-    """D_hat, D_hat^dagger, gamma_5 and d_V D_hat on full-lattice even fields (dirac.py operators)."""
+    """D_hat, D_hat^dagger, gamma_5 and d_V D_hat on full-lattice even fields (dirac.py operators),
+    CG of `solver.cg` (per-sample convergence)."""
 
-    def __init__(self, U, kappa, geometry, time_sign):
+    def __init__(self, U, kappa, geometry, time_sign, fermion=None):
         self.geometry, self.kappa, self.time_sign = geometry, kappa, time_sign
         self.w = WilsonDirac(U, kappa, geometry, time_sign)
         self.eo = self.w.even_odd()
+
+    def field(self, phi):
+        return phi
+
+    def apply(self, x):
+        return self.eo.apply(x)
+
+    def apply_dagger(self, x):
+        return self.eo.apply_dagger(x)
+
+    def gamma5(self, x):
+        return self.eo.gamma5(x)
 
     def tangent(self, V):
         """d_V D_hat x = -kappa^2 even[H(V) H(U) x + H(U) H(V) x], x even (H linear in the links)."""
@@ -203,7 +228,53 @@ class _ReferenceOps:
         return apply
 
     def solve(self, b, tol, max_iter):
-        return cg(self.eo.normal, b, tol=tol, max_iter=max_iter)
+        return cg(self.eo.normal, b, tol=tol, max_iter=max_iter), None
+
+
+class _FastOps(_ReferenceOps):
+    """The same on half-lattice even fields (`fast.HalfLatticeWilson`: the term's colour product), with
+    the term's solver (`lean_cg`, or `mixed_precision_cg` with precision "mixed")."""
+
+    def __init__(self, U, kappa, geometry, time_sign, fermion=None):
+        self.geometry, self.kappa, self.time_sign = geometry, kappa, time_sign
+        self.fermion = fermion
+        self.colour_product = fermion.colour_product
+        self.op = HalfLatticeWilson(U, kappa, geometry, time_sign, colour_product=self.colour_product)
+
+    def field(self, phi):
+        return to_half(phi, self.geometry, 0)
+
+    def apply(self, x):
+        return self.op.apply(x)
+
+    def apply_dagger(self, x):
+        return self.op.apply(x, dagger=True)
+
+    def gamma5(self, x):
+        return self.op.gamma5(x)
+
+    def tangent(self, V):
+        """d_V D_hat x = -kappa^2 [H_eo(V) H_oe(U) + H_eo(U) H_oe(V)] x on half fields."""
+        opV = HalfLatticeWilson(V, self.kappa, self.geometry, self.time_sign, colour_product=self.colour_product)
+        op = self.op
+
+        def apply(x):
+            return -op._k2 * (opV.hop(op.hop(x, 1), 0) + op.hop(opV.hop(x, 1), 0))
+        return apply
+
+    def solve(self, b, tol, max_iter):
+        f, info = self.fermion, {}
+        if f.precision == "double":
+            res = lean_cg(self.op.normal, b, tol=tol, max_iter=max_iter, check_every=f.check_every, info=info)
+        else:
+            if getattr(self, "_low", None) is None:
+                self._low = self.op.to(torch.complex64)
+            res = mixed_precision_cg(self.op, self._low, b, tol=tol, inner_tol=f.inner_tol, max_outer=f.max_outer,
+                                     max_iter=max_iter, check_every=f.check_every, info=info)
+        return res, info["loop_iterations"]
+
+
+_OPS = {"wilson": _ReferenceOps, "wilson_fast": _FastOps}
 
 
 def _rdot(a, b):
@@ -232,8 +303,11 @@ def pseudofermion_pg_term(U, fermion, velocity, *, phi=None, kappa=None, volume=
 
     Args:
         U: links (B, D, lattice, N, N) (not modified; differentiated on a detached copy).
-        fermion: `TwoFlavourWilson` / `ParametricTwoFlavourWilson` (even-odd) with phi set; its
-            kappa, time_sign, geometry, solver_tol, max_iter and on_unconverged are the defaults.
+        fermion: `TwoFlavourWilson` / `ParametricTwoFlavourWilson` (even-odd) or the fast
+            `FastTwoFlavourWilson` / `ParametricFastTwoFlavourWilson` (half-lattice operator with the
+            term's colour product, lean or mixed-precision CG as the term's `precision`), with phi
+            set; its kappa, time_sign, geometry, solver_tol, max_iter and on_unconverged are the
+            defaults.
         velocity: a callable U -> tangent field i F(U) U (e.g. the frozen flow field; it is
             differentiated through), or a hermitian (B, D, lattice, N, N) field H held fixed
             (tangent i H U).
@@ -247,7 +321,7 @@ def pseudofermion_pg_term(U, fermion, velocity, *, phi=None, kappa=None, volume=
         xi (B,) float (detached), gradient (like U, complex; Wirtinger, divided by V), S_pf (B,)
         = Re phi^dagger X (the action at U, free from the X solve), counter.
     """
-    pg_fermion_kind(fermion)
+    Ops = _OPS[pg_fermion_kind(fermion)]
     if counter is None:
         counter = LossSolveCounter()
     geometry = fermion.geometry
@@ -269,9 +343,10 @@ def pseudofermion_pg_term(U, fermion, velocity, *, phi=None, kappa=None, volume=
 
     with _timed(counter):
         U0 = U.detach()
-        ops = _ReferenceOps(U0, kappa, geometry, fermion.time_sign)
-        X_res = ops.solve(phi, tol, max_iter)
-        counter.record(X_res, tol, "pg_X", policy, max_iter)
+        ops = Ops(U0, kappa, geometry, fermion.time_sign, fermion)
+        phi = ops.field(phi)
+        X_res, loops = ops.solve(phi, tol, max_iter)
+        counter.record(X_res, tol, "pg_X", policy, max_iter, loop_iterations=loops)
         X = X_res.x
         S_pf = _rdot(phi, X)
         with torch.enable_grad():
@@ -279,17 +354,17 @@ def pseudofermion_pg_term(U, fermion, velocity, *, phi=None, kappa=None, volume=
             V = tangent_of(Ug)
             if V.shape != U.shape:
                 raise ValueError(f"the velocity must return a tangent of shape {tuple(U.shape)}, got {tuple(V.shape)}")
-            g_ops = _ReferenceOps(Ug, kappa, geometry, fermion.time_sign)
+            g_ops = Ops(Ug, kappa, geometry, fermion.time_sign, fermion)
             dD = g_ops.tangent(V)
-            DX = g_ops.eo.apply(X)
+            DX = g_ops.apply(X)
             dDX = dD(X)
             s = -2.0 * _rdot(DX, dDX)
             with torch.no_grad():  # (d_V M) X = gamma_5 (d_V D_hat) gamma_5 D_hat X + D_hat^dagger (d_V D_hat) X
-                rhs = ops.eo.gamma5(dD(ops.eo.gamma5(DX))) + ops.eo.apply_dagger(dDX)
+                rhs = ops.gamma5(dD(ops.gamma5(DX))) + ops.apply_dagger(dDX)
                 rhs = rhs.detach()
-            Y_res = ops.solve(rhs, tol, max_iter)
-            counter.record(Y_res, tol, "pg_Y", policy, max_iter)
-            t2 = 2.0 * _rdot(DX, g_ops.eo.apply(Y_res.x.detach()))
+            Y_res, loops = ops.solve(rhs, tol, max_iter)
+            counter.record(Y_res, tol, "pg_Y", policy, max_iter, loop_iterations=loops)
+            t2 = 2.0 * _rdot(DX, g_ops.apply(Y_res.x.detach()))
             (gradient,) = torch.autograd.grad((s + t2).sum(), Ug)
     return {"xi": s.detach() / volume, "gradient": gradient / volume, "S_pf": S_pf.detach(), "counter": counter}
 

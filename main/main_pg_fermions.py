@@ -26,7 +26,9 @@ solver and defect flags of main_snf_fermions.py (--D --T --L --N --beta --kappa 
 --colour-product --check-every --inner-tol --max-outer --tau --n-steps --n-gauge-substeps
 --integrator --defect-size --defect-time-slice (alias --time-slice) --defect-space-slice (alias
 --space-slice) --start-config --therm --seed --device --resume --overwrite --quiet), plus
---loss-tol (the two loss solves; default --solver-tol). The domain is always the bc defect
+--loss-tol (the two loss solves; default --solver-tol). --fast (and its options) puts both the
+trajectories and the two loss solves on the half-lattice operator and the lean / mixed-precision CG of
+`neoqcd.fermions.fast` (same physics to the solver tolerance; in the resume check). The domain is always the bc defect
 (--defect-shape cube, `utils.Defect`, the defect of main_pt_obc.py and of the CNF checkpoint); N = 3,
 Wilson fermions. --therm trajectories at fixed labels and --warmup REX steps (with swaps) precede a
 fresh run. The field's defect mask (`cnf_io.build_cnf`) and the action's
@@ -166,8 +168,6 @@ def validate(args):
     if args.defect_shape != "cube":
         raise SystemExit("--defect-shape cube only: the CNF checkpoint records the defect of utils.Defect "
                          "(main_pt_obc.py), which the field and the evaluation runners rebuild")
-    if args.fast:
-        raise SystemExit("--fast is not yet supported by the PG loss")
     for key in ("replicas", "batch_size", "hidden_dim", "depth", "mcmc_steps", "epochs", "save_every"):
         if getattr(args, key) < 1:
             raise SystemExit(f"--{key.replace('_', '-')} must be positive")

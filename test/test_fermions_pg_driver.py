@@ -3,7 +3,7 @@
 - single process: outputs (metrics.jsonl keys per rung, config.json with the fermions block, the
   checkpoint pair), a resumed run equal to the uninterrupted one bitwise (metrics and field), metrics
   past the checkpoint dropped, refusals (a previous run without --resume/--overwrite, a resume with
-  other physics, --defect-shape line, --fast);
+  other physics, --defect-shape line, staggered fermions);
 - the checkpoint read by the unchanged pure-gauge loader (`cnf_io.load_cnf_checkpoint`) and, for a
   defect-hyper-smearing field in 4D, by main/convert_cnf_to_smearing_flow.py (NEO-REX target);
 - two Gloo ranks (one rung each; NEOQCD_SKIP_GLOO=1 skips): an interrupted and resumed run equals
@@ -83,7 +83,7 @@ class SingleProcessDriverTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "kappa"):
                 self.run_driver(*[v if v != "0.18" else "0.17" for v in BASE], "--replicas", "3", "--epochs", "4",
                                 "--output-dir", str(a), "--resume")
-            for extra, message in ((["--defect-shape", "line"], "cube"), (["--fast"], "fast")):
+            for extra, message in ((["--defect-shape", "line"], "cube"), (["--fermions", "staggered", "--mass", "0.3"], "wilson")):
                 with self.assertRaisesRegex(SystemExit, message):
                     self.run_driver(*BASE, *extra, "--replicas", "3", "--epochs", "1", "--output-dir", str(b))
 
