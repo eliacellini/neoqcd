@@ -33,8 +33,9 @@ This page describes the code as it is. The plan holds the motivation and the lit
   (Bonanno et al., arXiv:2404.14151).
 - Fermionic NE-MCMC (Jarzynski on the joint (U, φ)) for protocols in β, κ/mass or bc, Wilson or staggered.
 - Fermionic SNF: pure-gauge stout/residual layers (trainable) before every HMC block. The S_pf
-  gradient comes from a custom autograd Function, with no backpropagation through CG. Wilson
-  only for now; staggered SNF with layers is in progress in `snf_layers.py`.
+  gradient comes from a custom autograd Function, with no backpropagation through CG (first
+  derivatives only). Wilson (reference and fast) and staggered (reference; the fast staggered term
+  in the library); Hasenbusch, clover and the other term types are refused.
 - REX on the gauge-only defect: fermionic HMC replicas and solve-free swaps. There is a
   single-process, device-safe `FermionREX` and a `distributedPT.ParallelTempering` target (tested
   on Gloo). Wilson and staggered.
@@ -50,7 +51,7 @@ at 4^4, β = 1.0, κ = 0.1 and at 8^4, β = 5.6, κ = 0.153 (§5b).
 **Not done.**
 
 - DD-HMC in the drivers and the fast path (the algorithm itself is in `ddhmc.py`, §5c).
-- Staggered SNF with layers (in progress).
+- Hasenbusch (or clover) terms in the SNF layers (refused by `PseudofermionAction`).
 - O-REX and NEO-REX with fermions (out of this plan).
 - The 8^4, β = 5.6, κ = 0.1545 point (openQCD reference 0.5687(3) available) and the
   comparison with Grid. The 4^4 and 8^4 κ = 0.153 openQCD comparisons are done (§5b).
@@ -223,7 +224,7 @@ periodic top rung (guarded). The swap uniforms come from a separate CPU generato
 | `staggered_exact.py` | `assemble_staggered_hopping`, `assemble_staggered_even_odd`, `log_det_staggered`, `ExactStaggeredMetropolis` |
 | `action.py` | `QCDAction` (`fermions="wilson"|"staggered"`, `mass`), `ParametricTwoFlavourWilson`, `ParametricStaggeredPseudofermion`, `JointHamiltonian`, `bc_link_couplings`, `bc_plaquette_weights`, `PARAMETER_NAMES`, `STAGGERED_PARAMETER_NAMES`, `FERMION_TYPES` |
 | `snf.py` | `FieldState`, `HMCBlock`, `FermionNEMCMC`, `jarzynski_free_energy`, `effective_sample_size`, `OBSERVABLES` |
-| `snf_layers.py` | `PseudofermionAction`, `pseudofermion_action`, `joint_action`, `FermionLayerBlock`, `FermionSNF`, `make_gauge_layers` (default ρ = 1e-3) |
+| `snf_layers.py` | `PseudofermionAction`, `pseudofermion_action`, `joint_action`, `FermionLayerBlock`, `FermionSNF` (`layer_diagnostics`), `make_gauge_layers` (library default kind smearing, ρ = 1e-3; the driver's default is smearing_signed, ρ = 0), `SignedCouplingLayer`, `layer_conditioning`, `residual_options`, `stout_rho_bound`, `layer_diagnostics` |
 | `rex.py` | `swap_action_difference`, `FermionREXTarget`, `distributed_rex_step`, `FermionREX` (`swap_generator`, `swap_seed`) |
 | `io.py` | `save_state`/`load_state` (`.pt` + `.json` sidecar), `restore_generator`, `ObservableWriter`, `read_observables`, `write_npz`, `atomic_json_save`, `n_flavours` |
 
@@ -265,6 +266,13 @@ Hasenbusch and staggered-action files (their times not yet measured), all passin
 | `main_hmc` | Wilson outputs and bitwise resume, rows past the checkpoint dropped, quenched and staggered runs, argument checks | 3s |
 | `main_snf_rex` | NE-MCMC in κ, SNF in bc with training and resume, interrupted SNF resumes identically, residual layers, REX outputs and resume (outputs only, not physics) | 7s |
 | `snf_residual` | residual layers: options and conditioning; SU(3) output, dlogJ = dense Haar log-Jacobian (static/hyper × n_pt 0, 1, 2 × mod 2, 4 in 2D, n_pt 1 in 4D 2^4), exact identity at zero step; dS_pf/dθ vs FD and dense solve, nonzero gradient at the identity; bookkeeping (κ, β, bc), identity layers = NE-MCMC, Jarzynski in κ; driver training, resume, architecture check of `--load-flow` | 50s |
+| `snf_function` | `PseudofermionAction` dispatch by exact type (every supported and refused term class, the fast Hasenbusch ratio term refused), fast staggered value and gradient against the reference (weights, (B,) mass, through a signed layer), `create_graph=True` raises, the forward solve at action_tol (not solver_tol) | 2s |
+| `snf_diagnostics` | the stout fold above 1/(2(D−1)) (cold 4D, ρ = 0.2) and monotone image below, `layer_diagnostics` of every kind (residual = equivalent stout ratio), driver columns, one warning per phase, CSV header upgrade on resume | 4s |
+| `snf_driver_checks` | driver defaults (smearing_signed, ρ = 0), lr vs ρ_init for `smearing`, zero conditioning steps refused, ignored-option warnings, flow/pool checkpoint pair (kill between the writes resumes bitwise; inconsistent pairs refused), `--load-flow` protocol check and `--load-flow-force`, shared flow at another n-step, resume-key entries (older checkpoints with a note), skipped non-finite gradient steps | 9s |
+| `snf_convergence` | `--on-unconverged` reaches the fermion term of QCDAction and FermionREX (reference and fast), NaN-sticky `SolveMonitor` and CSV summary, convergence columns of converged and `--max-iter 3` runs (raise/warn/ignore), staggered | 3s |
+| `snf_layer_checks` | 4D 2^3×4 signed stout Haar log-Jacobian (batch 2, both signs of ρ, dense 1024²), weighted gradient with (B,) κ (reference and fast against dense autograd), gauge equivariance and log J invariance of every layer kind (2D, 4D), Jarzynski with a signed layer at ρ = −0.008 against the exact determinant | 45s alone, ~15s in the suite |
+| `rex_convergence` | convergence columns and `--on-unconverged` of both REX drivers (single process, three Gloo ranks) | 5s |
+| `hmc_defect_weights` | defect plaquette weights with integer masks (float64, couplings not truncated) | 1s |
 
 ## 5. How to run
 
@@ -302,33 +310,69 @@ anything longer. Sync code via git; submit with `sbatch` from `/leonardo_work/IN
 
 - Protocol: `--protocol beta|kappa|bc` with `--initial --final --n-step` (linear) or
   `--protocol-file`.
-- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing|smearing_signed|residual|hyper-residual
-  --rho-init` (default 1e-3; with `smearing` ρ = 0 cannot train and is refused for training,
-  `smearing_signed --rho-init 0` is a trainable identity start) `--train-steps --lr --lr-warmup
-  --grad-clip --load-flow`. `param_abs_mean` in training.csv is the mean |parameter| the step ran
-  with (before its optimizer step).
+- Mode: `--mode nemcmc|snf`; for snf, `--layers smearing_signed|smearing|residual|hyper-residual
+  --rho-init --train-steps --lr --lr-warmup --grad-clip --load-flow --load-flow-force`.
+  `param_abs_mean` in training.csv is the mean |parameter| the step ran with (before its
+  optimizer step).
+- Defaults (since 20 November): `--layers smearing_signed --rho-init 0` for `--mode snf`, the exact
+  identity with a live gradient (before: `smearing` with ρ_init = lr = 1e-3, whose first Adam step
+  sent every |ρ| to ≈ 0 or ≈ 2e-3 and flipped signs). `--layers smearing` (the pure-gauge |ρ|
+  layer) is refused for training unless `--lr` < |`--rho-init`| (ρ_init = 0: no gradient at all).
+  Residual layers whose conditioning steps d_i are all 0 (`--residual-delta step` with one step, a
+  constant protocol) are the identity and are refused (training died in `loss.backward()`, and
+  without training the run was NE-MCMC labelled snf). Options the layer kind ignores
+  (`--rho-init` with the residual kinds or without layers, residual options given at their
+  default with the stout kinds) give one RuntimeWarning; other residual values with stout layers
+  exit as before.
 - Residual layers (see "Residual layers" below): `--residual-n-pt --residual-mask-mod
   --residual-[no-]include-imag --residual-[no-]quadratic --residual-coeff-init --residual-coeff-max
   --hyper-time-embedding-dim --hyper-hidden-dim --hyper-depth --hyper-activation --layer-sharing
   --residual-condition --residual-delta`; refused with the other layer kinds.
 - Solver and fast path: `--solver-tol --action-tol --max-iter --no-reuse-guess --on-unconverged`
   and `--fast --precision --colour-product --check-every --inner-tol --max-outer` (§5b; part of the
-  resume key; also in the two REX drivers).
+  resume key; also in the two REX drivers). `--on-unconverged` reaches the fermion term through
+  `fermion_kwargs` (unit test, also for `FermionREX`).
 - Sampling: `--batch --eval-samples`, `--n-traj` (HMC trajectories per block), `--n-between`
   (pool trajectories at λ_0 between flow runs).
 - Starting pool: `--start-config` (a `main_hmc`/pool checkpoint) and `--therm`.
 - Defect: `--defect-shape cube|line --defect-size --defect-time-slice --defect-space-slice`.
 - Outputs:
-  - `samples.csv`: W, Q, logJ, S0, S_final, solves, ESS per sample.
+  - `samples.csv`: W, Q, logJ, S0, S_final, solves, ESS per sample; `max_residual` (largest true
+    relative CG residual of the batch's solves, decorrelation trajectories and flow, NaN-sticky)
+    and `unconverged_solves` (solves above 10 max(tol, 1e3 ε)), so `--on-unconverged warn|ignore`
+    leaves a trace (`SolveMonitor`, which wraps the term's `_solve` as `SolveTimer` of
+    `main_hmc.py` does; the reference staggered term, which has no policy, is counted by the same
+    rule).
   - `blocks.csv`: per protocol step.
-  - `training.csv`.
+  - `training.csv`: per step, with `max_residual`, `unconverged_solves`, and the bijectivity
+    diagnostics of the flow the step ran with: `max_abs_coeff` (max |ρ| for the stout kinds, the
+    largest coefficient for the residual kinds) and `injectivity_ratio` (`snf_layers.layer_diagnostics`:
+    max |ρ| / (1/(2(D−1))), or the residual contraction estimate; ≥ 1 means no bijectivity
+    guarantee). A non-finite gradient norm skips the optimizer step with a line on stderr.
   - `run_meta.json`: ΔF = −log⟨e^{−W}⟩ with jackknife error, ESS, solves and CG iterations
-    per sample.
-  - `flow.pt/.json` and `pool.pt/.json` (resume). `flow.json` records the layer architecture
-    (`architecture`: layer kind, residual options except coeff_init, sharing, conditioning modes)
-    and the per-step conditioning (c_i, d_i); `--load-flow` refuses a flow whose sidecar records
-    another architecture (or has no sidecar). The residual options are also in the resume key and
-    in `run_meta.json` (`run.flow_architecture`, `run.layer_conditioning`).
+    per sample; `summary.convergence` (training, evaluation, totals), `run.therm_max_residual`,
+    `run.therm_unconverged_solves`; `run.layer_diagnostics` of the evaluated flow and
+    `summary.training` maxima of the diagnostics, `nonfinite_grad_steps` (skipped optimizer steps).
+    One RuntimeWarning in training and one for the evaluated (trained, loaded or resumed) flow
+    when `injectivity_ratio` ≥ 1; nothing is clamped.
+  - `flow.pt/.json`, `flow_prev.pt` and `pool.pt/.json` (resume). `flow.json` records the layer
+    architecture (`architecture`: layer kind, residual options except coeff_init, sharing,
+    conditioning modes), the protocol (parameter in `physics`, `initial`, `protocol`) and the
+    per-step conditioning (c_i, d_i). `--load-flow` refuses a flow whose sidecar records another
+    architecture (or has no sidecar), and one trained on another protocol (parameter, initial
+    value, values, conditioning: a reversed protocol flips the sign of d_i), printing what differs,
+    unless `--load-flow-force` (protocol only; the architecture must match). A shared layer
+    (hyper-residual) loads at another `--n-step` (with `--load-flow-force`); per-step layers need
+    the same number of steps. The residual options are also in the resume key and in
+    `run_meta.json` (`run.flow_architecture`, `run.layer_conditioning`).
+- Checkpoints: the flow is written first, atomically, after moving the current `flow.pt` to
+  `flow_prev.pt`; then the pool, whose sidecar commits the pair. A kill at any point leaves a flow
+  file of the pool's step: `--resume` picks it (from `flow_prev.pt` after a kill between the two
+  writes, restored as `flow.pt`) and refuses a pair where neither matches. The resume key holds the
+  physics, the layers and (since 20 November) `--n-between` and, for snf, `--train-steps --lr
+  --lr-warmup --grad-clip` and `--rho-init` (stout kinds); a checkpoint without these entries is
+  accepted with a printed note, and a mismatch lists the differing entries. CSVs written before new
+  columns are upgraded on resume (the new columns empty).
 
 **Residual layers** (`--layers residual|hyper-residual`, `snf_layers.make_gauge_layers(...,
 kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
@@ -377,7 +421,9 @@ kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
 - Run: `--n-chains --steps --therm --swap-parity alternating|even_odd --periodic-translation`.
 - Physics, HMC and defect options are those of the SNF driver.
 - Outputs:
-  - `observables.csv`: per step × rung.
+  - `observables.csv`: per step × rung; `max_residual` and `unconverged_solves` of the step's
+    solves (all replicas; in the distributed driver gathered over the ranks, max NaN-sticky and
+    sum), `summary.convergence` in `run_meta.json` (every step, thermalisation included).
   - `replica_history.npz`: labels, plaquette, trajectory_labels and exp_minus_dH in
     `replica_history` layout.
   - `run_meta.json`: round trips, flux, τ_int on the bottom and top rungs, swap acceptance per
@@ -385,7 +431,9 @@ kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
   - `checkpoint.*` and `rex_state.pt`.
 - The swap uniforms use `FermionREX`'s separate CPU generator (`swap_seed` = seed + 1); the
   former `DeviceREX` workaround is gone.
-- Staggered fermions are not yet exposed by the SNF/REX drivers (library only); `main_hmc.py` has them.
+- Staggered fermions: `--fermions staggered --mass` in the SNF driver (`--protocol mass|beta|bc`,
+  NE-MCMC and SNF layers) and in both REX drivers, as in `main_hmc.py`; `--fast` and
+  `--on-unconverged` are Wilson only there.
 
 **Debug jobs** (one A100, fp64, 30 min). Each resumes automatically if its checkpoint exists:
 
@@ -394,7 +442,10 @@ kind, residual={...})`; the pure-gauge `ResidualCouplingLayer`, SU(3) only).
   - w8: 8^4, β = 5.6, κ = 0.153, 100 + 200 trajectories.
 - `job/debug_snf_fermions.sh` (`POINTS="nemcmc snf"`), 4^4, β = 5.6, κ 0.153 → 0.1545 in 8 steps:
   - nemcmc: 100 thermalisation trajectories and 256 samples.
-  - snf: starts from the nemcmc pool, 20 Adam steps with stout layers (ρ_init = 1e-3), then 128 samples.
+  - snf: starts from the nemcmc pool, 20 Adam steps with signed stout layers from the identity
+    (`--layers smearing_signed --rho-init 0 --lr 1e-3 --lr-warmup 5`), then 128 samples; directory
+    `snf_signed_...` (until 20 November: |ρ| stout with ρ_init = lr = 1e-3, now refused, in
+    `snf_smearing_...`).
   - Both with `--fast`; output directories end in `_fast` (no old non-fast checkpoint is resumed).
   - residual (optional, `POINTS="nemcmc residual"`): static residual layers with two frozen-link
     convolutions, `--residual-coeff-init 0 --lr 1e-3 --lr-warmup 5`, 20 Adam steps, 128 samples,
@@ -731,26 +782,43 @@ repo convention.
   - Only pure-gauge layers; φ is held fixed across a layer and resampled per trajectory, with no
     flow on φ.
   - `FermionLayerBlock` raises if a layer returns a nonzero dQ.
-  - Staggered SNF with layers is in progress (`snf_layers.py`); NE-MCMC and REX already take
-    staggered fermions.
+  - `PseudofermionAction` handles, by exact type, the reference and fast Wilson terms, the
+    reference and fast staggered terms and their parametric subclasses; Hasenbusch heavy/ratio
+    terms (reference and fast), clover, DD-HMC blocks, the fused-kernel term and any other subclass
+    raise TypeError (before 20 November `FastRatioWilsonTerm` was taken for the plain fast term and
+    returned Re φ†X with the plain force, silently). It is differentiable once: the saved force is a
+    constant, so a second derivative would miss dF/dU; `create_graph=True` raises.
+  - Bijectivity: each masked stout update is guaranteed to be a bijection only for
+    |ρ| < 1/(2(D−1)) (1/6 in 4D, `snf_layers.stout_rho_bound`; contraction of the staple sum);
+    above it the map can fold with a finite log J and no error (a cold 4D configuration at
+    ρ = 0.2: two inputs differing on one link share an image, unit test), and Jarzynski fails
+    silently. Nothing is clamped (that would change what is trained): `layer_diagnostics` reports
+    max |ρ| against the bound, and for the residual kinds a heuristic contraction estimate
+    |d_i|/N Σ_f (|lin_f| + 2 Σ_j |H_fj|), equal to the stout ratio of the equivalent stout map
+    when the features are real and there is no quadratic term (the layer is then exactly a stout map
+    with ρ = d lin/N); norm constants of the quadratic term and the non-unitary convolved staples
+    (n_pt > 0) are not tracked. The driver records both and warns once (training, evaluated flow)
+    when the ratio is ≥ 1, whatever `--residual-coeff-max`.
   - The legacy SU(2) stout log-Jacobian is doubled, as in `Flow._full_logdet`. This is not the
     exact Haar log-Jacobian (relative error ~1e-3 at ρ = 0.01-0.1), so SU(2) stout SNF is only
-    approximately Jarzynski-exact. SU(3) is exact to ~1e-14 (unit test).
+    approximately Jarzynski-exact. SU(3) is exact (dense Haar Jacobian to 1e-10: 2D stout and
+    signed stout, 4D 2^3×4 signed stout with a batch of 2 and both signs of ρ, residual kinds).
   - Residual layers: SU(3) and the full periodic lattice only (no cropped defect patch, no
     `residual_mode=class`); 4D mask mod 4 is tested only through the 2D Jacobian checks (a dense
     4^4 Jacobian is too large for a unit test). Up to 14 November the fermionic `--layers residual`
     was the hyper parameterisation with raw (λ_i, forward-difference) conditioning; it is now the
     static one (pure-gauge spelling), and such old flows are refused by `--load-flow`.
-  - The stout layer uses |ρ|, whose gradient vanishes at ρ = 0, hence the default ρ = 1e-3.
-    `--layers smearing_signed` (`snf_layers.SignedCouplingLayer`, a `Smearing` subclass with a
-    signed ρ; the map and its exact log-Jacobian are linear in ρ through the staples, checked
+  - The stout layer uses |ρ|, whose gradient vanishes at ρ = 0, hence the library default
+    ρ = 1e-3. `--layers smearing_signed` (`snf_layers.SignedCouplingLayer`, a `Smearing` subclass
+    with a signed ρ; the map and its exact log-Jacobian are linear in ρ through the staples, checked
     against the dense Haar Jacobian at negative ρ) starts at the identity with `--rho-init 0`
-    and trains; `--lr-warmup k` ramps the learning rate linearly over k steps.
+    and trains; it is the driver's default since 20 November. `--lr-warmup k` ramps the learning
+    rate linearly over k steps.
   - Adam's first steps move every parameter by about lr whatever the gradient: with lr = ρ_init
     (the 14 November GPU pilot, lr = ρ_init = 1e-3) step 0 sends each ρ to ≈ 0 or ≈ 2ρ_init.
     `param_abs_mean` in training.csv is the value the step's flow ran with (before its optimizer
     step; before 14 November it was logged after it, which is why the pilot showed 1.5625e-4 =
-    5 × 2e-3 / 64 at step 0).
+    5 × 2e-3 / 64 at step 0). The driver now refuses `--layers smearing` with lr ≥ |ρ_init|.
   - The protocol is a list of floats; per-configuration (B,) protocols are accepted by the
     NE-MCMC only.
 - **Pool correlation.** The SNF driver's consecutive batches are correlated through the pool's
