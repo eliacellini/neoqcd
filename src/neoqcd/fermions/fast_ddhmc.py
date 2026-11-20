@@ -189,8 +189,8 @@ class FastSchurTwoFlavour(SchurTwoFlavour):
         out = self._half_masks.get(key)
         if out is None:
             tab = site_tables(self.geometry, like.device)
-            flat = getattr(self.blocks, name).reshape(-1).to(like.device)
-            out = tuple(flat.index_select(0, tab["sites"][p]).to(like.real.dtype).view(1, -1, 1, 1) for p in (0, 1))
+            flat = getattr(self.blocks, name).reshape(-1).to(device=like.device, dtype=like.real.dtype)
+            out = tuple(flat.index_select(0, tab["sites"][p]).view(1, -1, 1, 1) for p in (0, 1))
             self._half_masks[key] = out
         return out
 
