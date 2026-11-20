@@ -564,7 +564,7 @@ def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, 
             n_total += 1
         r_true = b - apply_normal(x)
         rr_true = _norm2(r_true)
-        good = rr_true <= accept
+        good = (rr_true <= accept) & torch.isfinite(rr_true)  # inf <= inf (an inf rhs) is not converged
         bad = ~good & torch.isfinite(rr_true)
         if n_total >= max_iter or not bool(bad.any()):
             break
@@ -611,6 +611,10 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
     (a step that increased |r| is undone); the loop ends when every sample is converged or
     stagnated, after `max_outer` steps, or when the inner budget is spent.
     `max_iter` is a total budget of complex64 loop iterations over all inner solves.
+    A sample with a non-finite residual (a NaN or inf right-hand side or start) is finished at
+    once (zero inner right-hand side, finite inner tolerance), as `lean_cg` isolates it: the other
+    samples run exactly as in a batch without it, and it ends not converged with a non-finite
+    residual (the convergence policy of the terms then names only that sample).
 
     Returns SolverResult(x complex128, iterations (B,) = inner CG iterations summed over the outer
     steps, residual = true complex128 relative residual). `info` (dict) receives "outer" (outer
@@ -645,6 +649,10 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
         rhs = torch.where(_bview(done, r), torch.zeros_like(r), r / _bview(scale, r).to(r.dtype)).to(low)
         sub = {}
         inner = torch.clamp(0.5 * torch.sqrt(target) / scale, min=float(inner_tol), max=0.5)
+        # a finished sample (zero inner rhs) gets a finite inner tolerance: a non-finite sample has
+        # a NaN target, and a NaN tolerance never converges inside lean_cg, which would spend the
+        # whole budget and leave the healthy samples at the complex64 level (isolated as in lean_cg)
+        inner = torch.where(done, torch.full_like(inner, 0.5), inner)
         # no restarts inside: the outer loop is the residual replacement
         e = lean_cg(A64, rhs, tol=inner, max_iter=budget - loops, check_every=check_every, info=sub,
                     max_restarts=0)
@@ -661,9 +669,9 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
         r = torch.where(_bview(keep, r), r_new, r)
         rr = torch.where(keep, rr_new, rr)
     if info is not None:
+        converged = (rr <= target) & torch.isfinite(rr)  # an inf residual is not converged (inf <= inf)
         info.update(outer=outer, inner_iterations=inner_max, loop_iterations=loops, double_applications=doubles,
-                    converged=rr <= target, stagnated=stagnated & ~(rr <= target),
-                    budget_exhausted=bool(loops >= budget))
+                    converged=converged, stagnated=stagnated & ~converged, budget_exhausted=bool(loops >= budget))
     b2 = _norm2(b)
     residual = torch.sqrt(rr / torch.where(b2 > 0, b2, torch.ones_like(b2)))
     return SolverResult(x, iterations, residual)

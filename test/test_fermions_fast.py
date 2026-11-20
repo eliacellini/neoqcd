@@ -542,6 +542,50 @@ class MixedPrecisionTest(unittest.TestCase):
         self.assertFalse(bool(info["stagnated"].any()))
         self.assertLess(res.residual.max().item(), 1e-10)
 
+    def test_non_finite_sample_is_isolated(self):
+        """A sample with a NaN (or inf) right-hand side does not hold up the batch, in
+        mixed_precision_cg as in lean_cg: the healthy samples end bitwise as in a batch without it
+        (same x, residuals, per-sample iterations and loop cost, inner budget not spent), the bad
+        sample ends with a non-finite residual, not converged; the fast term's convergence error
+        names only that sample (double and mixed)."""
+        geo = G44
+        op = HalfLatticeWilson(links(geo, 1, 101), 0.13, geo)  # links of batch 1: fields of any batch
+        op64 = op.to(C64)
+        b = to_half(field(geo, 3, 102), geo)
+        healthy = b[[0, 2]].clone()
+        solvers = {
+            "mixed": lambda rhs, info: mixed_precision_cg(op, op64, rhs, tol=1e-12, inner_tol=1e-6, max_iter=2000,
+                                                          info=info),
+            "double": lambda rhs, info: lean_cg(op.normal, rhs, tol=1e-12, max_iter=2000, info=info),
+        }
+        for value in (float("nan"), float("inf")):
+            bad = b.clone()
+            bad[1, 3, 1, 2] = value
+            for name, solve in solvers.items():
+                with self.subTest(value=value, solver=name):
+                    want_info, info = {}, {}
+                    want, got = solve(healthy, want_info), solve(bad, info)
+                    self.assertTrue(torch.equal(got.x[[0, 2]], want.x))
+                    self.assertTrue(torch.equal(got.residual[[0, 2]], want.residual))
+                    self.assertEqual(got.iterations[[0, 2]].tolist(), want.iterations.tolist())
+                    self.assertEqual(info["loop_iterations"], want_info["loop_iterations"])
+                    self.assertLess(got.residual[[0, 2]].max().item(), 1e-12)
+                    self.assertFalse(bool(torch.isfinite(got.residual[1])))
+                    self.assertEqual(info["converged"].tolist(), [True, False, True])
+                    if name == "mixed":
+                        self.assertFalse(info["budget_exhausted"])
+                        self.assertEqual(info["outer"], want_info["outer"])
+        U = links(geo, 3, 103)
+        for precision in ("double", "mixed"):
+            with self.subTest(term=precision):
+                term = FastTwoFlavourWilson(0.13, geo, precision=precision, solver_tol=1e-12)
+                term.refresh(U, torch.Generator().manual_seed(104))
+                term._phi_h[1, 3, 1, 2] = float("nan")
+                with self.assertRaisesRegex(RuntimeError, r"action: CG not converged, relative residual inf .* "
+                                                          r"for sample\(s\) \[1\],"):
+                    term.action(U)
+                self.assertLess(term.stats["last_residual"][[0, 2]].max().item(), 1e-11)
+
     def test_max_iter_is_total_inner_budget(self):
         geo = G44
         op = HalfLatticeWilson(links(geo, 2, 67), kappas(0.12, 0.13), geo)
