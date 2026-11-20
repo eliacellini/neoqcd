@@ -562,21 +562,58 @@ D_bl = D_Ω ⊕ D_Ω* (Dirichlet blocks), and
     det D = det D_Ω · det D_Ω* · det R,   R = P (1 − D_Ω*⁻¹ D_∂Ω* D_Ω⁻¹ D_∂Ω) P   on the boundary set,
     S = φ†(D̂_bl† D̂_bl)⁻¹φ (even-odd in the blocks) + |R⁻¹ φ_R|²,   R⁻¹ψ = P(ψ − D⁻¹ D_∂Ω ψ).
 
-Only the *active* links move in a trajectory: links inside a block with at most one end on the
-block's boundary. Momenta are zero and forces are masked elsewhere. Before every trajectory the
-field is translated: either by a uniform random vector (`translation="random"`, the default) or by
-one random vector followed by `n_regular` block-relative steps (`translation="luscher"`). The
-second option is our reading of appendix C and is not checked against eqs. (C.1)–(C.2). The
-cycle is `DDHMC.cycle` / `ddhmc_step`. Active-link fraction in 4D with cubic blocks b⁴,
-(b−1)(b−2)³/b⁴:
+Only the *active* links move in a trajectory: links with both ends in one block and at most one
+end on the block's interior boundary (sect. 3.3 and fig. 2 of the paper). Momenta are zero and
+forces are masked elsewhere. Active-link fraction in 4D with cubic blocks b⁴, (b−1)(b−2)³/b⁴:
 
-| b | 4 | 6 | 8 | 12 |
-|---|---|---|---|---|
-| active fraction | 0.094 | 0.247 | 0.369 | 0.531 |
+| b | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|
+| active fraction | 0.094 | 0.247 | 0.369 | 0.461 | 0.531 |
 
-2^D blocks have no active links. Over all translations every link is active in exactly this
-fraction of them. A single diagonal step (1,…,1) does not give uniform coverage. The "luscher"
-option therefore runs through all prod(b) block-relative offsets in odometer order.
+These match sect. 3.5 of the paper: "a minority of 25%" for 6⁴ blocks and "greater than 50%"
+from 12⁴ on. A block size 2 in any direction leaves no active link, and `DDHMC` raises.
+
+**Translations** (checked against the paper on 2026-11-20). Once per update cycle the gauge field is
+translated, U(x, μ) → U(x + v, μ) (eq. 3.9). In the code this is `translate(U, v)`, i.e.
+U'(n) = U(n − v) in array indices, because "x + μ" is array index n − 1. The blocks and their
+colours stay fixed, and the pseudofermions are drawn anew in every trajectory, so only the gauge
+field is translated. The paper translates "at the beginning or the end of every update cycle"
+(sect. 3.3) and does it at the end (sect. 3.4 (c)). `DDHMC.cycle` / `ddhmc_step` does it at the
+beginning, which gives the same chain. The antiperiodic twist stays on the t = 0 time links. The
+translation is still an exact symmetry, since moving the twist with the field is the change of
+variables ψ → −ψ on the time slices that wrapped around. The choice of v is `DDHMC(translation=...)`:
+- `"random"` (default): v uniform on the lattice in every cycle. This is valid by eq. (3.9) alone.
+  Appendix C warns that some links are then visited far below average even after hundreds of
+  cycles.
+- `"luscher"`: appendix C. "A purely random choice of v is followed, in the next few update cycles,
+  by translations along a diagonal lattice direction in regular steps." The code takes one uniform
+  random v, then n − 1 cycles translated by v = (b₀, …, b₃)/n with n = ½ min{10, b₀, …, b₃}
+  (eq. C.2), then a new random v. For 8⁴ blocks this is a random v and then three steps (2, 2, 2, 2)
+  (eq. C.1). Each chain has its own random v and the same steps. `n_regular` (default n − 1)
+  overrides n. The paper leaves two choices open, and these are ours. When b_μ/n is not an integer
+  the paper allows "close-by integer vectors"; we take the nearest integer with halves rounded up,
+  the same step in every regular cycle (12⁴ → (2, 2, 2, 2), 16⁴ → (3, 3, 3, 3), the paper's
+  8×6²×12 blocks → n = 3, v = (3, 2, 2, 4)). The paper writes D = 4; for other D we use the same
+  formula over all directions. `luscher_translation_step(b)` returns (n, v).
+- `"odometer"`: ours, not in the paper (this was the code's "luscher" option before 2026-11-20).
+  One random v, then the prod(b) − 1 block-relative offsets in odometer order. Over a period every
+  link is then active in exactly the active fraction of the cycles.
+- `None`: no translation. This is the only option allowed with a defect, and it is not ergodic.
+
+The paper's scheme is balanced only on average. Over a uniform random v every link is active in
+each cycle with probability equal to the active fraction. Within one period, though, some links
+are never active. Per period of n cycles (exact over v; tests):
+
+| cubic blocks | 4⁴ | 6⁴ | 8⁴ | 10⁴ | 12⁴ |
+|---|---|---|---|---|---|
+| n, v | 2, (2,2,2,2) | 3, (2,2,2,2) | 4, (2,2,2,2) | 5, (2,2,2,2) | 5, (2,2,2,2) |
+| links never active in a period | 13/16 | 1/3 | 3/64 = 4.7% | 0 | 0 |
+| variance of the visits (with n random v) | 0.15 (0.17) | 0.34 (0.56) | 0.42 (0.93) | 0.45 (1.24) | 0.56 (1.25) |
+
+No link is missed in a period for cubic blocks from 10⁴ to 20⁴ either. In 2D with 6×6 blocks
+(fig. 9: three grids) every link is active in every period. Over 100 cycles with 8⁴ blocks the
+spread of the visit counts across links is 3.3 against 4.6 with random vectors, and the least
+visited link has 26 visits against 22.
 
 **Naming.** The code's labels are colour-mirrored with respect to the paper. The code takes the
 Schur complement on Ω*, and its "∂Ω*" (`exterior_boundary`) is the set of white sites with a
@@ -598,9 +635,24 @@ repo convention.
 - the Metropolis step: the replayed accept decision, with rejected chains bitwise unchanged;
 - `cycle` / `ddhmc_step`: links stay in SU(N), the translation is applied before the trajectory,
   and the stats keys (with `plaquette`) are present;
-- translation coverage;
-- behind `NEOQCD_SLOW`, DD-HMC against plain HMC and the exact-determinant Metropolis on 2D 8×8,
-  κ = 0.22.
+- translation coverage over all translations, and the `"odometer"` period;
+- behind `NEOQCD_SLOW`, DD-HMC with `"random"` and with `"luscher"` translations against plain HMC
+  and the exact-determinant Metropolis on 2D 8×8, κ = 0.22 (~20 min).
+
+`test_fermions_ddhmc_translation.py` (16 s) checks the translations against the paper:
+- Wilson-operator covariance D[T_s U](σ T_s ψ) = σ T_s(D[U]ψ), with σ = time_sign on the wrapped
+  time slices, on 4⁴ SU(3) and 8×4³ SU(2) for time_sign = ±1. Without σ it fails on every
+  time-shifted chain at time_sign = −1.
+- The dense det D (modulus and phase, built from the links by `exact.py`) and the gauge action
+  are unchanged by time and mixed shifts (4⁴ and 8×4³ SU(2)). The twist is felt: the det differs
+  between ±1.
+- n and v of eqs. (C.1)–(C.2) for a table of block sizes, the active fractions of sect. 3.5, and
+  the refusal of decompositions without active links.
+- The `next_shifts` sequence (random, then (2,2,2,2) three times for 8⁴), and the restart on a new
+  batch size.
+- The per-period visiting distribution against the analytic count (3/64 and 1/3 above).
+- The 100-cycle balance against random vectors.
+- 12 `"luscher"` cycles: ⟨e^{−ΔH}⟩ = 1, and inactive links bitwise equal to the translated input.
 
 **Limits.**
 - The block solves use a global CG on the block operator, not block-local solvers.

@@ -3,7 +3,8 @@
 CPU, complex128, fixed seeds. Stage 1: block geometry. Stage 2: block operators and the exact
 factorisation det D = det D_Omega det D_Omega* det R with dense matrices. Stage 3: the
 pseudofermion terms (stochastic determinant ratios, forces vs finite differences). Stage 4: the
-DD-HMC update. Prints behind NEOQCD_TEST_VERBOSE, slow comparisons behind NEOQCD_SLOW=1.
+DD-HMC update. Prints behind NEOQCD_TEST_VERBOSE, slow comparisons behind NEOQCD_SLOW=1. The
+translations against the paper (eq. 3.9, appendix C) are in test_fermions_ddhmc_translation.py.
 """
 
 import itertools
@@ -647,11 +648,13 @@ class DDHMCUpdateTest(unittest.TestCase):
             cd = self.coverage(bd, diag)
             self.assertFalse(bool((cd == cd.reshape(-1)[0]).all()))
 
-    def test_luscher_translation(self):
-        """translation="luscher": one random vector, then the block-relative offsets; after a full
-        period of prod(b) cycles every link has been active the same number of times."""
+    def test_odometer_translation(self):
+        """translation="odometer" (ours, not the paper's): one random vector, then the
+        block-relative offsets; after a full period of prod(b) cycles every link has been active
+        the same number of times. The paper's scheme ("luscher") is tested in
+        test_fermions_ddhmc_translation.py."""
         B = 3
-        ham, hmc = self.make(translation="luscher")
+        ham, hmc = self.make(translation="odometer")
         self.assertEqual(hmc.n_regular, 15)
         gen = torch.Generator().manual_seed(83)
         period = hmc.n_regular + 1
@@ -674,21 +677,22 @@ class DDHMCUpdateTest(unittest.TestCase):
                 c = self.coverage(self.bd, half)
                 self.assertTrue(bool((c == round(expect)).all()))
         # a shorter period (n_regular = 3) is accepted and restarts after 4 cycles
-        _, h2 = self.make(translation="luscher", n_regular=3)
+        _, h2 = self.make(translation="odometer", n_regular=3)
         seq = [h2.next_shifts(1, gen) for _ in range(5)]
         self.assertEqual([tuple(x[0].tolist()) for x in seq[1:4]], [(1, 0), (1, 0), (1, 0)])
         # the cycle applies the sequence
         U = SUN_identity(G2_8.link_shape(1)[:-1], dtype=torch.cdouble)
-        _, h3 = self.make(translation="luscher")
+        _, h3 = self.make(translation="odometer")
         U1, acc, _, st = h3.cycle(U, gen)
         self.check_cycle_output(U, U1, acc, st)
 
 
 class DDHMCExactComparisonTest(unittest.TestCase):
-    """DD-HMC against the plain N_f = 2 HMC, the exact-determinant Metropolis and quenched HMC,
-    2D 8x8 SU(3), 4x4 blocks, beta = 5.0, kappa = 0.22, B = 32 chains from a cold start (as
-    ExactComparisonTest of test_fermions_hmc_fermions.py, on the smallest 2D lattice with active
-    links). Observables: plaquette and log det(D^dagger D) (exact, dense). Slow: NEOQCD_SLOW=1."""
+    """DD-HMC, with the random and with the paper's ("luscher") translations, against the plain
+    N_f = 2 HMC, the exact-determinant Metropolis and quenched HMC, 2D 8x8 SU(3), 4x4 blocks,
+    beta = 5.0, kappa = 0.22, B = 32 chains from a cold start (as ExactComparisonTest of
+    test_fermions_hmc_fermions.py, on the smallest 2D lattice with active links). Observables:
+    plaquette and log det(D^dagger D) (exact, dense). Slow: NEOQCD_SLOW=1."""
 
     B = 32
     BETA, KAPPA = 5.0, 0.22
@@ -728,11 +732,14 @@ class DDHMCExactComparisonTest(unittest.TestCase):
                 logdet.append(l)
         return self.chain_stats(plaq), self.chain_stats(logdet), m.acceptance
 
-    @unittest.skipUnless(SLOW, "~15 min on one CPU thread: NEOQCD_SLOW=1")
+    @unittest.skipUnless(SLOW, "~20 min on one CPU thread: NEOQCD_SLOW=1")
     def test_kappa_022(self):
         bd = BlockDecomposition(G2_8, 4)
-        dd = DDHMC(G2_8, dd_hamiltonian(bd, self.BETA, self.KAPPA, tol=1e-10), tau=1.0, n_steps=2)
-        (p_d, e_pd), (l_d, e_ld), (x, e_x) = self.run_hmc(dd, True, 30, 120, 300)
+        dd = {}
+        for translation, seed in (("random", 300), ("luscher", 310)):
+            hmc = DDHMC(G2_8, dd_hamiltonian(bd, self.BETA, self.KAPPA, tol=1e-10), tau=1.0, n_steps=2,
+                        translation=translation)
+            dd[translation] = self.run_hmc(hmc, True, 30, 120, seed)
         plain = H.HMC(G2_8, TwoFlavourHamiltonian(self.BETA, self.KAPPA, G2_8, n_gauge_substeps=3), tau=1.0,
                       n_steps=2)
         (p_h, e_ph), (l_h, e_lh), _ = self.run_hmc(plain, False, 15, 60, 500)
@@ -740,20 +747,22 @@ class DDHMCExactComparisonTest(unittest.TestCase):
         (p_q, e_pq), (l_q, e_lq), _ = self.run_hmc(quenched, False, 15, 60, 600)
         (p_m, e_pm), (l_m, e_lm), acc_m = self.run_metropolis(40, 60, 400)
         msg = (f"2D 8x8 SU(3), 4x4 blocks, beta={self.BETA} kappa={self.KAPPA}:\n"
-               f"  <P>       DD-HMC {p_d:.4f}({e_pd:.4f})  HMC {p_h:.4f}({e_ph:.4f})  exact {p_m:.4f}({e_pm:.4f})  "
-               f"quenched {p_q:.4f}({e_pq:.4f})\n"
-               f"  <log det> DD-HMC {l_d:.4f}({e_ld:.4f})  HMC {l_h:.4f}({e_lh:.4f})  exact {l_m:.4f}({e_lm:.4f})  "
-               f"quenched {l_q:.4f}({e_lq:.4f})\n"
-               f"  DD <exp(-dH)> = {x:.4f}({e_x:.4f}); Metropolis acceptance {acc_m:.3f}; "
-               f"|l_dd - l_exact| / |l_exact - l_quenched| = {abs(l_d - l_m) / abs(l_m - l_q):.3f}")
+               f"  <P>       HMC {p_h:.4f}({e_ph:.4f})  exact {p_m:.4f}({e_pm:.4f})  quenched {p_q:.4f}({e_pq:.4f})\n"
+               f"  <log det> HMC {l_h:.4f}({e_lh:.4f})  exact {l_m:.4f}({e_lm:.4f})  quenched {l_q:.4f}({e_lq:.4f})\n"
+               f"  Metropolis acceptance {acc_m:.3f}")
+        for translation, ((p_d, e_pd), (l_d, e_ld), (x, e_x)) in dd.items():
+            msg += (f"\n  DD-HMC ({translation}): <P> {p_d:.4f}({e_pd:.4f})  <log det> {l_d:.4f}({e_ld:.4f})  "
+                    f"<exp(-dH)> = {x:.4f}({e_x:.4f}); "
+                    f"|l_dd - l_exact| / |l_exact - l_quenched| = {abs(l_d - l_m) / abs(l_m - l_q):.3f}")
         say(msg)
-        self.assertLess(abs(x - 1.0), 4 * e_x, msg=msg)
-        for a, ea in ((p_h, e_ph), (p_m, e_pm)):
-            self.assertLess(abs(p_d - a), 4 * math.hypot(e_pd, ea), msg=msg)
-        for a, ea in ((l_h, e_lh), (l_m, e_lm)):
-            self.assertLess(abs(l_d - a), 4 * math.hypot(e_ld, ea), msg=msg)
         self.assertGreater(abs(l_m - l_q), 4 * math.hypot(e_lm, e_lq), msg=msg)
-        self.assertLess(abs(l_d - l_m), 0.3 * abs(l_m - l_q), msg=msg)
+        for (p_d, e_pd), (l_d, e_ld), (x, e_x) in dd.values():
+            self.assertLess(abs(x - 1.0), 4 * e_x, msg=msg)
+            for a, ea in ((p_h, e_ph), (p_m, e_pm)):
+                self.assertLess(abs(p_d - a), 4 * math.hypot(e_pd, ea), msg=msg)
+            for a, ea in ((l_h, e_lh), (l_m, e_lm)):
+                self.assertLess(abs(l_d - a), 4 * math.hypot(e_ld, ea), msg=msg)
+            self.assertLess(abs(l_d - l_m), 0.3 * abs(l_m - l_q), msg=msg)
 
 
 if __name__ == "__main__":

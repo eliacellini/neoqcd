@@ -74,20 +74,45 @@ d D_dOmega = 0 there):
           Two full solves (x and zeta).
     gauge: the Wilson gauge force, masked.
 
-Active links (Luescher, fig. 2): links with both endpoints in the same block and at most one
-endpoint on the block's interior boundary (sites with y_nu in {0, b_nu - 1} for some nu). In
-direction mu the in-block link at local y (y_mu >= 1) joins y and y - e_mu; both are boundary
+Active links (Luescher, sect. 3.3 and fig. 2): links with both endpoints in the same block and at
+most one endpoint on the block's interior boundary (sites with y_nu in {0, b_nu - 1} for some nu).
+In direction mu the in-block link at local y (y_mu >= 1) joins y and y - e_mu; both are boundary
 points iff some transverse y_nu (nu != mu) is in {0, b_nu - 1}, or b_mu = 2. Count per block and
 direction: a_mu = (b_mu - 1) [b_mu > 2] prod_{nu != mu} (b_nu - 2), fraction
-sum_mu a_mu / (D prod b). For b = 8^4: 7 * 6^3 / 8^4 = 0.369; for 2^D blocks there are none.
-Only active links are evolved in a trajectory (momenta zero elsewhere, forces masked); the gauge
-field is translated before every trajectory (eq. 3.9), an exact symmetry of the action (the
-antiperiodic twist can be moved by psi -> -psi on a slab), so that all links are updated on
-average: by a uniform random vector (default) or by one random vector followed by regular
-block-relative steps (`DDHMC(translation="luscher")`). The translation is a symmetry ONLY WITHOUT
-a boundary-condition defect: `DDHMCHamiltonian` takes no plaquette weights, and `DDHMC.cycle`
-raises if the gauge term carries some (`check_translation_invariant`); translation=None is the
-only option with a defect, and then the fixed grid alone is not ergodic.
+sum_mu a_mu / (D prod b). For b = 6^4 it is 0.247 and for 12^4 0.531, the paper's "a minority of
+25%" and "greater than 50%" (sect. 3.5); for 8^4 it is 7 * 6^3 / 8^4 = 0.369. A block size 2 in
+any direction leaves no active link at all (`DDHMC` refuses such a decomposition).
+
+Translations. Only active links are evolved in a trajectory (momenta zero elsewhere, forces
+masked), so the gauge field is translated once per update cycle (eq. 3.9),
+    U(x, mu) -> U(x + v, mu),   i.e. `translate(U, v)`: U'(n) = U(n - v) in array indices,
+since "x + mu" is array index n - 1. The paper allows it "at the beginning or the end of every
+update cycle" (sect. 3.3) and does it at the end (sect. 3.4 (c)); `DDHMC.cycle` does it at the
+beginning, the same Markov chain up to where it starts. The blocks (and their colours) stay
+fixed; the pseudofermions are drawn anew in every trajectory, so nothing else is translated. It is
+an exact symmetry of the action: the antiperiodic twist on the time links at t = 0 is fixed, and
+moving it with the field is the change of variables psi(n) -> -psi(n) on the time slices that
+wrapped around (tests). The vectors v (`DDHMC(translation=...)`, appendix C):
+  "random" (default): v uniform on the lattice in every cycle. Valid (eq. 3.9), but appendix C
+      warns that some links are then visited far below average even after hundreds of cycles.
+  "luscher": appendix C, "a purely random choice of v is followed, in the next few update cycles,
+      by translations along a diagonal lattice direction in regular steps": one uniform random v,
+      then n - 1 cycles translated by v = (b_0, ..., b_{D-1}) / n with
+      n = min{10, b_0, ..., b_{D-1}} / 2 (eq. C.2), then a new random v. For b = 8^4: n = 4, three
+      steps v = (2, 2, 2, 2) (eq. C.1). Our choices where the paper leaves one: when b_mu / n is not
+      an integer the paper allows "close-by integer vectors"; we take the nearest integer, halves
+      rounded up (`luscher_translation_step`), the same step in every regular cycle; the paper
+      writes D = 4, and other D use the same formula over all D directions.
+  "odometer": ours, not in the paper: one random v, then the prod(b) - 1 block-relative offsets
+      (`block_offset`), so that over a period every link is active exactly a_mu / prod(b) of
+      the cycles. The paper's scheme is balanced only on average: in one period of n cycles 4.7%
+      of the links are never active for 8^4 blocks (33% for 6^4, none for cubic blocks 10^4 to
+      20^4), although the visit counts per period vary less than with n random vectors (variance
+      0.42 against 0.93 for 8^4; tests).
+The translation is a symmetry ONLY WITHOUT a boundary-condition defect: `DDHMCHamiltonian` takes
+no plaquette weights, and `DDHMC.cycle` raises if the gauge term carries some
+(`check_translation_invariant`); translation=None is the only option with a defect, and then the
+fixed grid alone is not ergodic.
 """
 
 import math
@@ -103,7 +128,10 @@ from neoqcd.fermions.solver import solve
 
 __all__ = ["BlockDecomposition", "BlockWilsonDirac", "DDOperators", "BlockTwoFlavour", "SchurTwoFlavour",
            "MaskedActionTerm", "DDHMCHamiltonian", "DDHMC", "ddhmc_step", "random_translation", "translate",
-           "random_shifts", "block_offset", "check_translation_invariant"]
+           "random_shifts", "block_offset", "luscher_translation_step", "check_translation_invariant",
+           "TRANSLATIONS"]
+
+TRANSLATIONS = ("random", "luscher", "odometer", None)
 
 
 class BlockDecomposition:
@@ -432,12 +460,30 @@ def random_translation(U, generator=None):
 
 def block_offset(k, block_size):
     """The k-th block-relative offset in mixed-radix (odometer) order, direction 0 fastest:
-    k = 0, ..., prod(b) - 1 enumerates every o with 0 <= o_mu < b_mu exactly once."""
+    k = 0, ..., prod(b) - 1 enumerates every o with 0 <= o_mu < b_mu exactly once
+    (`translation="odometer"`)."""
     o = []
     for b in block_size:
         o.append(k % b)
         k //= b
     return tuple(o)
+
+
+def luscher_translation_step(block_size, n=None):
+    """(n, v) of appendix C of hep-lat/0409106: after a random translation, n - 1 cycles are
+    translated by the regular diagonal step v = (b_0, ..., b_{D-1}) / n (eq. C.2), with
+    n = min{10, b_0, ..., b_{D-1}} / 2 unless `n` is given; b = 8^4 gives n = 4, v = (2, 2, 2, 2)
+    (eq. C.1). When b_mu / n is not an integer v_mu is the nearest integer, halves rounded up (the
+    paper: "or close-by integer vectors"). The block sizes are even (`BlockDecomposition`), so the
+    default n is an integer >= 1; n = 1 (a block size 2) means no regular steps."""
+    b = tuple(int(x) for x in block_size)
+    if not b or any(x < 2 or x % 2 for x in b):
+        raise ValueError(f"block sizes must be even and >= 2, got {b}")
+    n = min(10, *b) // 2 if n is None else int(n)
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    v = tuple((2 * x + n) // (2 * n) for x in b)  # floor(b_mu / n + 1/2)
+    return n, v
 
 
 def check_translation_invariant(hamiltonian):
@@ -456,36 +502,59 @@ class DDHMC(HMC):
     inactive links restored exactly after the reunitarisation. `cycle` = translation + trajectory
     (Luescher's update cycle, eq. 3.9).
 
-    translation:
+    translation (module doc, "Translations"; U'(n) = U(n - v)):
         "random" (default): every cycle translates each chain by an independent vector uniform on
             the lattice.
-        "luscher": one uniform random vector, then `n_regular` cycles in which the field is moved
-            so that its total offset from that random vector runs through the block-relative
-            offsets o(k) = `block_offset(k, block_size)`, k = 1, ..., n_regular; then a new random
-            vector. With n_regular = prod(b) - 1 (the default) a period visits every
-            block-relative offset once, so every link is active in exactly
-            a_mu / prod(b) of the cycles of a period (tests). This is OUR reading of the
-            recommendation of Luescher's appendix C (random shift followed by regular steps);
-            the correspondence with eqs. (C.1), (C.2) of hep-lat/0409106 is UNVERIFIED. Note
-            that a single fixed diagonal step (1, ..., 1) does NOT give uniform coverage (for 4x4
-            blocks in 2D it activates some links twice as often as others), and no single step
-            vector generates all offsets when the b_mu share a factor 2; hence the odometer.
+        "luscher": appendix C of hep-lat/0409106. One uniform random vector, then `n_regular`
+            cycles translated by the regular diagonal step v = b / n, n = n_regular + 1
+            (`luscher_translation_step`), then a new random vector. Default n_regular = n - 1 with
+            n = min{10, b_0, ..., b_{D-1}} / 2 (eq. C.2); for 8^4 blocks a random vector and then
+            three steps (2, 2, 2, 2) (eq. C.1). Every chain takes its own random vector and the
+            same regular steps.
+        "odometer": ours, not in the paper. One uniform random vector, then `n_regular` cycles in
+            which the total offset from it runs through the block-relative offsets
+            o(k) = `block_offset(k, block_size)`, k = 1, ..., n_regular; then a new random vector.
+            With n_regular = prod(b) - 1 (its default) a period visits every block-relative
+            offset once, so every link is active in exactly a_mu / prod(b) of the cycles of a
+            period (tests); the paper's scheme is balanced only on average. A fixed diagonal step
+            (1, ..., 1) would not do this (for 4x4 blocks in 2D it activates some links twice as
+            often as others), and no single step generates all offsets when the b_mu share a
+            factor 2.
         None: no translation (cycle = trajectory); the only option allowed with a defect, and
             then only the active links of the fixed grid move (not ergodic on its own).
-    State of the "luscher" sequence: `self._k` (position in the period), `self._offset` (B, D).
+    n_regular: the regular cycles after each random vector ("luscher" and "odometer"; ignored
+        otherwise). Raises ValueError if the blocks have no active link (a block size 2 in some
+        direction, module doc).
+    State of the "luscher"/"odometer" sequence: `self._k` (position in the period), `self._offset`
+    (B, D) (total offset from the last random vector).
     """
 
     def __init__(self, geometry, hamiltonian, tau, n_steps, translation="random", n_regular=None, **kwargs):
         super().__init__(geometry, hamiltonian, tau, n_steps, **kwargs)
-        if translation not in ("random", "luscher", None):
-            raise ValueError(f"translation must be 'random', 'luscher' or None, got {translation!r}")
+        if translation not in TRANSLATIONS:
+            raise ValueError(f"translation must be one of {TRANSLATIONS}, got {translation!r}")
         self.translation = translation
-        bs = hamiltonian.blocks.block_size
-        self.n_regular = math.prod(bs) - 1 if n_regular is None else int(n_regular)
+        blocks = hamiltonian.blocks
+        if not bool(blocks.active_links.any()):
+            raise ValueError(f"block size {blocks.block_size} has no active links (a block size 2 in some "
+                             "direction freezes every link, fig. 2 of hep-lat/0409106): use blocks >= 4 "
+                             "in every direction")
+        bs = blocks.block_size
+        if translation == "odometer":
+            self.n_regular = math.prod(bs) - 1 if n_regular is None else int(n_regular)
+        else:
+            self.n_regular = luscher_translation_step(bs)[0] - 1 if n_regular is None else int(n_regular)
         if self.n_regular < 0:
             raise ValueError("n_regular must be >= 0")
+        self.luscher_step = luscher_translation_step(bs, self.n_regular + 1)[1]
         self._k = 0
         self._offset = None
+
+    def regular_offset(self, k):
+        """Total offset from the period's random vector after k regular cycles (k >= 1)."""
+        if self.translation == "odometer":
+            return block_offset(k, self.hamiltonian.blocks.block_size)
+        return tuple(k * v for v in self.luscher_step)
 
     def _active(self, U):
         return self.hamiltonian.blocks.link_mask(self.hamiltonian.blocks.active_links, U)
@@ -511,19 +580,19 @@ class DDHMC(HMC):
         return U_new, accepted, dH, stats
 
     def next_shifts(self, B, generator=None, device=None):
-        """(B, D) shifts to apply in the next cycle (advances the "luscher" sequence)."""
+        """(B, D) shifts to apply in the next cycle (advances the "luscher"/"odometer" sequence;
+        a new batch size B restarts it with a random vector)."""
         extents = self.geometry.lattice
         if self.translation == "random":
             return random_shifts(B, extents, generator, device)
         if self.translation is None:
             return torch.zeros(B, len(extents), dtype=torch.long, device=device)
-        bs = self.hamiltonian.blocks.block_size
         if self._k == 0 or self._offset is None or self._offset.shape[0] != B:
             self._k = 0
             shifts = random_shifts(B, extents, generator, device)
             self._offset = torch.zeros(B, len(extents), dtype=torch.long, device=device)
         else:
-            new = torch.tensor(block_offset(self._k, bs), dtype=torch.long, device=device).expand(B, -1)
+            new = torch.tensor(self.regular_offset(self._k), dtype=torch.long, device=device).expand(B, -1)
             shifts = new - self._offset
             self._offset = new.clone()
         self._k = (self._k + 1) % (self.n_regular + 1)
