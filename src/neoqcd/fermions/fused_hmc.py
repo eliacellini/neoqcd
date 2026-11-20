@@ -46,18 +46,28 @@ import warnings
 import torch
 
 from neoqcd.fermions import fused as _fused
-from neoqcd.fermions.hmc import WilsonGaugeAction
+from neoqcd.fermions._gauge import C1_SERIES, N_SERIES, XI_SERIES, XI_TAYLOR, SUN_mul
+from neoqcd.fermions.algebra import expi
+from neoqcd.fermions.fused import FusedTwoFlavourWilson
+from neoqcd.fermions.hmc import HMC, OMELYAN_LAMBDA, Hamiltonian, WilsonGaugeAction, _MDState
 
 __all__ = [
     "MD_KERNEL_SOURCE",
     "MD_TARGETS",
+    "MD_COMPONENTS",
+    "parse_md_kernels",
+    "FusedMDHamiltonian",
     "md_backend_status",
     "load_md_backend",
     "gauge_force",
+    "md_update",
     "FusedWilsonGaugeAction",
+    "FusedHMC",
 ]
 
 MD_TARGETS = ("cuda", "cpu")
+# the components that can run through the kernels (main_hmc.py --md-kernels)
+MD_COMPONENTS = ("gauge_force", "update")
 _SUPPORTED_D = (2, 4)
 _SUPPORTED_N = (2, 3)
 _MAX_D = 4
@@ -145,6 +155,151 @@ MD_HD int64_t md_bwd(int64_t site, int mu, const int64_t* extent, const int64_t*
     return c == extent[mu] - 1 ? site - (extent[mu] - 1) * stride[mu] : site + stride[mu];
 }
 
+// ---- exp(i Q) of hermitian traceless Q (algebra.expi, method "auto") ----------------------------
+// SU(3): exp(iQ) = f0 + f1 Q + f2 Q^2 with the coefficients of smearing_jacobian.exp_coefficients:
+// below c1 = Tr(Q^2)/2 = MD_C1_SERIES the Taylor series truncated after MD_N_SERIES terms, summed by
+// the recursion of smearing_jacobian.series_polynomials, Q^n = a_n + b_n Q + c_n Q^2,
+// (a, b, c)_{n+1} = (c0 c_n, a_n + c1 c_n, b_n), as s = (a, b, c)_n / n!; above, the closed forms of
+// Morningstar and Peardon (smearing_jacobian.mp_coefficients, f only) at |c0|, then
+// f_j(-c0) = (-1)^j f_j(c0)^*; xi0 = sin(w)/w from its Taylor series (XI_TAYLOR) below |w| = MD_XI_SERIES.
+#define MD_C1_SERIES @C1_SERIES@
+#define MD_N_SERIES @N_SERIES@
+#define MD_XI_SERIES @XI_SERIES@
+
+template <typename T>
+MD_HD void md_su3_coefficients(T c0, T c1, MdC<T> f[3]) {
+    if (c1 < (T)MD_C1_SERIES) {
+        T s0 = 1, s1 = 0, s2 = 0;
+        T fr[3] = {0, 0, 0}, fi[3] = {0, 0, 0};
+        for (int n = 0; n < MD_N_SERIES; ++n) {
+            const T sg = n % 4 < 2 ? (T)1 : (T)-1;  // i^n: real for even n, imaginary for odd n
+            if (n % 2 == 0) { fr[0] += sg * s0; fr[1] += sg * s1; fr[2] += sg * s2; }
+            else { fi[0] += sg * s0; fi[1] += sg * s1; fi[2] += sg * s2; }
+            const T inv = (T)1 / (T)(n + 1);
+            const T t0 = (c0 * s2) * inv, t1 = (s0 + c1 * s2) * inv, t2 = s1 * inv;
+            s0 = t0; s1 = t1; s2 = t2;
+        }
+        MD_UNROLL
+        for (int j = 0; j < 3; ++j) f[j] = c_make<T>(fr[j], fi[j]);
+        return;
+    }
+    typedef MdC<T> C;
+    const bool neg = c0 < 0;
+    const T c0max = (T)2 * pow(c1 / (T)3, (T)1.5);
+    const T ratio_max = (T)1 - (T)2.220446049250313e-16;  // 1 - torch.finfo(torch.float64).eps
+    T ratio = fabs(c0) / c0max;
+    if (ratio > ratio_max) ratio = ratio_max;
+    const T theta = acos(ratio);
+    const T u = sqrt(c1 / (T)3) * cos(theta / (T)3);
+    const T w = sqrt(c1) * sin(theta / (T)3);
+    const T u2 = u * u, w2 = w * w;
+    const T xi0 = fabs(w) < (T)MD_XI_SERIES ? @XI0@ : sin(w) / w;
+    const T cw = cos(w);
+    const C eu = c_make<T>(cos(u), sin(u));
+    const C e2u = c_mul(eu, eu), emu = c_conj(eu);
+    C h[3];
+    // (u2 - w2) e2u + emu (8 u2 cw + 2 i u (3 u2 + w2) xi0)
+    h[0] = c_add(c_scale(u2 - w2, e2u), c_mul(emu, c_make<T>((T)8 * u2 * cw, (T)2 * u * ((T)3 * u2 + w2) * xi0)));
+    // 2 u e2u - emu (2 u cw - i (3 u2 - w2) xi0)
+    h[1] = c_sub(c_scale((T)2 * u, e2u), c_mul(emu, c_make<T>((T)2 * u * cw, -((T)3 * u2 - w2) * xi0)));
+    // e2u - emu (cw + 3 i u xi0)
+    h[2] = c_sub(e2u, c_mul(emu, c_make<T>(cw, (T)3 * u * xi0)));
+    const T den = (T)9 * u2 - w2;
+    MD_UNROLL
+    for (int j = 0; j < 3; ++j) {
+        C fj = c_make<T>(h[j].re / den, h[j].im / den);
+        if (neg) fj = c_scale(j == 1 ? (T)-1 : (T)1, c_conj(fj));
+        f[j] = fj;
+    }
+}
+
+// X = exp(i Q) for N = 3 (Cayley-Hamilton) or N = 2 (closed form cos q + i sin(q)/q Q, q^2 = Tr(Q^2)/2)
+template <typename T, int N>
+MD_HD void md_expi(MdC<T>* X, const MdC<T>* Q) {
+    typedef MdC<T> C;
+    if (N == 3) {
+        C Q2[9];
+        m_mul<T, 3, false, false>(Q2, Q, Q);
+        const T c1 = (T)0.5 * ((Q2[0].re + Q2[4].re) + Q2[8].re);
+        T c0 = 0;  // Re Tr(Q Q^2) / 3
+        MD_UNROLL
+        for (int i = 0; i < 3; ++i) {
+            MD_UNROLL
+            for (int j = 0; j < 3; ++j) c0 += Q[3 * i + j].re * Q2[3 * j + i].re - Q[3 * i + j].im * Q2[3 * j + i].im;
+        }
+        C f[3];
+        md_su3_coefficients<T>(c0 / (T)3, c1, f);
+        MD_UNROLL
+        for (int e = 0; e < 9; ++e) {
+            const C x = c_mul(f[1], Q[e]);
+            X[e] = c_add(e % 4 == 0 ? c_add(f[0], x) : x, c_mul(f[2], Q2[e]));
+        }
+    } else {
+        T q2 = 0;  // Re Tr(Q Q) / 2
+        MD_UNROLL
+        for (int i = 0; i < N; ++i) {
+            MD_UNROLL
+            for (int j = 0; j < N; ++j) q2 += Q[N * i + j].re * Q[N * j + i].re - Q[N * i + j].im * Q[N * j + i].im;
+        }
+        q2 *= (T)0.5;
+        const T q = q2 > 0 ? sqrt(q2) : (T)0;
+        const T cq = cos(q), sq = q > 0 ? sin(q) / q : (T)1;
+        MD_UNROLL
+        for (int e = 0; e < N * N; ++e) {
+            const C iq = c_make<T>(-(sq * Q[e].im), sq * Q[e].re);  // i (sin(q)/q) Q
+            X[e] = e % (N + 1) == 0 ? c_add(c_make<T>(cq, 0), iq) : iq;
+        }
+    }
+}
+
+// U' = exp(i h P) U for one link
+template <typename T, int N>
+MD_HD void md_move_link(MdC<T>* Uout, const MdC<T>* P, const MdC<T>* U, T h) {
+    MdC<T> Q[N * N], X[N * N], L[N * N];
+    MD_UNROLL
+    for (int e = 0; e < N * N; ++e) Q[e] = c_scale(h, P[e]);
+    md_expi<T, N>(X, Q);
+    m_load<T, N>(L, U);
+    MdC<T> out[N * N];
+    m_mul<T, N, false, false>(out, X, L);
+    m_store<T, N>(Uout, out);
+}
+
+// ---- link and momentum update ----------------------------------------------------------------------
+// Arguments of nq_md_update (_UpdateArgs): per link, P' = P - coef F (with F) and U' = exp(i h P') U
+// (with U); P' = P without F.
+struct NqUpdateArgs {
+    const void* U;            // NULL (no move) or (n, N, N) complex links
+    const void* P;            // (n, N, N) complex momenta
+    const void* F;            // NULL (no kick) or (n, N, N) complex force
+    void* P_out;              // with F: (n, N, N) P - coef F
+    void* U_out;              // with U: (n, N, N) exp(i h P') U
+    void* reserved_ptr;
+    double coef, h;
+    int64_t n;                // links
+    int32_t N, dtype, device, reserved;
+};
+
+template <typename T, int N, bool KICK, bool MOVE>
+MD_HD void md_update_link(const NqUpdateArgs& a, int64_t tid) {
+    typedef MdC<T> C;
+    constexpr int NN = N * N;
+    const C* P = static_cast<const C*>(a.P) + tid * NN;
+    C Pn[NN];
+    if (KICK) {
+        const C* Fp = static_cast<const C*>(a.F) + tid * NN;
+        C* Po = static_cast<C*>(a.P_out) + tid * NN;
+        MD_UNROLL
+        for (int e = 0; e < NN; ++e) {
+            Pn[e] = c_sub(P[e], c_scale((T)a.coef, Fp[e]));
+            Po[e] = Pn[e];
+        }
+    } else {
+        m_load<T, N>(Pn, P);
+    }
+    if (MOVE) md_move_link<T, N>(static_cast<C*>(a.U_out) + tid * NN, Pn, static_cast<const C*>(a.U) + tid * NN, (T)a.h);
+}
+
 // ---- gauge force ----------------------------------------------------------------------------------
 // Arguments of nq_gauge_force (mirrored by the ctypes structure _GaugeArgs in fused_hmc.py; the host
 // checks sizeof through nq_gauge_args_size()).
@@ -154,16 +309,16 @@ struct NqGaugeArgs {
     const void* beta;         // (B or 1,) real
     const void* mom;          // NULL (write F) or (B, D, V, N, N) complex momenta: write P - coef F
     void* out;                // (B, D, V, N, N) complex
-    void* reserved_ptr;
+    void* links_out;          // NULL, or (with mom) (B, D, V, N, N): exp(i h (P - coef F)) U (kick + move)
     double coef;              // kick coefficient (with mom)
-    double reserved;
+    double h;                 // move step (with links_out)
     int64_t batch, volume;
     int64_t extent[MD_MAX_D], stride[MD_MAX_D];
     int64_t weights_bstride, beta_bstride;  // per-sample strides in real elements (0: shared)
     int32_t D, N, dtype, device;
 };
 
-template <typename T, int D, int N, bool WEIGHTED, bool KICK>
+template <typename T, int D, int N, bool WEIGHTED, bool KICK, bool MOVE>
 MD_HD void md_gauge_link(const NqGaugeArgs& a, int64_t tid) {
     typedef MdC<T> C;
     constexpr int NN = N * N;
@@ -220,41 +375,54 @@ MD_HD void md_gauge_link(const NqGaugeArgs& a, int64_t tid) {
     for (int e = 0; e < NN; ++e) {
         const C z = (e % (N + 1) == 0) ? c_sub(t2[e], trN) : t2[e];
         const C f = c_make<T>(s * z.im, -(s * z.re));  // (-i s) z
-        out[e] = KICK ? c_sub(P[e], c_scale((T)a.coef, f)) : f;
+        t1[e] = KICK ? c_sub(P[e], c_scale((T)a.coef, f)) : f;
+        out[e] = t1[e];
     }
+    if (MOVE) md_move_link<T, N>(static_cast<C*>(a.links_out) + tid * NN, t1, Ub + ((int64_t)mu * V + x) * NN, (T)a.h);
 }
 
 // ---- launch helpers (CUDA kernel, or a host loop over the same thread index) ---------------------
+// One generic launcher: FN is a functor class with a static `run(args, tid)`; one thread per index
+// tid < total (the host build loops over the same index).
 #ifdef __CUDACC__
-template <typename T, int D, int N, bool WEIGHTED, bool KICK>
-__global__ void md_gauge_kernel(const MD_GRID_CONSTANT NqGaugeArgs a, int64_t total) {
+template <typename FN, typename ARGS>
+__global__ void md_kernel(const MD_GRID_CONSTANT ARGS a, int64_t total) {
     const int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < total) md_gauge_link<T, D, N, WEIGHTED, KICK>(a, tid);
+    if (tid < total) FN::run(a, tid);
 }
 
-template <typename T, int D, int N, bool WEIGHTED, bool KICK>
-static int md_gauge_launch(const NqGaugeArgs& a, void* stream) {
-    const int64_t total = a.batch * (int64_t)D * a.volume;
+template <typename FN, typename ARGS>
+static int md_launch(const ARGS& a, int64_t total, void* stream) {
     if (total == 0) return 0;
     const int64_t blocks = (total + MD_THREADS - 1) / MD_THREADS;
-    md_gauge_kernel<T, D, N, WEIGHTED, KICK><<<(unsigned)blocks, MD_THREADS, 0, (cudaStream_t)stream>>>(a, total);
+    md_kernel<FN, ARGS><<<(unsigned)blocks, MD_THREADS, 0, (cudaStream_t)stream>>>(a, total);
     return (int)cudaGetLastError();
 }
 #else
-template <typename T, int D, int N, bool WEIGHTED, bool KICK>
-static int md_gauge_launch(const NqGaugeArgs& a, void* stream) {
+template <typename FN, typename ARGS>
+static int md_launch(const ARGS& a, int64_t total, void* stream) {
     (void)stream;
-    const int64_t total = a.batch * (int64_t)D * a.volume;
-    for (int64_t tid = 0; tid < total; ++tid) md_gauge_link<T, D, N, WEIGHTED, KICK>(a, tid);
+    for (int64_t tid = 0; tid < total; ++tid) FN::run(a, tid);
     return 0;
 }
 #endif
 
+template <typename T, int D, int N, bool WEIGHTED, bool KICK, bool MOVE> struct MdGaugeFn {
+    static MD_HD void run(const NqGaugeArgs& a, int64_t tid) { md_gauge_link<T, D, N, WEIGHTED, KICK, MOVE>(a, tid); }
+};
+
+template <typename T, int D, int N, bool WEIGHTED>
+static int md_gauge_kick(const NqGaugeArgs& a, void* stream) {
+    const int64_t total = a.batch * (int64_t)D * a.volume;
+    if (a.mom == 0) return md_launch<MdGaugeFn<T, D, N, WEIGHTED, false, false> >(a, total, stream);
+    if (a.links_out == 0) return md_launch<MdGaugeFn<T, D, N, WEIGHTED, true, false> >(a, total, stream);
+    return md_launch<MdGaugeFn<T, D, N, WEIGHTED, true, true> >(a, total, stream);
+}
+
 template <typename T, int D, int N>
 static int md_gauge_modes(const NqGaugeArgs& a, void* stream) {
-    const bool weighted = a.weights != 0, kick = a.mom != 0;
-    if (weighted) return kick ? md_gauge_launch<T, D, N, true, true>(a, stream) : md_gauge_launch<T, D, N, true, false>(a, stream);
-    return kick ? md_gauge_launch<T, D, N, false, true>(a, stream) : md_gauge_launch<T, D, N, false, false>(a, stream);
+    if (a.links_out != 0 && a.mom == 0) return -1;  // the move needs the kick
+    return a.weights != 0 ? md_gauge_kick<T, D, N, true>(a, stream) : md_gauge_kick<T, D, N, false>(a, stream);
 }
 
 static int md_gauge_dispatch(const NqGaugeArgs& a, void* stream) {
@@ -262,6 +430,28 @@ static int md_gauge_dispatch(const NqGaugeArgs& a, void* stream) {
 #define MD_CASE(DD, NN) if (a.D == DD && a.N == NN) return md_gauge_modes<double, DD, NN>(a, stream);
     MD_CASE(4, 3) MD_CASE(4, 2) MD_CASE(2, 3) MD_CASE(2, 2)
 #undef MD_CASE
+    return -1;
+}
+
+template <typename T, int N, bool KICK, bool MOVE> struct MdUpdateFn {
+    static MD_HD void run(const NqUpdateArgs& a, int64_t tid) { md_update_link<T, N, KICK, MOVE>(a, tid); }
+};
+
+template <typename T, int N>
+static int md_update_modes(const NqUpdateArgs& a, void* stream) {
+    const bool kick = a.F != 0, move = a.U != 0;
+    if (kick && (a.P_out == 0)) return -1;
+    if (move && (a.U_out == 0)) return -1;
+    if (kick && move) return md_launch<MdUpdateFn<T, N, true, true> >(a, a.n, stream);
+    if (kick) return md_launch<MdUpdateFn<T, N, true, false> >(a, a.n, stream);
+    if (move) return md_launch<MdUpdateFn<T, N, false, true> >(a, a.n, stream);
+    return 0;
+}
+
+static int md_update_dispatch(const NqUpdateArgs& a, void* stream) {
+    if (a.dtype != 0) return -1;  // complex128 only
+    if (a.N == 3) return md_update_modes<double, 3>(a, stream);
+    if (a.N == 2) return md_update_modes<double, 2>(a, stream);
     return -1;
 }
 
@@ -293,8 +483,17 @@ int nq_md_is_cuda(void) {
 }
 
 int nq_gauge_args_size(void) { return (int)sizeof(NqGaugeArgs); }
+int nq_update_args_size(void) { return (int)sizeof(NqUpdateArgs); }
 
-// Returns 0 on success, -1 for an unsupported (dtype, D, N), a cudaError_t code otherwise.
+int nq_md_update(const NqUpdateArgs* a, void* stream) {
+    MD_DEVICE_GUARD_BEGIN(a->device)
+    int code = md_update_dispatch(*a, stream);
+    MD_DEVICE_GUARD_END(code)
+    return code;
+}
+
+// Every entry point returns 0 on success, -1 for an unsupported (dtype, D, N) or argument
+// combination, a cudaError_t code otherwise.
 int nq_gauge_force(const NqGaugeArgs* a, void* stream) {
     MD_DEVICE_GUARD_BEGIN(a->device)
     int code = md_gauge_dispatch(*a, stream);
@@ -303,7 +502,7 @@ int nq_gauge_force(const NqGaugeArgs* a, void* stream) {
 }
 
 const char* nq_md_error_string(int code) {
-    if (code == -1) return "unsupported (dtype, D, N)";
+    if (code == -1) return "unsupported (dtype, D, N) or argument combination";
 #ifdef __CUDACC__
     return cudaGetErrorString((cudaError_t)code);
 #else
@@ -314,6 +513,20 @@ const char* nq_md_error_string(int code) {
 """
 
 
+def _horner(coefficients, x):
+    """C expression of sum_n coefficients[n] x^n by Horner's rule, the coefficients exact (%.17g)."""
+    expr = f"(T){coefficients[-1]:.17g}"
+    for c in coefficients[-2::-1]:
+        expr = f"({expr} * {x} + (T){c:.17g})"
+    return expr
+
+
+MD_KERNEL_SOURCE = (MD_KERNEL_SOURCE.replace("@C1_SERIES@", repr(float(C1_SERIES)))
+                    .replace("@N_SERIES@", str(int(N_SERIES)))
+                    .replace("@XI_SERIES@", repr(float(XI_SERIES)))
+                    .replace("@XI0@", _horner(XI_TAYLOR[0], "w2")))
+
+
 # ---- ctypes mirrors of the argument structures -------------------------------------------------
 class _GaugeArgs(ctypes.Structure):
     _fields_ = [
@@ -322,9 +535,9 @@ class _GaugeArgs(ctypes.Structure):
         ("beta", ctypes.c_void_p),
         ("mom", ctypes.c_void_p),
         ("out", ctypes.c_void_p),
-        ("reserved_ptr", ctypes.c_void_p),
+        ("links_out", ctypes.c_void_p),
         ("coef", ctypes.c_double),
-        ("reserved", ctypes.c_double),
+        ("h", ctypes.c_double),
         ("batch", ctypes.c_int64),
         ("volume", ctypes.c_int64),
         ("extent", ctypes.c_int64 * _MAX_D),
@@ -338,9 +551,28 @@ class _GaugeArgs(ctypes.Structure):
     ]
 
 
+class _UpdateArgs(ctypes.Structure):
+    _fields_ = [
+        ("U", ctypes.c_void_p),
+        ("P", ctypes.c_void_p),
+        ("F", ctypes.c_void_p),
+        ("P_out", ctypes.c_void_p),
+        ("U_out", ctypes.c_void_p),
+        ("reserved_ptr", ctypes.c_void_p),
+        ("coef", ctypes.c_double),
+        ("h", ctypes.c_double),
+        ("n", ctypes.c_int64),
+        ("N", ctypes.c_int32),
+        ("dtype", ctypes.c_int32),
+        ("device", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
+    ]
+
+
 _ENTRY_POINTS = (
     # (function, argument structure, size function)
     ("nq_gauge_force", _GaugeArgs, "nq_gauge_args_size"),
+    ("nq_md_update", _UpdateArgs, "nq_update_args_size"),
 )
 
 
@@ -481,9 +713,10 @@ def plaquette_weight_tensor(weights, geometry, B, device):
     return torch.stack([w.expand(BW, V) for w in fields], dim=1).contiguous()
 
 
-def gauge_force(U, beta, geometry, weights=None, mom=None, coef=0.0, backend=None):
+def gauge_force(U, beta, geometry, weights=None, mom=None, coef=0.0, h=None, backend=None):
     """The force of `WilsonGaugeAction` (beta, plaquette weights as a `plaquette_weight_tensor`) through
-    the kernel; with `mom`, the kicked momenta mom - coef F instead (F never stored). U complex128
+    the kernel; with `mom`, the kicked momenta mom - coef F instead (F never stored); with `mom` and
+    `h`, the pair (mom - coef F, exp(i h (mom - coef F)) U) (kick and move in one pass). U complex128
     (B, D, lattice, N, N) on the device of `backend` (default: the library of U's device)."""
     _refuse_autograd("gauge_force", U=U, mom=mom)
     reason = kernel_supports(geometry, U.dtype)
@@ -514,11 +747,52 @@ def gauge_force(U, beta, geometry, weights=None, mom=None, coef=0.0, backend=Non
         a.coef = float(coef)
     out = torch.empty_like(U, memory_format=torch.contiguous_format)
     a.out = out.data_ptr()
+    links_out = None
+    if h is not None:
+        if mom is None:
+            raise ValueError("the fused move (h) needs the kick (mom)")
+        links_out = torch.empty_like(U, memory_format=torch.contiguous_format)
+        a.links_out = links_out.data_ptr()
+        a.h = float(h)
     a.batch, a.volume = B, geometry.volume
     _lattice_args(a, geometry)
     a.D, a.N, a.dtype, a.device = geometry.D, geometry.N, 0, _device_index(dev)
     _launch(backend, "nq_gauge_force", a, dev)
-    return out
+    return out if links_out is None else (out, links_out)
+
+
+def md_update(P, U=None, F=None, coef=0.0, h=None, backend=None):
+    """Link and momentum update through the kernel, per link: P' = P - coef F (with F, else P' = P)
+    and U' = exp(i h P') U (with U and h; `algebra.expi` "auto": Cayley-Hamilton for SU(3) with the
+    coefficients of exp_coefficients, closed form for SU(2)). Returns (P' or None without F,
+    U' or None without U). Tensors (..., N, N) of one shape, complex128, one device."""
+    _refuse_autograd("md_update", P=P, U=U, F=F)
+    N = P.shape[-1]
+    if P.dtype != torch.complex128 or N not in _SUPPORTED_N or P.shape[-2] != N:
+        raise ValueError(f"md_update: complex128 (..., N, N) with N in {_SUPPORTED_N}, got {P.dtype} {tuple(P.shape)}")
+    for name, t in (("U", U), ("F", F)):
+        if t is not None and (t.shape != P.shape or t.dtype != P.dtype or t.device != P.device):
+            raise ValueError(f"md_update: {name} must have the shape, dtype and device of P")
+    if (U is None) != (h is None):
+        raise ValueError("md_update: the move needs both U and h")
+    dev = P.device
+    backend = load_md_backend(_target_of(dev), dev) if backend is None else backend
+    P = _raw(P)
+    a = _UpdateArgs()
+    a.P = P.data_ptr()
+    a.n = P.numel() // (N * N)
+    a.N, a.dtype, a.device = N, 0, _device_index(dev)
+    P_out = U_out = None
+    if F is not None:
+        F = _raw(F)
+        P_out = torch.empty_like(P)
+        a.F, a.P_out, a.coef = F.data_ptr(), P_out.data_ptr(), float(coef)
+    if U is not None:
+        U = _raw(U)
+        U_out = torch.empty_like(U)
+        a.U, a.U_out, a.h = U.data_ptr(), U_out.data_ptr(), float(h)
+    _launch(backend, "nq_md_update", a, dev)
+    return P_out, U_out
 
 
 class _KernelChoice:
@@ -620,3 +894,195 @@ class FusedWilsonGaugeAction(WilsonGaugeAction):
         self._choice.last_used = backend.target
         return gauge_force(U, self.beta, self.geometry, self._packed_weights(U), mom=P, coef=coefficient,
                            backend=backend)
+
+    def force_kick_move(self, U, P, coefficient, h):
+        """(P', exp(i h P') U) with P' = P - coefficient * force(U), in one kernel pass; None when the
+        kernel does not run here (the caller then kicks and moves separately)."""
+        backend = self._backend(U)
+        if backend is None or not (P.dtype == U.dtype and P.shape == U.shape and P.device == U.device):
+            return None
+        self._choice.last_used = backend.target
+        return gauge_force(U, self.beta, self.geometry, self._packed_weights(U), mom=P, coef=coefficient, h=h,
+                           backend=backend)
+
+
+# ---- integrator ------------------------------------------------------------------------------------
+def _default_exp(method, N):
+    """True if `algebra.expi(Q, method)` is the exponential of the update kernel for SU(N)."""
+    return method == "auto" or (method, N) in (("closed", 2), ("cayley_hamilton", 3))
+
+
+class _FusedMDState(_MDState):
+    """`hmc._MDState` with the momentum kicks and the position updates through the kernels.
+
+    Same lazy kicks and the same sequence of updates as the parent (level 0 first at a flush). A
+    level whose only term has `force_kick` (the fused gauge or fermion force) kicks in one pass;
+    other levels compute F with `level_force` and kick through the update kernel. At a move, the
+    last pending level is kicked together with the move: in the force kernel when its term has
+    `force_kick_move` (the gauge force: F, the kick and exp(i h P) U in one pass), else by the
+    update kernel (kick + move in one pass). New tensors are written every time (no in-place
+    update of P or U: the trajectory keeps its initial P and U, and the operator caches keyed on
+    U's identity see a new tensor). `counts` records which path every kick and move took.
+    """
+
+    def __init__(self, hamiltonian, U, P, exp_method, update_backend, fuse_force_kicks=True):
+        super().__init__(hamiltonian, U, P, exp_method)
+        self.backend = update_backend
+        self.fuse_force_kicks = bool(fuse_force_kicks)
+        self.counts = {"kick_fused": 0, "kick_kernel": 0, "kick_torch": 0, "move_fused": 0, "move_kernel": 0,
+                       "move_torch": 0}
+
+    def _single_term(self, level):
+        terms = self.hamiltonian.levels[level][0]
+        return terms[0] if len(terms) == 1 and self.fuse_force_kicks else None
+
+    def _kick(self, level, c):
+        term = self._single_term(level)
+        if term is not None and hasattr(term, "force_kick"):
+            self.P = term.force_kick(self.U, self.P, c)
+            self.counts["kick_fused"] += 1
+        else:
+            F = self.hamiltonian.level_force(self.U, level)
+            if self.backend is not None and F.dtype == self.P.dtype and F.shape == self.P.shape:
+                self.P = md_update(self.P, F=F, coef=c, backend=self.backend)[0]
+                self.counts["kick_kernel"] += 1
+            else:
+                self.P = self.P - c * F
+                self.counts["kick_torch"] += 1
+        self.force_evals[level] += 1
+        self.pending[level] = 0.0
+
+    def flush(self):
+        for level, c in enumerate(self.pending):
+            if c != 0.0:
+                self._kick(level, c)
+
+    def move(self, h):
+        pending = [level for level, c in enumerate(self.pending) if c != 0.0]
+        for level in pending[:-1]:
+            self._kick(level, self.pending[level])
+        if self.backend is None or not _default_exp(self.exp_method, self.U.shape[-1]):
+            self.flush()
+            self.U = SUN_mul(expi(h * self.P, self.exp_method), self.U)
+            self.counts["move_torch"] += 1
+            return
+        if pending:
+            level = pending[-1]
+            c = self.pending[level]
+            term = self._single_term(level)
+            if term is not None and hasattr(term, "force_kick_move"):
+                done = term.force_kick_move(self.U, self.P, c, h)
+                if done is not None:
+                    self.P, self.U = done
+                    self.force_evals[level] += 1
+                    self.pending[level] = 0.0
+                    self.counts["kick_fused"] += 1
+                    self.counts["move_fused"] += 1
+                    return
+            if term is not None and hasattr(term, "force_kick"):
+                self._kick(level, c)
+            else:
+                F = self.hamiltonian.level_force(self.U, level)
+                self.P, self.U = md_update(self.P, U=self.U, F=F, coef=c, h=h, backend=self.backend)
+                self.force_evals[level] += 1
+                self.pending[level] = 0.0
+                self.counts["kick_kernel"] += 1
+                self.counts["move_kernel"] += 1
+                return
+        self.U = md_update(self.P, U=self.U, h=h, backend=self.backend)[1]
+        self.counts["move_kernel"] += 1
+
+
+class FusedHMC(HMC):
+    """`hmc.HMC` whose molecular dynamics runs the kicks and the position updates through the update
+    kernel (and the fused force kicks of the terms that have them): `_FusedMDState`.
+
+    Extra args: `target` "cuda", "cpu" (host build) or None (the parent's integrator exactly),
+    `strict` (raise BackendUnavailable instead of the torch updates when the kernel cannot run for
+    the links: device, dtype, N), `fuse_force_kicks` (default True: use the terms' `force_kick` /
+    `force_kick_move`; False: every level's force is computed and kicked by the update kernel).
+    The update kernel runs for exp_method "auto" (and the SU(N)-specific method it means); any other
+    method runs the torch updates. Metropolis, refresh, energies and the final reunitarisation are
+    the parent's. `last_counts` holds the paths of the last trajectory's kicks and moves.
+    """
+
+    def __init__(self, geometry, hamiltonian, tau, n_steps, integrator="omelyan", exp_method="auto",
+                 omelyan_lambda=OMELYAN_LAMBDA, target=None, strict=False, fuse_force_kicks=True):
+        super().__init__(geometry, hamiltonian, tau, n_steps, integrator=integrator, exp_method=exp_method,
+                         omelyan_lambda=omelyan_lambda)
+        self._choice = _KernelChoice(target, strict, "link and momentum update")
+        self.fuse_force_kicks = bool(fuse_force_kicks)
+        self.last_counts = None
+
+    @property
+    def kernel_used(self):
+        return self._choice.last_used
+
+    @torch.no_grad()
+    def integrate(self, U, P, tau=None, n_steps=None):
+        """As `HMC.integrate`, with `_FusedMDState` (the parent's own integrator when target is None)."""
+        if self._choice.target is None:
+            self._choice.last_used = "torch"
+            return super().integrate(U, P, tau, n_steps)
+        backend = self._choice.backend(U.device, self.geometry, U.dtype)
+        self._choice.last_used = "torch" if backend is None else backend.target
+        tau = self.tau if tau is None else float(tau)
+        n = (self.n_steps if n_steps is None else int(n_steps)) * self.hamiltonian.levels[0][1]
+        state = _FusedMDState(self.hamiltonian, U, P, self.exp_method, backend, self.fuse_force_kicks)
+        h = tau / n
+        for _ in range(n):
+            self._step(state, 0, h)
+        state.flush()
+        self.last_counts = dict(state.counts)
+        return state.U, state.P, state.force_evals
+
+
+# ---- Hamiltonian ----------------------------------------------------------------------------------
+def parse_md_kernels(spec):
+    """--md-kernels value -> sorted tuple of MD_COMPONENTS: "none" (or "", None) is (), "all" every
+    component, else a comma-separated list (ValueError on an unknown name)."""
+    if spec is None:
+        return ()
+    if isinstance(spec, (list, tuple, set, frozenset)):
+        names = [str(x).strip() for x in spec]
+    else:
+        names = [x.strip() for x in str(spec).split(",")]
+    names = [x for x in names if x and x != "none"]
+    if "all" in names:
+        if len(names) > 1:
+            raise ValueError(f"md kernels: 'all' combined with {names}")
+        return tuple(MD_COMPONENTS)
+    bad = [x for x in names if x not in MD_COMPONENTS]
+    if bad:
+        raise ValueError(f"md kernels: unknown component(s) {bad}; choose from {MD_COMPONENTS}, 'all' or 'none'")
+    return tuple(sorted(set(names), key=MD_COMPONENTS.index))
+
+
+class FusedMDHamiltonian(Hamiltonian):
+    """`fused.FusedTwoFlavourHamiltonian` (fused hop) with the MD kernels of `md_kernels`.
+
+    Levels as there: the fermion term outside, the gauge term inside with `n_gauge_substeps`.
+    `md_kernels`: components of MD_COMPONENTS (`parse_md_kernels`) run through the compiled target
+    `md_target` ("cuda" or "cpu"; None: none of them) with `md_strict`; "gauge_force" makes the
+    gauge term a `FusedWilsonGaugeAction`. The "update" component is the integrator's
+    (`FusedHMC(target=...)`, `md_hmc_target(ham)`). Other keyword arguments go to
+    `FusedTwoFlavourWilson` (kernel, link_layout, strict, solver settings, ...).
+    """
+
+    def __init__(self, beta, kappa, geometry, n_gauge_substeps=1, plaquette_weights=None, md_kernels=(),
+                 md_target=None, md_strict=False, **fermion_kwargs):
+        self.md_kernels = parse_md_kernels(md_kernels)
+        self.md_target = md_target
+        self.md_strict = bool(md_strict)
+
+        def target(component):
+            return md_target if component in self.md_kernels else None
+
+        self.fermion = FusedTwoFlavourWilson(kappa, geometry, **fermion_kwargs)
+        self.gauge = FusedWilsonGaugeAction(beta, geometry, plaquette_weights, target=target("gauge_force"),
+                                            strict=md_strict)
+        super().__init__([([self.fermion], 1), ([self.gauge], n_gauge_substeps)])
+
+    def md_hmc_target(self):
+        """The `FusedHMC` target of the "update" component (None when it is off)."""
+        return self.md_target if "update" in self.md_kernels else None

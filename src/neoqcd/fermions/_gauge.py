@@ -18,6 +18,7 @@ from neoqcd.sun_utils import (  # noqa: F401
 )
 from neoqcd.theory import Wilson_action  # noqa: F401
 from neoqcd.smearing_jacobian import exp_coefficients  # noqa: F401
+from neoqcd.smearing_jacobian import C1_SERIES, N_SERIES, XI_SERIES, XI_TAYLOR  # noqa: F401
 from neoqcd.theory import plaquette_weight  # noqa: F401
 from neoqcd.mcmc import HBOR  # noqa: F401
 from neoqcd.utils import create_mask  # noqa: F401
