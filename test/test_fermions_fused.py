@@ -194,6 +194,26 @@ class _KernelEquality:
         bc = b.conj()
         self.assertLess(rel(op.normal(bc), ref.normal(bc.resolve_conj())), 1e-14)
 
+    def test_fresh_links_after_in_place_update(self):
+        """The term's operator after an in-place update of the links (U._version bumps) is a new
+        one whose kernel links (the soa copy included) are those of the new U, in both dtypes."""
+        dev = torch.device(self.device)
+        geo = G46
+        k = kappas(0.12, 0.13)
+        U = links(geo, 2, 56).to(dev)
+        x = to_half(field(geo, 2, 57), geo).to(dev)
+        term = FusedTwoFlavourWilson(k, geo, kernel=self.kernel, link_layout=self.link_layout, strict=True)
+        op = term.operator(U)
+        op.normal(x)
+        term._low_precision(op).normal(x.to(C64))  # the soa copies of both dtypes exist now
+        with torch.no_grad():
+            U.copy_(links(geo, 2, 58).to(dev))
+        new = term.operator(U)
+        self.assertIsNot(new, op)
+        ref = HalfLatticeWilson(U, k, geo)
+        self.assertLess(rel(new.normal(x), ref.normal(x)), 1e-14)
+        self.assertLess(rel(term._low_precision(new).normal(x.to(C64)), ref.to(C64).normal(x.to(C64))), 1e-6)
+
     @staticmethod
     def _views(x):
         """(name, view): the values of x as a non-contiguous tensor, at a storage offset, with a
@@ -331,6 +351,78 @@ class CudaSoaKernelTest(CudaKernelTest):
 
 class CudaSiteKernelTest(CudaKernelTest):
     link_layout = "site"
+
+
+class CudaDeviceAndStreamTest(unittest.TestCase):
+    """CUDA only (skipped without a CUDA device and nvcc): the compiled hop on a second GPU with
+    torch's current device 0 or 1, interleaved with torch ops on both devices, and on a
+    non-default stream (a race against the stream if the kernel were launched elsewhere)."""
+
+    @classmethod
+    def setUpClass(cls):
+        reason = cuda_reason()
+        if reason is not None:
+            raise unittest.SkipTest(f"cuda kernel not testable here: {reason}")
+
+    def test_second_device_with_either_current_device(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("needs two CUDA devices")
+        dev = torch.device("cuda", 1)
+        geo = G46
+        k = kappas(0.12, 0.13)
+        U = links(geo, 2, 90).to(dev)
+        x = to_half(field(geo, 2, 91), geo).to(dev)
+        ref = HalfLatticeWilson(U, k, geo)
+        want = ref.normal(x)
+        before = torch.cuda.current_device()
+        try:
+            for layout in F.LINK_LAYOUTS:
+                op = FusedHalfLatticeWilson(U, k, geo, kernel="cuda", strict=True, link_layout=layout)
+                for current in (0, 1, 0):
+                    with self.subTest(layout=layout, current=current):
+                        torch.cuda.set_device(current)
+                        a = torch.ones(1000, device="cuda:0").cumsum(0)  # torch work on both devices
+                        got = op.normal(x)
+                        b = (got.abs() ** 2).sum()  # consumed by torch on cuda:1 after the kernel
+                        c = op.to(C64).normal(x.to(C64))
+                        self.assertEqual(torch.cuda.current_device(), current)  # torch's device untouched
+                        self.assertLess(rel(got, want), 1e-14)
+                        self.assertLess(rel(c, ref.to(C64).normal(x.to(C64))), 1e-6)
+                        self.assertAlmostEqual(b.item(), (want.abs() ** 2).sum().item(), delta=1e-10 * b.item())
+                        self.assertEqual(a[-1].item(), 1000.0)
+                term = FusedTwoFlavourWilson(k, geo, kernel="cuda", link_layout=layout, strict=True, solver_tol=1e-12)
+                torch.cuda.set_device(0)
+                term.refresh(U, torch.Generator(device=dev).manual_seed(92))
+                S = term.action(U)
+                fast = FastTwoFlavourWilson(k, geo, solver_tol=1e-12)
+                fast.refresh(U, torch.Generator(device=dev).manual_seed(92))
+                self.assertLess((S - fast.action(U)).abs().max().item(), 1e-8)
+        finally:
+            torch.cuda.set_device(before)
+
+    def test_non_default_stream(self):
+        dev = torch.device("cuda", torch.cuda.current_device())
+        geo = G46
+        k = kappas(0.12, 0.13)
+        U = links(geo, 2, 93).to(dev)
+        x = to_half(field(geo, 2, 94), geo).to(dev)
+        want = HalfLatticeWilson(U, k, geo).normal(2.0 * x)
+        torch.cuda.synchronize(dev)
+        for layout in F.LINK_LAYOUTS:
+            with self.subTest(layout=layout):
+                op = FusedHalfLatticeWilson(U, k, geo, kernel="cuda", strict=True, link_layout=layout)
+                op.normal(x)  # the soa copy is built on the default stream
+                torch.cuda.synchronize(dev)
+                s = torch.cuda.Stream(device=dev)
+                xs = torch.zeros_like(x)
+                s.wait_stream(torch.cuda.current_stream(dev))  # xs exists before s writes it
+                with torch.cuda.stream(s):
+                    torch.cuda._sleep(50_000_000)  # the stream is busy: xs is written late
+                    xs.copy_(2.0 * x)
+                    got = op.normal(xs)  # must run on s, after the copy
+                    got = got * 1.0  # and be consumed on s
+                s.synchronize()
+                self.assertLess(rel(got, want), 1e-14)
 
 
 _CUDA_STUB = r"""

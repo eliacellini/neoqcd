@@ -52,8 +52,11 @@ torch.utils.cpp_extension: no torch headers (seconds of nvcc instead of a minute
 build), no ninja, no pybind, no build lock that a killed job leaves behind (the library is written
 to a temporary name and renamed atomically), and the identical source also compiles with any host
 C++ compiler (the "cpu" emulation, testable on a laptop). The library links the CUDA runtime
-statically; it shares the device's primary context with torch, sets the device of the tensors
-before the launch and restores the previous one.
+statically and shares the device's primary context with torch. The launch makes the tensors'
+device current through torch first (torch.cuda.device, only when it is not current already), so
+the library finds it current and switches nothing; it switches (and switches back, return codes
+checked) only if its current device still differs, never creating a context torch does not
+have in the normal path. The kernel runs on torch's current stream of that device.
 Build cache: $NEOQCD_KERNEL_CACHE, default ~/.cache/neoqcd/kernels, one file per source hash,
 compiler and GPU architecture. nvcc is looked up in $CUDA_HOME/bin, $CUDA_PATH/bin, then PATH;
 the host compiler in $CXX, then c++, g++, clang++. A build writes a temporary file named after the
@@ -312,18 +315,28 @@ int nq_is_cuda(void) {
 }
 
 // Returns 0 on success, -1 for an unsupported (dtype, D, N), a cudaError_t code otherwise.
+// Device: the caller (FusedHalfLatticeWilson._hop_kernel) makes the tensors' device current through
+// torch before the call, so the current device normally equals a->device and nothing is switched.
+// This library links its own (static) CUDA runtime: a cudaSetDevice here to a device whose primary
+// context torch never created would create one behind torch's back, hence no switch at all when the
+// devices agree. Only when they differ is the device set for the launch and then set back, with both
+// return codes checked (a failed restore is reported if the launch itself succeeded).
 int nq_hop(const NqHopArgs* a, void* stream) {
 #ifdef __CUDACC__
-    int previous = -1;
-    int err = (int)cudaGetDevice(&previous);
+    int current = -1;
+    int err = (int)cudaGetDevice(&current);
     if (err) return err;
-    if (previous != a->device && (err = (int)cudaSetDevice(a->device))) return err;
+    const int switched = (current != a->device);
+    if (switched && (err = (int)cudaSetDevice(a->device))) return err;
 #endif
     int code = -1;
     if (a->dtype == 0) code = nq_dispatch<double>(*a, stream);
     else if (a->dtype == 1) code = nq_dispatch<float>(*a, stream);
 #ifdef __CUDACC__
-    if (previous != a->device) cudaSetDevice(previous);
+    if (switched) {
+        err = (int)cudaSetDevice(current);
+        if (code == 0 && err) code = err;
+    }
 #endif
     return code;
 }
@@ -817,8 +830,16 @@ class FusedHalfLatticeWilson(HalfLatticeWilson):
             if add.shape != psi.shape:
                 raise ValueError(f"add of shape {tuple(add.shape)} differs from {tuple(psi.shape)}")
             a.add = add.data_ptr()
-        stream = torch.cuda.current_stream(psi.device).cuda_stream if psi.device.type == "cuda" else None
-        self._get_backend().hop(a, stream)
+        backend = self._get_backend()
+        if psi.device.type != "cuda":
+            backend.hop(a, None)
+        elif torch.cuda.current_device() == psi.device.index:
+            backend.hop(a, torch.cuda.current_stream(psi.device).cuda_stream)
+        else:
+            # make the tensors' device current through torch (as a torch op on them would), so the
+            # library sees it as its current device and switches nothing (nq_hop)
+            with torch.cuda.device(psi.device):
+                backend.hop(a, torch.cuda.current_stream(psi.device).cuda_stream)
         return out
 
     def _hop_loop(self, psi, t, dagger=False):
