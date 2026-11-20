@@ -812,6 +812,35 @@ class Counter:
         return s - snap[0], c - snap[1]
 
 
+def shared_layers(args):
+    """True if one layer object serves every protocol step (--layer-sharing shared, residual kinds)."""
+    return getattr(args, "residual", None) is not None and args.layer_sharing == "shared"
+
+
+def load_flow_state(flow, state_dict, shared, source):
+    """Load a `FermionSNF.state_dict` into `flow`. A shared layer is one module referenced by every
+    block, so the state_dict repeats its tensors under every blocks.<i>. prefix: they are checked to
+    be identical and given to however many blocks this flow has, so a shared flow loads at another
+    --n-step (with --load-flow-force: the protocol then differs). Per-step layers need one stored
+    layer per step: a mismatch exits with a clear message."""
+    if shared:
+        per_block = {}
+        for k, v in state_dict.items():
+            head, index, rest = k.split(".", 2)
+            if head != "blocks":
+                raise SystemExit(f"{source}: unexpected entry {k!r} in a flow state")
+            per_block.setdefault(rest, []).append(v)
+        if any(not all(torch.equal(v, vs[0]) for v in vs[1:]) for vs in per_block.values()):
+            raise SystemExit(f"{source}: the blocks hold different layers, not one shared layer")
+        state_dict = {f"blocks.{i}.{rest}": vs[0] for i in range(len(flow.blocks)) for rest, vs in per_block.items()}
+    try:
+        flow.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        stored = len({k.split(".")[1] for k in state_dict if k.startswith("blocks.")})
+        raise SystemExit(f"{source}: the stored flow ({stored} per-step layers) does not fit this run's "
+                         f"{len(flow.blocks)} protocol steps / layers: {str(exc).splitlines()[0]}")
+
+
 def flow_train_step(phase, progress, train_steps):
     """Training steps behind the flow of a checkpoint (phase, progress): the flow changes in training only."""
     return int(progress if phase == "train" else train_steps)
@@ -1097,7 +1126,7 @@ def main(argv=None):
     if args.load_flow:
         check_flow_sidecar(args, args.load_flow, log=lambda m: _log(args, m))
         payload = torch.load(args.load_flow, map_location=device)
-        flow.load_state_dict(payload["state_dict"])
+        load_flow_state(flow, payload["state_dict"], shared_layers(args), args.load_flow)
 
     # ---- state
     key = physics_key(args)
@@ -1117,7 +1146,7 @@ def main(argv=None):
                 os.replace(used, flow_path)
                 _log(args, f"--resume: {flow_path.name} was newer than the pool checkpoint (a job killed between the "
                            f"two writes): resuming from {used.name}, the flow of the pool's step (now {flow_path.name})")
-            flow.load_state_dict(payload["state_dict"])
+            load_flow_state(flow, payload["state_dict"], shared_layers(args), used)
             if optimizer is not None and payload.get("optimizer") is not None:
                 optimizer.load_state_dict(payload["optimizer"])
         source = meta["extra"].get("source")

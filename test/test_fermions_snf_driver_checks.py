@@ -234,6 +234,42 @@ class LoadFlowProtocolTest(unittest.TestCase):
                         self.assertTrue((tmp / f"force_{layers}_{k}" / "samples.csv").exists())
 
 
+    def test_shared_flow_at_another_n_step(self):
+        """A shared hyper-residual flow (one layer for every step) loads at another --n-step (with
+        --load-flow-force: the protocol differs) and gives the same coefficients at the same
+        conditioning value; per-step layers at another --n-step exit with a clear message."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            common = LATTICE + ["--mode", "snf", "--batch", "2", "--seed", "3", "--eval-samples", "2",
+                                "--protocol", "kappa", "--final", "0.19"]
+            for layers in ("hyper-residual", "residual"):
+                trained = tmp / layers
+                quiet_main(common + ["--layers", layers, "--n-step", "2", "--train-steps", "2", "--out", str(trained)])
+                argv = common + ["--layers", layers, "--n-step", "3", "--load-flow", str(trained / "flow.pt"),
+                                 "--load-flow-force", "--out", str(tmp / f"{layers}_n3")]
+                if layers == "residual":
+                    with self.assertRaisesRegex(SystemExit, "does not fit this run's 3 protocol steps"):
+                        quiet_main(argv)
+                    continue
+                quiet_main(argv)
+                saved = torch.load(trained / "flow.pt")["state_dict"]
+                args = SNF.parse_args(common + ["--layers", layers, "--n-step", "3"])
+                flow = SNF.FermionSNF(SNF.QCDAction(SNF.Geometry(2, 4, 4, 3), "kappa", beta=5.0, kappa=0.18),
+                                      args.protocol_values,
+                                      SNF.make_gauge_layers(SNF.FlowPars(D=2, T=4, L=4, N=3,
+                                                                         mask=SNF.create_mask(2, 4, 4),
+                                                                         protocol=args.protocol_values, batch_size=2,
+                                                                         device="cpu"),
+                                                            layers, residual={k: v for k, v in args.residual.items()
+                                                                              if k != "parameterization"}),
+                                      None, initial_parameter=0.18)
+                SNF.load_flow_state(flow, saved, True, "test")
+                for k, v in flow.state_dict().items():
+                    rest = k.split(".", 2)[2]
+                    self.assertTrue(torch.equal(v, saved["blocks.0." + rest]), k)
+                self.assertIs(flow.blocks[0].layer, flow.blocks[2].layer)
+
+
 class ResumeKeyTest(unittest.TestCase):
     """--n-between, --train-steps, --lr, --lr-warmup, --grad-clip, --rho-init are in the resume key;
     a checkpoint written before them is accepted with a note."""
