@@ -27,7 +27,13 @@ from neoqcd.fermions import fused as F  # noqa: E402
 from neoqcd.fermions import fused_hmc as M  # noqa: E402
 from neoqcd.fermions._gauge import SUN_haar, SUN_mul  # noqa: E402
 from neoqcd.fermions.algebra import algebra_basis, expi, random_algebra, unitarize  # noqa: E402
-from neoqcd.fermions.fast import FastTwoFlavourWilson, HalfLatticeWilson, to_half  # noqa: E402
+from neoqcd.fermions.fast import (  # noqa: E402
+    FastTwoFlavourWilson,
+    HalfLatticeWilson,
+    lean_cg,
+    mixed_precision_cg,
+    to_half,
+)
 from neoqcd.fermions.hmc import (  # noqa: E402
     HMC,
     Hamiltonian,
@@ -343,7 +349,7 @@ class _IntegratorTest(_Target):
                 hmc = self._compare(lambda t: _fermion_hmc(G46, t, md_kernels=comp), G46, B=2, n_traj=1)
                 ham = hmc.hamiltonian
                 used = {"gauge_force": ham.gauge.kernel_used, "fermion_force": ham.fermion.force_kernel_used,
-                        "update": hmc.kernel_used}
+                        "update": hmc.kernel_used, "cg": ham.fermion.cg_kernel_used}
                 for name, path in used.items():
                     self.assertEqual(path, self.target if name == comp else "torch", name)
                 if comp == "update":  # forces from torch, kicks and moves through the update kernel
@@ -456,6 +462,115 @@ class _FermionForceEquality(_Target):
                 kicked = term.force_kick(U, P, 0.25)
                 self.assertEqual(term.stats["solves"], solves + 1)
                 self.assertLess((kicked - (P - 0.25 * F_ref)).abs().max().item(), 1e-9 * F_ref.abs().max().item())
+
+
+class _CGEquality(_Target):
+    def _system(self, geo=G46, B=3, seed=60, dtype=C):
+        U = self.dev(links(geo, B, seed))
+        op = HalfLatticeWilson(U, torch.tensor([0.11, 0.12, 0.13][:B], dtype=torch.float64), geo).to(dtype)
+        b = self.dev(to_half(torch.randn(geo.wilson_shape(B), dtype=C, generator=torch.Generator().manual_seed(seed + 1)),
+                             geo)).to(dtype)
+        return op, b
+
+    def step(self):
+        return M.FusedCGStep(M.load_md_backend(self.target, self.device), self.device)
+
+    def test_lean_cg_equal(self):
+        """lean_cg with the fused iteration: the same per-sample iteration counts and loop count, x and
+        the true residual equal to rounding (complex128 at 1e-12, complex64 at 1e-5), check intervals
+        1 and 10."""
+        for dtype, tol, xtol in ((C, 1e-12, 1e-12), (C64, 1e-5, 1e-4)):
+            op, b = self._system(dtype=dtype)
+            for every in (1, 10):
+                with self.subTest(dtype=dtype, check_every=every):
+                    i0, i1 = {}, {}
+                    r0 = lean_cg(op.normal, b, tol=tol, max_iter=400, check_every=every, info=i0)
+                    step = self.step()
+                    r1 = lean_cg(op.normal, b, tol=tol, max_iter=400, check_every=every, info=i1, step=step)
+                    self.assertGreater(step.calls, 10)
+                    self.assertTrue(torch.equal(r0.iterations, r1.iterations))
+                    self.assertEqual(i0["loop_iterations"], i1["loop_iterations"])
+                    self.assertLess(rel(r1.x, r0.x), xtol)
+                    self.assertTrue(bool(i1["converged"].all()))
+                    self.assertLess(r1.residual.max().item(), 10 * max(tol, 1e3 * torch.finfo(r1.residual.dtype).eps))
+
+    def test_mixed_precision_equal(self):
+        op, b = self._system()
+        low = op.to(C64)
+        i0, i1 = {}, {}
+        r0 = mixed_precision_cg(op, low, b, tol=1e-12, max_iter=2000, info=i0)
+        r1 = mixed_precision_cg(op, low, b, tol=1e-12, max_iter=2000, info=i1, step=self.step())
+        self.assertLess(rel(r1.x, r0.x), 1e-10)
+        self.assertTrue(bool(i1["converged"].all()))
+        self.assertLess(r1.residual.max().item(), 1e-11)
+
+    def test_zero_and_nonfinite_samples(self):
+        """A zero right-hand side stays zero with 0 iterations; a NaN sample is isolated: the healthy
+        samples end bitwise as in a batch without it."""
+        op, b = self._system(B=3)
+        zero = b.clone()
+        zero[1] = 0
+        r = lean_cg(op.normal, zero, tol=1e-12, max_iter=400, step=self.step())
+        self.assertEqual(int(r.iterations[1]), 0)
+        self.assertEqual(r.x[1].abs().max().item(), 0.0)
+        op1, b1 = self._system(B=1)  # sample 0 of the same system (kappa 0.11, links of sample 0)
+        nan = b.clone()
+        nan[1, 0, 0, 0] = float("nan")
+        U2 = torch.stack([op.U[0], op.U[0], op.U[0]])
+        op2 = HalfLatticeWilson(U2, 0.11, G46)
+        nan[0] = b1[0]
+        nan[2] = b1[0]
+        r2 = lean_cg(op2.normal, nan, tol=1e-12, max_iter=400, step=self.step())
+        alone = lean_cg(HalfLatticeWilson(op.U[:1], 0.11, G46).normal, b1, tol=1e-12, max_iter=400, step=self.step())
+        self.assertTrue(torch.equal(r2.x[0], alone.x[0]))
+        self.assertTrue(torch.equal(r2.x[2], alone.x[0]))
+        self.assertFalse(bool(torch.isfinite(r2.residual[1])))
+
+    def test_unwritable_inputs_return_none(self):
+        op, b = self._system()
+        step = self.step()
+        x = torch.zeros_like(b)
+        r = b.clone()
+        p = r.clone()
+        rr = (r.abs() ** 2).reshape(3, -1).sum(1)
+        conv = torch.zeros(3, dtype=torch.bool, device=b.device)
+        its = torch.zeros(3, dtype=torch.long, device=b.device)
+        strided = torch.zeros(b.shape[:-1] + (2 * b.shape[-1],), dtype=C, device=b.device)[..., ::2]
+        self.assertIsNone(step(op.normal, strided, r, p, rr, rr, conv, its))
+        self.assertIsNone(step(op.normal, x, torch._neg_view(-r), p, rr, rr, conv, its))
+        self.assertIsNone(step(op.normal, x.to(C64), r.to(C64), p.to(C64), rr, rr, conv, its))  # rr of the wrong dtype
+        self.assertEqual(step.calls, 0)
+        self.assertIsNotNone(step(op.normal, x, r, p, rr, rr * 1e-24, conv, its))
+        self.assertEqual(its.tolist(), [1, 1, 1])
+
+    def test_term_with_cg_kernels(self):
+        """FusedForceTwoFlavourWilson with cg_target: action and force as FastTwoFlavourWilson (same
+        draws), double and mixed precision; the solves report the kernel path."""
+        geo = G46
+        k = torch.tensor([0.12, 0.13], dtype=torch.float64)
+        U = self.dev(links(geo, 2, 61))
+        hop = "cpu" if self.target == "cpu" else "cuda"
+        for precision in ("double", "mixed"):
+            with self.subTest(precision=precision):
+                gen = torch.Generator(device=self.device)
+                fast = FastTwoFlavourWilson(k, geo, solver_tol=1e-12, action_tol=1e-13, precision=precision)
+                fast.refresh(U, gen.manual_seed(62))
+                term = M.FusedForceTwoFlavourWilson(k, geo, cg_target=self.target, md_strict=True, kernel=hop,
+                                                    strict=True, solver_tol=1e-12, action_tol=1e-13,
+                                                    precision=precision)
+                term.refresh(U, gen.manual_seed(62))
+                self.assertLess((term.action(U) - fast.action(U)).abs().max().item(), 1e-8)
+                self.assertEqual(term.cg_kernel_used, self.target)
+                self.assertLess(rel(term.force(U), fast.force(U)), 1e-9)
+                self.assertEqual(term.stats["cg_iterations"], fast.stats["cg_iterations"])
+
+
+class CpuCGTest(_CGEquality, unittest.TestCase):
+    target, device = "cpu", "cpu"
+
+
+class CudaCGTest(_CGEquality, unittest.TestCase):
+    target, device = "cuda", "cuda"
 
 
 class CpuFermionForceTest(_FermionForceEquality, unittest.TestCase):

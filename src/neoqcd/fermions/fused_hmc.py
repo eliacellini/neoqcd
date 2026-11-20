@@ -62,6 +62,7 @@ __all__ = [
     "gauge_force",
     "md_update",
     "fermion_force",
+    "FusedCGStep",
     "FusedWilsonGaugeAction",
     "FusedForceTwoFlavourWilson",
     "FusedHMC",
@@ -69,7 +70,7 @@ __all__ = [
 
 MD_TARGETS = ("cuda", "cpu")
 # the components that can run through the kernels (main_hmc.py --md-kernels)
-MD_COMPONENTS = ("gauge_force", "update", "fermion_force")
+MD_COMPONENTS = ("gauge_force", "update", "fermion_force", "cg")
 _SUPPORTED_D = (2, 4)
 _SUPPORTED_N = (2, 3)
 _MAX_D = 4
@@ -570,6 +571,101 @@ static int md_fforce_dispatch(const NqFermionForceArgs& a, void* stream) {
     return -1;
 }
 
+// ---- CG linear algebra (fast.lean_cg, one loop iteration after A p) ---------------------------------
+// Arguments of nq_cg (_CGArgs). op 0: dot partials Re <p, Ap>; op 1: alpha = rr / pAp (0 where
+// pAp <= tiny), x += alpha p, r -= alpha Ap, partials of |r|^2; op 2: beta = rr_new / rr (0 where
+// rr <= tiny), p = beta p + r, and per sample iterations += !converged,
+// converged_out = converged | (rr_new <= target). Thread t of sample b handles the elements
+// e = t, t + nchunk, ... (coalesced across a warp); its partial sums are in double, in a fixed order
+// (deterministic), and torch sums the (B, nchunk) partials.
+struct NqCGArgs {
+    void* x;                      // (B, n) complex (op 1: updated in place)
+    void* r;                      // (B, n) complex (op 1: updated in place; op 2: read)
+    void* p;                      // (B, n) complex (op 0, 1: read; op 2: updated in place)
+    const void* Ap;               // (B, n) complex
+    const void* rr;               // (B,) real (field precision): |r|^2 before the iteration
+    const double* pAp;            // (B,) Re <p, Ap> (op 1)
+    const double* rr_new;         // (B,) |r|^2 after the update (op 2)
+    const void* target;           // (B,) real (field precision) (op 2)
+    int64_t* iterations;          // (B,) (op 2)
+    const uint8_t* converged_in;  // (B,) bool (op 2)
+    uint8_t* converged_out;       // (B,) bool (op 2)
+    double* partials;             // (B, nchunk) (op 0, 1)
+    double tiny;                  // torch.finfo(real dtype).tiny
+    int64_t batch, n, nchunk;
+    int32_t op, dtype, device, reserved;
+};
+
+template <typename T>
+MD_HD void md_cg_dot(const NqCGArgs& a, int64_t tid) {
+    typedef MdC<T> C;
+    const int64_t b = tid / a.nchunk, t = tid % a.nchunk;
+    const C* P = static_cast<const C*>(a.p) + b * a.n;
+    const C* A = static_cast<const C*>(a.Ap) + b * a.n;
+    double s = 0;
+    for (int64_t e = t; e < a.n; e += a.nchunk) s += (double)P[e].re * (double)A[e].re + (double)P[e].im * (double)A[e].im;
+    a.partials[tid] = s;
+}
+
+template <typename T>
+MD_HD void md_cg_xr(const NqCGArgs& a, int64_t tid) {
+    typedef MdC<T> C;
+    const int64_t b = tid / a.nchunk, t = tid % a.nchunk;
+    const T pap = (T)a.pAp[b];
+    const T alpha = pap > (T)a.tiny ? static_cast<const T*>(a.rr)[b] / pap : (T)0;
+    C* X = static_cast<C*>(a.x) + b * a.n;
+    C* R = static_cast<C*>(a.r) + b * a.n;
+    const C* P = static_cast<const C*>(a.p) + b * a.n;
+    const C* A = static_cast<const C*>(a.Ap) + b * a.n;
+    double s = 0;
+    for (int64_t e = t; e < a.n; e += a.nchunk) {
+        X[e] = c_add(X[e], c_scale(alpha, P[e]));
+        const C rv = c_sub(R[e], c_scale(alpha, A[e]));
+        R[e] = rv;
+        s += (double)rv.re * (double)rv.re + (double)rv.im * (double)rv.im;
+    }
+    a.partials[tid] = s;
+}
+
+template <typename T>
+MD_HD void md_cg_p(const NqCGArgs& a, int64_t tid) {
+    typedef MdC<T> C;
+    const int64_t b = tid / a.nchunk, t = tid % a.nchunk;
+    const T rr = static_cast<const T*>(a.rr)[b];
+    const T rn = (T)a.rr_new[b];
+    const T beta = rr > (T)a.tiny ? rn / rr : (T)0;
+    C* P = static_cast<C*>(a.p) + b * a.n;
+    const C* R = static_cast<const C*>(a.r) + b * a.n;
+    for (int64_t e = t; e < a.n; e += a.nchunk) P[e] = c_add(c_scale(beta, P[e]), R[e]);
+    if (t == 0) {
+        const uint8_t conv = a.converged_in[b];
+        a.iterations[b] += conv ? 0 : 1;
+        a.converged_out[b] = (uint8_t)(conv || rn <= static_cast<const T*>(a.target)[b]);
+    }
+}
+
+template <typename T, int OP> struct MdCGFn {
+    static MD_HD void run(const NqCGArgs& a, int64_t tid) {
+        if (OP == 0) md_cg_dot<T>(a, tid);
+        else if (OP == 1) md_cg_xr<T>(a, tid);
+        else md_cg_p<T>(a, tid);
+    }
+};
+
+template <typename T>
+static int md_cg_ops(const NqCGArgs& a, void* stream) {
+    if (a.op == 0) return md_launch<MdCGFn<T, 0> >(a, a.batch * a.nchunk, stream);
+    if (a.op == 1) return md_launch<MdCGFn<T, 1> >(a, a.batch * a.nchunk, stream);
+    if (a.op == 2) return md_launch<MdCGFn<T, 2> >(a, a.batch * a.nchunk, stream);
+    return -1;
+}
+
+static int md_cg_dispatch(const NqCGArgs& a, void* stream) {
+    if (a.dtype == 0) return md_cg_ops<double>(a, stream);
+    if (a.dtype == 1) return md_cg_ops<float>(a, stream);
+    return -1;
+}
+
 template <typename T, int N, bool KICK, bool MOVE> struct MdUpdateFn {
     static MD_HD void run(const NqUpdateArgs& a, int64_t tid) { md_update_link<T, N, KICK, MOVE>(a, tid); }
 };
@@ -622,6 +718,14 @@ int nq_md_is_cuda(void) {
 int nq_gauge_args_size(void) { return (int)sizeof(NqGaugeArgs); }
 int nq_update_args_size(void) { return (int)sizeof(NqUpdateArgs); }
 int nq_fforce_args_size(void) { return (int)sizeof(NqFermionForceArgs); }
+int nq_cg_args_size(void) { return (int)sizeof(NqCGArgs); }
+
+int nq_cg(const NqCGArgs* a, void* stream) {
+    MD_DEVICE_GUARD_BEGIN(a->device)
+    int code = md_cg_dispatch(*a, stream);
+    MD_DEVICE_GUARD_END(code)
+    return code;
+}
 
 int nq_fermion_force(const NqFermionForceArgs* a, void* stream) {
     MD_DEVICE_GUARD_BEGIN(a->device)
@@ -739,11 +843,37 @@ class _FermionForceArgs(ctypes.Structure):
     ]
 
 
+class _CGArgs(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_void_p),
+        ("r", ctypes.c_void_p),
+        ("p", ctypes.c_void_p),
+        ("Ap", ctypes.c_void_p),
+        ("rr", ctypes.c_void_p),
+        ("pAp", ctypes.c_void_p),
+        ("rr_new", ctypes.c_void_p),
+        ("target", ctypes.c_void_p),
+        ("iterations", ctypes.c_void_p),
+        ("converged_in", ctypes.c_void_p),
+        ("converged_out", ctypes.c_void_p),
+        ("partials", ctypes.c_void_p),
+        ("tiny", ctypes.c_double),
+        ("batch", ctypes.c_int64),
+        ("n", ctypes.c_int64),
+        ("nchunk", ctypes.c_int64),
+        ("op", ctypes.c_int32),
+        ("dtype", ctypes.c_int32),
+        ("device", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
+    ]
+
+
 _ENTRY_POINTS = (
     # (function, argument structure, size function)
     ("nq_gauge_force", _GaugeArgs, "nq_gauge_args_size"),
     ("nq_md_update", _UpdateArgs, "nq_update_args_size"),
     ("nq_fermion_force", _FermionForceArgs, "nq_fforce_args_size"),
+    ("nq_cg", _CGArgs, "nq_cg_args_size"),
 )
 
 
@@ -1043,6 +1173,85 @@ def fermion_force(op, a_e, a_o, b_e, b_o, scale, mom=None, coef=0.0, backend=Non
     return out
 
 
+_CG_DTYPES = {torch.complex128: (0, torch.float64), torch.complex64: (1, torch.float32)}
+CG_ELEMENTS_PER_THREAD = 8  # complex elements summed by one thread of the reductions
+
+
+def _plain(t):
+    return t.is_contiguous() and not t.is_conj() and not t.is_neg()
+
+
+class FusedCGStep:
+    """One iteration of `fast.lean_cg` after the operator, in three kernel passes (`step` of
+    lean_cg / mixed_precision_cg): Re <p, Ap> (partials), the x and r update with |r|^2 (partials),
+    the p update with the per-sample iteration count and convergence flag; torch sums the
+    (B, n / 8) double partials. Same arithmetic as the torch body (alpha, beta, the guards for
+    pAp, rr <= tiny, NaN), the dot products summed in double in another order: rounding-level
+    differences. complex128 and complex64 (the inner solves of mixed precision). Returns None (the
+    torch body runs) for inputs it cannot write in place (not contiguous, conj/neg bits, another
+    device or dtype)."""
+
+    def __init__(self, backend, device):
+        self.backend = backend
+        self.device = torch.device(device)
+        self.calls = 0
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["backend"] = None  # ctypes handles: re-acquired at the first call
+        return state
+
+    def _get_backend(self):
+        if self.backend is None:
+            self.backend = load_md_backend(_target_of(self.device), self.device)
+        return self.backend
+
+    def __call__(self, apply_normal, x, r, p, rr, target, converged, iterations):
+        if x.dtype not in _CG_DTYPES or x.device.type != self.device.type:
+            return None
+        code, real = _CG_DTYPES[x.dtype]
+        if not (all(_plain(t) and t.dtype == x.dtype and t.shape == x.shape for t in (x, r, p))
+                and rr.dtype == real and iterations.dtype == torch.int64 and iterations.is_contiguous()
+                and converged.dtype == torch.bool):
+            return None
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (x, r, p)):
+            return None
+        backend = self._get_backend()
+        Ap = _raw(apply_normal(p))
+        dev = x.device
+        B = x.shape[0]
+        n = x[0].numel()
+        nchunk = max(1, min(n, -(-n // CG_ELEMENTS_PER_THREAD)))
+        partials = torch.empty((B, nchunk), dtype=torch.float64, device=dev)
+        rr_c = _raw(rr)
+        a = _CGArgs()
+        a.x, a.r, a.p, a.Ap = x.data_ptr(), r.data_ptr(), p.data_ptr(), Ap.data_ptr()
+        a.rr = rr_c.data_ptr()
+        a.partials = partials.data_ptr()
+        a.tiny = float(torch.finfo(real).tiny)
+        a.batch, a.n, a.nchunk = B, n, nchunk
+        a.dtype, a.device = code, _device_index(dev)
+        a.op = 0
+        _launch(backend, "nq_cg", a, dev)
+        pAp = partials.sum(dim=1)
+        a.pAp = pAp.data_ptr()
+        a.op = 1
+        _launch(backend, "nq_cg", a, dev)
+        rr_new = partials.sum(dim=1)
+        target_c = _raw(target.to(device=dev, dtype=real))
+        conv_in = _raw(converged)
+        conv_out = torch.empty_like(conv_in)
+        a.rr_new = rr_new.data_ptr()
+        a.target = target_c.data_ptr()
+        a.iterations = iterations.data_ptr()
+        a.converged_in = conv_in.data_ptr()
+        a.converged_out = conv_out.data_ptr()
+        a.op = 2
+        _launch(backend, "nq_cg", a, dev)
+        self.calls += 1
+        return rr_new.to(real), conv_out
+
+
 class _KernelChoice:
     """Lazy per-device choice between a compiled MD kernel and the torch code (module docstring)."""
 
@@ -1172,9 +1381,39 @@ class FusedForceTwoFlavourWilson(FusedTwoFlavourWilson):
     is `force_kernel_used` ("cuda", "cpu" or "torch").
     """
 
-    def __init__(self, kappa, geometry, md_target=None, md_strict=False, **kwargs):
+    def __init__(self, kappa, geometry, md_target=None, md_strict=False, cg_target=None, **kwargs):
         self._force_choice = _KernelChoice(md_target, md_strict, "fermion force")
+        self._cg_choice = _KernelChoice(cg_target, md_strict, "CG linear algebra")
+        self._cg_steps = {}
         super().__init__(kappa, geometry, **kwargs)
+
+    @property
+    def cg_kernel_used(self):
+        """"cuda" / "cpu" when the last solve ran its iterations through `FusedCGStep`, else "torch"."""
+        return self._cg_choice.last_used
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_cg_steps"] = {}
+        return state
+
+    def _solve(self, op, tol):
+        """The parent's solve with the CG iterations through `FusedCGStep` when "cg" is requested
+        (`fast.FastTwoFlavourWilson._solve` reads `_cg_step`)."""
+        self._cg_step = None
+        self._cg_choice.last_used = "torch"
+        if self._cg_choice.target is not None:
+            backend = self._cg_choice.backend(op.device, self.geometry, torch.complex128)
+            if backend is not None:
+                key = str(op.device)
+                if key not in self._cg_steps:
+                    self._cg_steps[key] = FusedCGStep(backend, op.device)
+                self._cg_step = self._cg_steps[key]
+            self._cg_choice.last_used = "torch" if backend is None else backend.target
+        try:
+            return super()._solve(op, tol)
+        finally:
+            self._cg_step = None
 
     @property
     def force_kernel_used(self):
@@ -1382,7 +1621,8 @@ class FusedMDHamiltonian(Hamiltonian):
     `md_kernels`: components of MD_COMPONENTS (`parse_md_kernels`) run through the compiled target
     `md_target` ("cuda" or "cpu"; None: none of them) with `md_strict`: "gauge_force" for the gauge
     term (`FusedWilsonGaugeAction`), "fermion_force" for the fermion term
-    (`FusedForceTwoFlavourWilson`; with the component off it is `FusedTwoFlavourWilson`'s force). The "update" component is the integrator's
+    (`FusedForceTwoFlavourWilson`; with the component off it is `FusedTwoFlavourWilson`'s force),
+    "cg" for the CG iterations of the fermion solves (`FusedCGStep`). The "update" component is the integrator's
     (`FusedHMC(target=...)`, `md_hmc_target(ham)`). Other keyword arguments go to
     `FusedTwoFlavourWilson` (kernel, link_layout, strict, solver settings, ...).
     """
@@ -1397,7 +1637,7 @@ class FusedMDHamiltonian(Hamiltonian):
             return md_target if component in self.md_kernels else None
 
         self.fermion = FusedForceTwoFlavourWilson(kappa, geometry, md_target=target("fermion_force"),
-                                                  md_strict=md_strict, **fermion_kwargs)
+                                                  md_strict=md_strict, cg_target=target("cg"), **fermion_kwargs)
         self.gauge = FusedWilsonGaugeAction(beta, geometry, plaquette_weights, target=target("gauge_force"),
                                             strict=md_strict)
         super().__init__([([self.fermion], 1), ([self.gauge], n_gauge_substeps)])

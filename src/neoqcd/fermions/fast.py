@@ -483,7 +483,8 @@ def _bview(c, field):
     return c.view((-1,) + (1,) * (field.dim() - 1))
 
 
-def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, info=None, max_restarts=None):
+def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, info=None, max_restarts=None,
+            step=None):
     """CG for a batched hermitian positive-definite system with few host synchronisations.
 
     The convergence test (a host sync) runs every `check_every` iterations (first at iteration
@@ -511,6 +512,12 @@ def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, 
     dict it receives "loop_iterations" (applications of A in the loop: the cost), "checks",
     "restarts", "converged" ((B,) bool: true residual within the limit above) and "stagnated"
     (bool: restarts stopped by the floor rule).
+
+    `step` (default None: the torch iteration below) is an optional replacement of one loop
+    iteration, `step(apply_normal, x, r, p, rr, target, converged, iterations)`, which updates x,
+    r, p and iterations in place exactly as the torch body does and returns (rr_new, converged), or
+    None to run the torch body for this iteration (`fused_hmc.FusedCGStep`: the same arithmetic in
+    three fused kernels).
     """
     check_every = max(1, int(check_every))
     max_iter = int(max_iter)
@@ -546,20 +553,24 @@ def lean_cg(apply_normal, b, x0=None, tol=1e-10, max_iter=1000, check_every=10, 
                 checks += 1
                 if bool((converged | ~torch.isfinite(rr)).all()) or n_total >= max_iter:
                     break
-            Ap = apply_normal(p)
-            pAp = _rdot(p, Ap)
-            ok = pAp > tiny
-            alpha = torch.where(ok, rr / torch.where(ok, pAp, one), zero)
-            a = _bview(alpha.to(b.dtype), b)
-            x.addcmul_(p, a)
-            r.addcmul_(Ap, a, value=-1)
-            rr_new = _norm2(r)
-            ok = rr > tiny
-            beta = torch.where(ok, rr_new / torch.where(ok, rr, one), zero)
-            p.mul_(_bview(beta.to(b.dtype), p)).add_(r)
-            iterations += (~converged).long()
-            rr = rr_new
-            converged = converged | (rr <= target)
+            fused = None if step is None else step(apply_normal, x, r, p, rr, target, converged, iterations)
+            if fused is not None:
+                rr, converged = fused
+            else:
+                Ap = apply_normal(p)
+                pAp = _rdot(p, Ap)
+                ok = pAp > tiny
+                alpha = torch.where(ok, rr / torch.where(ok, pAp, one), zero)
+                a = _bview(alpha.to(b.dtype), b)
+                x.addcmul_(p, a)
+                r.addcmul_(Ap, a, value=-1)
+                rr_new = _norm2(r)
+                ok = rr > tiny
+                beta = torch.where(ok, rr_new / torch.where(ok, rr, one), zero)
+                p.mul_(_bview(beta.to(b.dtype), p)).add_(r)
+                iterations += (~converged).long()
+                rr = rr_new
+                converged = converged | (rr <= target)
             n += 1
             n_total += 1
         r_true = b - apply_normal(x)
@@ -594,7 +605,7 @@ def _normal_of(op):
 
 
 def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_outer=30, max_iter=1000,
-                       check_every=10, info=None, stagnation_factor=2.0):
+                       check_every=10, info=None, stagnation_factor=2.0, step=None):
     """Defect correction (iterative refinement) for A x = b, A hermitian positive definite.
 
     `op128` and `op64` are the operator in complex128 and complex64 (objects with `normal`, e.g.
@@ -615,6 +626,8 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
     once (zero inner right-hand side, finite inner tolerance), as `lean_cg` isolates it: the other
     samples run exactly as in a batch without it, and it ends not converged with a non-finite
     residual (the convergence policy of the terms then names only that sample).
+
+    `step`: the optional iteration of the inner `lean_cg` (its docstring).
 
     Returns SolverResult(x complex128, iterations (B,) = inner CG iterations summed over the outer
     steps, residual = true complex128 relative residual). `info` (dict) receives "outer" (outer
@@ -655,7 +668,7 @@ def mixed_precision_cg(op128, op64, b, x0=None, tol=1e-10, inner_tol=1e-6, max_o
         inner = torch.where(done, torch.full_like(inner, 0.5), inner)
         # no restarts inside: the outer loop is the residual replacement
         e = lean_cg(A64, rhs, tol=inner, max_iter=budget - loops, check_every=check_every, info=sub,
-                    max_restarts=0)
+                    max_restarts=0, step=step)
         loops += sub["loop_iterations"]
         inner_max.append(int(e.iterations.max().item()))
         iterations += e.iterations
@@ -798,13 +811,14 @@ class FastTwoFlavourWilson(TwoFlavourWilson):
             raise RuntimeError("the pseudofermion field is not set: call refresh(U, generator) first")
         x0 = self._X_h if (self.reuse_guess and self._X_h is not None) else None
         info = {}
+        step = getattr(self, "_cg_step", None)  # fused CG iteration of a subclass (fused_hmc), else None
         if self.precision == "double":
             res = lean_cg(op.normal, self._phi_h, x0=x0, tol=tol, max_iter=self.max_iter,
-                          check_every=self.check_every, info=info)
+                          check_every=self.check_every, info=info, step=step)
         else:
             res = mixed_precision_cg(op, self._low_precision(op), self._phi_h, x0=x0, tol=tol,
                                      inner_tol=self.inner_tol, max_outer=self.max_outer,
-                                     max_iter=self.max_iter, check_every=self.check_every, info=info)
+                                     max_iter=self.max_iter, check_every=self.check_every, info=info, step=step)
             self.stats["outer_iterations"] += info["outer"]
             self.stats["double_applications"] += info["double_applications"]
         self.stats["cg_loop_iterations"] += info["loop_iterations"]
