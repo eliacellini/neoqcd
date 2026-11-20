@@ -434,8 +434,13 @@ def _version(compiler):
         return ""
 
 
-def _build_spec(target, device=None):
-    """(compiler, flags, source suffix, library path in the cache) of target "cuda" or "cpu"."""
+def _build_spec(target, device=None, backend_class=None):
+    """(compiler, flags, source suffix, library path in the cache) of target "cuda" or "cpu".
+
+    `backend_class` (None: the hop library `_Backend`) is another library built and loaded by this
+    machinery: a `_Backend` subclass with the class attributes SOURCE (its kernel source) and NAME
+    (the library name prefix), e.g. `fused_hmc._MDBackend`; the cache file is keyed on its source."""
+    source, name = _source_and_name(backend_class)
     if target == "cuda":
         compiler = _find_nvcc()
         if compiler is None:
@@ -454,8 +459,15 @@ def _build_spec(target, device=None):
         suffix = ".cpp"
     else:
         raise ValueError(f"unknown target {target!r}")
-    tag = hashlib.sha256("\n".join([KERNEL_SOURCE, compiler, _version(compiler)] + flags).encode()).hexdigest()[:16]
-    return compiler, flags, suffix, _cache_dir() / f"neoqcd_hop_{target}_{tag}.so"
+    tag = hashlib.sha256("\n".join([source, compiler, _version(compiler)] + flags).encode()).hexdigest()[:16]
+    return compiler, flags, suffix, _cache_dir() / f"{name}_{target}_{tag}.so"
+
+
+def _source_and_name(backend_class):
+    """(kernel source, library name prefix) of a backend class (None: the hop library)."""
+    if backend_class is None:
+        return KERNEL_SOURCE, "neoqcd_hop"
+    return backend_class.SOURCE, backend_class.NAME
 
 
 def _partial_path(lib):
@@ -473,13 +485,13 @@ def _unlink(path):
         pass
 
 
-def _compile(target, compiler, flags, suffix, out):
-    """Compile KERNEL_SOURCE into the file `out`; on any failure (error, timeout, interrupt) the
-    partial output is removed and BackendUnavailable (or the interrupt) propagates."""
+def _compile(target, compiler, flags, suffix, out, source=None):
+    """Compile KERNEL_SOURCE (or `source`) into the file `out`; on any failure (error, timeout,
+    interrupt) the partial output is removed and BackendUnavailable (or the interrupt) propagates."""
     try:
         with tempfile.TemporaryDirectory(prefix="neoqcd_hop_") as tmp:
             src = Path(tmp) / f"neoqcd_hop{suffix}"
-            src.write_text(KERNEL_SOURCE)
+            src.write_text(KERNEL_SOURCE if source is None else source)
             cmd = [compiler] + flags + ["-o", str(out), str(src)]
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
@@ -495,40 +507,49 @@ def _compile(target, compiler, flags, suffix, out):
         raise
 
 
-def _build(target, device=None):
-    """Compile KERNEL_SOURCE for target ("cuda" or "cpu") into the cache unless the library is
-    already there; returns the library path (it is not loaded or checked here: `load_backend`)."""
-    compiler, flags, suffix, lib = _build_spec(target, device)
+def _compile_args(backend_class):
+    """Extra keyword arguments of `_compile` for a backend class (none for the hop library, so that
+    its call is the one it always was)."""
+    return {} if backend_class is None else {"source": backend_class.SOURCE}
+
+
+def _build(target, device=None, backend_class=None):
+    """Compile KERNEL_SOURCE (or the source of `backend_class`) for target ("cuda" or "cpu") into
+    the cache unless the library is already there; returns the library path (it is not loaded or
+    checked here: `load_backend`)."""
+    compiler, flags, suffix, lib = _build_spec(target, device, backend_class)
     if lib.is_file():
         return lib
     lib.parent.mkdir(parents=True, exist_ok=True)
     partial = _partial_path(lib)
-    _compile(target, compiler, flags, suffix, partial)
+    _compile(target, compiler, flags, suffix, partial, **_compile_args(backend_class))
     os.replace(partial, lib)  # atomic: concurrent builds and killed jobs leave no half file
     return lib
 
 
-def _load(target, device=None):
-    """The `_Backend` of target: the cached library if it loads; otherwise (none cached, or a cached
-    file that does not load: truncated or empty, a stale argument layout, ...) one fresh build.
+def _load(target, device=None, backend_class=None):
+    """The `_Backend` (or `backend_class`) of target: the cached library if it loads; otherwise (none
+    cached, or a cached file that does not load: truncated or empty, a stale argument layout, ...)
+    one fresh build.
 
     The fresh build is loaded under its own temporary name and only then moved over the cache entry
     (atomic os.replace), so a bad cached file is replaced for later jobs, and the process never
     re-opens a path whose stale library the dynamic loader may already hold (dlopen of a path
     already loaded returns the loaded library). If the fresh build does not load either, the
     partial file is removed and BackendUnavailable says why (with the cached file's failure)."""
-    compiler, flags, suffix, lib = _build_spec(target, device)
+    cls = _Backend if backend_class is None else backend_class
+    compiler, flags, suffix, lib = _build_spec(target, device, backend_class)
     stale = None
     if lib.is_file():
         try:
-            return _Backend(target, lib)
+            return cls(target, lib)
         except Exception as exc:  # noqa: BLE001 - any loading problem: rebuild once
             stale = f"{type(exc).__name__}: {exc}"
     lib.parent.mkdir(parents=True, exist_ok=True)
     partial = _partial_path(lib)
-    _compile(target, compiler, flags, suffix, partial)
+    _compile(target, compiler, flags, suffix, partial, **_compile_args(backend_class))
     try:
-        backend = _Backend(target, partial)
+        backend = cls(target, partial)
     except Exception as exc:  # noqa: BLE001
         _unlink(partial)
         why = f"{target} library built but it does not load: {type(exc).__name__}: {exc}"
@@ -569,10 +590,11 @@ class _Backend:
                                f"{self._lib.nq_error_string(code).decode(errors='replace')}")
 
 
-def load_backend(target, device=None):
+def load_backend(target, device=None, backend_class=None):
     """The kernel library for target "cuda" or "cpu" (built at first use, cached per process and
     on disk; a cached file that does not load is rebuilt once, `_load`); raises BackendUnavailable
-    with the reason (also cached for the process: no retry)."""
+    with the reason (also cached for the process: no retry). `backend_class`: another library
+    (`_build_spec`), cached under its own key."""
     if target == "cuda":
         if not torch.cuda.is_available():
             raise BackendUnavailable("CUDA is not available to torch")
@@ -584,13 +606,15 @@ def load_backend(target, device=None):
         key = ("cpu",)
     else:
         raise ValueError(f"unknown target {target!r}")
+    if backend_class is not None:
+        key = (backend_class.NAME,) + key
     hit = _BACKENDS.get(key)
     if isinstance(hit, _Backend):
         return hit
     if isinstance(hit, BackendUnavailable):
         raise hit
     try:
-        backend = _load(target, device)
+        backend = _load(target, device, backend_class)
     except BackendUnavailable as exc:
         _BACKENDS[key] = exc
         raise
@@ -602,10 +626,10 @@ def load_backend(target, device=None):
     return backend
 
 
-def backend_status(target, device=None):
+def backend_status(target, device=None, backend_class=None):
     """(available, reason): reason is the library path when available."""
     try:
-        return True, load_backend(target, device).path
+        return True, load_backend(target, device, backend_class).path
     except BackendUnavailable as exc:
         return False, str(exc)
 
