@@ -124,14 +124,114 @@ from neoqcd.fermions.algebra import unitarize
 from neoqcd.fermions.dirac import WilsonDirac
 from neoqcd.fermions.hmc import HMC, ActionTerm, Hamiltonian, WilsonGaugeAction, random_momenta
 from neoqcd.fermions.pseudofermion import ON_UNCONVERGED, TwoFlavourWilson, convergence_limit, hopping_derivative
-from neoqcd.fermions.solver import solve
+from neoqcd.fermions.solver import SolverResult, _norm2, cg
 
 __all__ = ["BlockDecomposition", "BlockWilsonDirac", "DDOperators", "BlockTwoFlavour", "SchurTwoFlavour",
            "MaskedActionTerm", "DDHMCHamiltonian", "DDHMC", "ddhmc_step", "random_translation", "translate",
            "random_shifts", "block_offset", "luscher_translation_step", "check_translation_invariant",
-           "TRANSLATIONS"]
+           "cgne_d_system", "solve_d_system", "TRANSLATIONS", "MAX_REFINEMENTS", "REFINE_SAFETY"]
 
 TRANSLATIONS = ("random", "luscher", "odometer", None)
+
+# D-system solves (`cgne_d_system`): at most MAX_REFINEMENTS correction passes after the first CGNE
+# pass, each to REFINE_SAFETY times the relative normal-equation tolerance that would just suffice
+# (0.1: one correction pass, rarely two, in the near-critical 2D tests; 0.2 and 0.3 cost about the
+# same and need a second pass more often)
+MAX_REFINEMENTS = 10
+REFINE_SAFETY = 0.1
+
+
+def cgne_d_system(apply, apply_dagger, normal_solve, rhs, b2, tol, max_iter):
+    """Solve D_hat x = rhs (an even-odd Schur system) by CGNE until the D-SYSTEM residual
+    |rhs - D_hat x| is at most max(tol, 1e3 eps) |b| for every sample.
+
+    b is the full-lattice right-hand side of D x = b, b2 = |b|^2 per sample (B,), and
+    rhs = b_e + kappa H_eo b_o; with the odd sites reconstructed exactly, x_o = b_o + kappa H_oe x_e,
+    |rhs - D_hat x_e| IS the full residual |b - D x| (its odd part vanishes), so the returned
+    residual is the true relative residual of D x = b.
+
+    Why the passes. CGNE (CG on D_hat^dag D_hat) stops on the normal-equation residual,
+    |D_hat^dag r| <= tol |D_hat^dag rhs|, which bounds |r| = |rhs - D_hat x| only up to a factor
+    1 / sigma_min(D_hat): near the critical kappa the D residual is that much larger than tol (up to
+    ~50 x tol on 2D 8x8 at kappa 0.246-0.254, sigma_min 2e-3 to 4e-2). The Schur term needs the
+    solution of the D system (R^-1, R) to a known accuracy, so the first pass is CGNE at `tol` and
+    every sample whose |r| is still above its target gets a correction pass (defect correction on
+    the D system, in the precision of rhs): r = rhs - D_hat x, CG on D_hat^dag D_hat e = D_hat^dag r
+    from zero to the relative normal tolerance
+        t = REFINE_SAFETY x target |b| / (|r| x excess)    (capped at 0.5),
+    x += e. Without `excess` this is REFINE_SAFETY times the tolerance that would just reach the
+    target if the residual kept its ratio |r| / |D_hat^dag r|; the ratio grows as CG removes the
+    large singular values first, so `excess` >= 1 is the observed / predicted residual of the
+    sample's previous correction pass (1 before the first). Samples within their target get a zero
+    right-hand side (they do not move).
+
+    `normal_solve(nrhs, tol, max_iter)` -> (x, iterations (B,), loop iterations (int)): CG on
+    D_hat^dag D_hat from zero, `tol` a float or a (B,) tensor, a zero right-hand side giving x = 0.
+    `max_iter` bounds the loop iterations of all passes together. The passes stop when every sample
+    is within its target, non-finite or stagnated (a correction pass after the sample's first one
+    that did not halve its residual: a roundoff floor; a pass that did not decrease it is undone),
+    after MAX_REFINEMENTS correction passes, or when the budget is spent; the caller's convergence
+    check (10 x the target) then decides.
+
+    Returns (x, iterations (B,) summed over the passes, residual (B,) = |rhs - D_hat x| / |b|
+    (|rhs - D_hat x| where b = 0), refinements = the number of correction passes).
+    """
+    eps = torch.finfo(b2.dtype).eps
+    b_norm = torch.sqrt(torch.where(b2 > 0, b2, torch.ones_like(b2)))
+    target = max(float(tol), 1e3 * eps)
+    x, iterations, loops = normal_solve(apply_dagger(rhs), tol, max_iter)
+    r = rhs - apply(x)
+    res = torch.sqrt(_norm2(r)) / b_norm
+    frozen = ~torch.isfinite(res)
+    ones = torch.ones_like(res)
+    excess = ones.clone()  # observed / predicted residual of the sample's last correction pass (>= 1)
+    passes = torch.zeros_like(iterations)
+    refinements = 0
+    while True:
+        need = (res > target) & ~frozen
+        if not bool(need.any()) or refinements >= MAX_REFINEMENTS or loops >= max_iter:
+            break
+        t = torch.clamp(REFINE_SAFETY * target / (torch.where(need, res, ones) * excess), max=0.5)
+        t = torch.where(need, t, 0.5 * ones)
+        src = torch.where(need.view((-1,) + (1,) * (r.dim() - 1)), r, torch.zeros_like(r))
+        e, e_iterations, e_loops = normal_solve(apply_dagger(src), t, max_iter - loops)
+        loops += e_loops
+        iterations = iterations + e_iterations
+        refinements += 1
+        passes = passes + need.long()
+        x_new = x + e
+        r_new = rhs - apply(x_new)
+        res_new = torch.sqrt(_norm2(r_new)) / b_norm
+        better = need & (res_new < res)
+        # stagnated: a non-finite residual, or less than a halving short of the target in a
+        # correction pass after the sample's first one (the first measures the excess)
+        stuck = ~torch.isfinite(res_new) | ((passes >= 2) & ~(2.0 * res_new <= res))
+        frozen = frozen | (need & stuck & ~(res_new <= target))
+        excess = torch.where(need & torch.isfinite(res_new), torch.clamp(res_new / (t * res), min=1.0), excess)
+        keep = better.view((-1,) + (1,) * (x.dim() - 1))
+        x = torch.where(keep, x_new, x)
+        r = torch.where(keep, r_new, r)
+        res = torch.where(better, res_new, res)
+    return x, iterations, res, refinements
+
+
+def solve_d_system(op, b, tol, max_iter, info=None):
+    """D^-1 b for a `WilsonDirac` op (the full or the block operator), b a full-lattice field:
+    even-odd, CGNE passes with `solver.cg` until the true relative residual of D x = b is at most
+    max(tol, 1e3 eps) per sample (`cgne_d_system`). Returns SolverResult(x full, iterations (B,)
+    summed over the passes, residual |b - D x| / |b| computed as |rhs - D_hat x_e| / |b|);
+    `info` (a dict) receives "refinements"."""
+    eo = op.even_odd()
+
+    def normal_solve(nrhs, t, budget):
+        res = cg(eo.normal, nrhs, tol=t, max_iter=budget)
+        return res.x, res.iterations, int(res.iterations.max().item())
+
+    x_e, iterations, residual, refinements = cgne_d_system(eo.apply, eo.apply_dagger, normal_solve,
+                                                           eo.prepare_rhs(b), _norm2(b), tol, max_iter)
+    if info is not None:
+        info["refinements"] = refinements
+    return SolverResult(eo.reconstruct(x_e, b), iterations, residual)
 
 
 class BlockDecomposition:
@@ -259,11 +359,12 @@ class BlockWilsonDirac(WilsonDirac):
 class DDOperators:
     """D, D_bl, D_dOmega, D_dOmegaS, R and R^-1 at links U (module doc for the formulas).
 
-    `tol` is the relative tolerance of every solve (CGNE, even-odd). Fields: (B, lattice, S, N).
-    Without `solver` a solve whose true residual is above `convergence_limit(tol)` raises and
-    `solves` / `iterations` count them. With `solver` (a callable (op, b, tol) -> x, the term's
-    `SchurTwoFlavour._solve`, which does the bookkeeping and applies its `on_unconverged` policy)
-    every solve goes through it.
+    `tol` is the relative tolerance of every solve, on the residual of the D system itself
+    (`solve_d_system`: even-odd CGNE passes until |b - D x| <= max(tol, 1e3 eps) |b|). Fields:
+    (B, lattice, S, N). Without `solver` a solve whose true residual is above
+    `convergence_limit(tol)` raises and `solves` / `iterations` count them. With `solver` (a
+    callable (op, b, tol) -> x, the term's `SchurTwoFlavour._solve`, which does the bookkeeping and
+    applies its convergence policy) every solve goes through it.
     """
 
     def __init__(self, U, kappa, blocks, time_sign=-1.0, tol=1e-12, max_iter=5000, solver=None):
@@ -300,7 +401,7 @@ class DDOperators:
     def _solve(self, op, b):
         if self.solver is not None:
             return self.solver(op, b, self.tol)
-        res = solve(op.even_odd(), b, method="cgne", tol=self.tol, max_iter=self.max_iter)
+        res = solve_d_system(op, b, self.tol, self.max_iter)
         self.solves += 1
         self.iterations += int(res.iterations.max().item())
         limit = convergence_limit(self.tol, res.residual.dtype)
@@ -359,12 +460,19 @@ class SchurTwoFlavour(ActionTerm):
     solves at action_tol), action with one full solve (action_tol), force on the active links with
     two full solves (solver_tol). No chronological guess: every solve starts from zero.
 
-    Bookkeeping and convergence policy as `TwoFlavourWilson` (the same methods): `stats` holds
-    refresh_calls, action_calls, force_calls, solves, cg_iterations (sum over solves of the largest
-    per-sample count), cg_iterations_per_sample ((B,) totals), last_iterations, last_residual
-    (the TRUE relative residual |b - D x| / |b| of the full or block system, per sample) and
-    unconverged_solves; `reset_stats()` zeroes them. After every solve the residual is compared
-    with `convergence_limit(tol)` = 10 max(tol, 1e3 eps): `on_unconverged` "raise" (default) raises
+    Solves. Every solve is of the D system, D x = b (full) or D_bl x = b (block), and `tol` is a
+    tolerance on ITS residual: `solve_d_system` / `cgne_d_system` run even-odd CGNE passes until
+    |b - D x| <= max(tol, 1e3 eps) |b| per sample (a plain CGNE stopping on the normal-equation
+    residual leaves |b - D x| up to 1 / sigma_min(D_hat) times larger near the critical kappa).
+
+    Bookkeeping as `TwoFlavourWilson` (the same methods): `stats` holds refresh_calls,
+    action_calls, force_calls, solves, cg_iterations (sum over solves of the largest per-sample
+    count, all passes), cg_iterations_per_sample ((B,) totals), last_iterations, last_residual
+    (per sample, the TRUE relative residual of the D system, |b - D x| / |b| = |rhs - D_hat x_e| / |b|
+    with rhs = b_e + kappa H_eo b_o: the same quantity in `FastSchurTwoFlavour`), unconverged_solves,
+    and refinements (correction passes after the first CGNE pass, summed over solves);
+    `reset_stats()` zeroes them. After every solve the residual is compared with
+    `convergence_limit(tol)` = 10 max(tol, 1e3 eps): `on_unconverged` "raise" (default) raises
     a RuntimeError naming the kind ("refresh": the block solves of R eta; "action"; "force"),
     "warn" warns once per kind, "ignore" only counts. Every solve goes through `_solve(op, b, tol)`
     (looked up on the instance at call time, so a wrapper such as main_hmc's SolveTimer sees it).
@@ -395,12 +503,15 @@ class SchurTwoFlavour(ActionTerm):
     def reset_stats(self):
         self.stats = {"refresh_calls": 0, "action_calls": 0, "force_calls": 0, "solves": 0,
                       "cg_iterations": 0, "cg_iterations_per_sample": None, "last_iterations": None,
-                      "last_residual": None, "unconverged_solves": 0}
+                      "last_residual": None, "unconverged_solves": 0, "refinements": 0}
 
     def _solve(self, op, b, tol):
-        """D^-1 b for a `WilsonDirac` op (the full or the block operator): even-odd CGNE from zero,
-        then the bookkeeping and the convergence check on the true residual of D x = b."""
-        res = solve(op.even_odd(), b, method="cgne", tol=tol, max_iter=self.max_iter)
+        """D^-1 b for a `WilsonDirac` op (the full or the block operator): `solve_d_system` (even-odd
+        CGNE passes from zero until |b - D x| <= max(tol, 1e3 eps) |b|), then the bookkeeping and the
+        convergence check on that true residual of D x = b."""
+        info = {}
+        res = solve_d_system(op, b, tol, self.max_iter, info)
+        self.stats["refinements"] += info["refinements"]
         self._count(res, tol, self._solve_kind or "solve")
         return res.x
 

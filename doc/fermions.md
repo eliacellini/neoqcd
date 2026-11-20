@@ -815,12 +815,45 @@ cached per (mask, device, real dtype), so a trajectory makes no host-device copy
 as `~active_links` are converted on every call; the cached tensors are shared, never modified in
 place). `SchurTwoFlavour` has the stats keys of `TwoFlavourWilson` (`refresh_calls`,
 `action_calls`, `force_calls`, `solves`, `cg_iterations`, `cg_iterations_per_sample`,
-`last_iterations`, `last_residual`, `unconverged_solves`; the old `iterations` key is gone) and its
-`on_unconverged` policy (§5b, convergence policy; kinds `refresh` for the two block solves of R η,
-`action`, `force`). The residual checked is the true |b − D x|/|b| of the full or block system.
-Every solve goes through the instance's `_solve(op, b, tol)` (`DDOperators(..., solver=...)`), so
-`main_hmc.py`'s `SolveTimer` wraps it as for the other terms. Per trajectory: refresh 2 block
-solves, Metropolis 1 full solve, every Schur force 2 full solves, every block force 1 block solve.
+`last_iterations`, `last_residual`, `unconverged_solves`; the old `iterations` key is gone), plus
+`refinements` (below), and its `on_unconverged` policy (§5b, convergence policy; kinds `refresh`
+for the two block solves of R η, `action`, `force`). Every solve goes through the instance's
+`_solve(op, b, tol)` (`DDOperators(..., solver=...)`), so `main_hmc.py`'s `SolveTimer` wraps it as
+for the other terms. Per trajectory: refresh 2 block solves, Metropolis 1 full solve, every Schur
+force 2 full solves, every block force 1 block solve.
+
+**Schur solves: the tolerance is on the D system** (since 2026-11-20). Every Schur solve is of
+D x = b (full) or D_bl x = b (block) and needs that solution (R⁻¹, R) to a known accuracy, so its
+`tol` bounds |b − D x|/|b|, not the normal-equation residual where CGNE stops. `solve_d_system` /
+`cgne_d_system` (the fast class: the same function on the half lattice) run CGNE on D̂†D̂ at `tol`;
+a sample whose |rhs − D̂ x_e| is still above max(tol, 1e3 ε)|b| gets correction passes: CGNE on
+D̂ e = rhs − D̂ x_e from zero to 0.1 × the relative normal tolerance that would just reach the
+target (divided by the excess observed in the sample's previous pass), x_e += e. At most 10 passes
+within the solve's `max_iter` budget; after its first correction pass a sample that does not halve
+its residual stops (a roundoff floor); then the policy check at 10 max(tol, 1e3 ε) decides. Why:
+CGNE stops at |D̂†r| ≤ tol |D̂†rhs|, which leaves |r| up to 1/σ_min(D̂) times larger. Before the
+change the policy compared |r| with 10 tol, so near the critical κ (2D 8×8 SU(3),
+U = exp(0.03 P), κ = 0.246–0.254, periodic time, σ_min 2e-3 to 4e-2, B = 8, 6 seeds × 6 κ) 38 of
+180 reference solves, 6 of 180 fast mixed and 1 of 180 fast double with `check_every = 1` were
+flagged, and with the default policy the run died. Now none is flagged and every D residual is
+within `tol`.
+- Recorded residual (`last_residual`, the policy, `max_residual` of the driver): the true relative
+  residual of the D system, |b − D x|/|b| = |rhs − D̂ x_e|/|b| with rhs = b_e + κ H_eo b_o and
+  x_o = b_o + κ H_oe x_e (the odd part of b − D x vanishes), the same quantity in `SchurTwoFlavour`
+  and `FastSchurTwoFlavour` (tests: recomputed with `WilsonDirac` on the full lattice). The block
+  term (`BlockTwoFlavour` = `TwoFlavourWilson` on D_bl) solves its normal system D̂_bl†D̂_bl X = φ
+  itself, so its residual is that of the normal equation: `max_residual` in observables.csv is
+  the largest of a normal-equation residual (block term) and a D-system residual (Schur term).
+- Cost (`refinements` counts the correction passes; their iterations are in `cg_iterations`,
+  `cg_loop_iterations`, `double_applications`; each pass adds one D̂† and one D̂ application). On
+  the near-critical set above, CG iterations +6% on the reference (110 passes in 180 solves),
+  +1% on fast double with `check_every = 1` (20), +0.4% on fast double with the default
+  `check_every = 10` (4: its overshoot usually reaches the D target), +13% on fast mixed (68,
+  complex64 loop + complex128 applications). One DD cycle of the 8^4 SU(3) benchmark below (Haar,
+  κ = 0.153): reference 485 → 495 Schur iterations (2 passes), fast double and mixed unchanged (no
+  pass); from a smooth start (U = exp(0.25 P), plaquette 0.71) 695 → 761 (9 passes) on the
+  reference, the fast paths again unchanged; dH equal to the 7 printed digits. The fast double
+  path rarely needs a pass because `check_every = 10` overshoots the normal tolerance.
 
 **Fast path** (`fast_ddhmc.py`, `main_hmc.py --dd-blocks --fast`; ground truth: the reference
 classes).
@@ -832,8 +865,9 @@ classes).
   link layouts.
 - `FastSchurTwoFlavour`: the Schur term with φ_R and every intermediate field as a pair of
   half-lattice fields. A solve D x = b (full) or D_bl x = b (block) is `prepare_rhs_half`, CGNE on
-  D̂†D̂ with `lean_cg` or `mixed_precision_cg` from zero, `reconstruct_odd`; the residual checked
-  is the reference's (|rhs − D̂ x_e|/|b|, one extra D̂). The hops between colours use the full
+  D̂†D̂ with `lean_cg` or `mixed_precision_cg` from zero with the D-system correction passes of
+  `cgne_d_system` (above), `reconstruct_odd`; the residual recorded and checked is the
+  reference's (|rhs − D̂ x_e|/|b|, one extra D̂ per pass). The hops between colours use the full
   operator and site masks only, D_∂Ω = −κ P_Ω H P_Ω*: the in-block hops join sites of one colour,
   so this equals the reference's hop through the cut links term by term, and no cut-link operator
   is gathered. The force is −2κ `HalfLatticeWilson.hopping_derivative`(ζ, x) with
@@ -879,7 +913,9 @@ fermions and `--kappa-heavy` are refused with a message. Each trajectory is `DDH
 (translation, then the trajectory on the active links). Outputs:
 - observables.csv: the plain-HMC columns; `solves`, `cg_iter`, `cg_iter_replica`, `solve_s`,
   `max_residual` cover both terms (with `--precision mixed`, `cg_iter` is the real cost of both:
-  complex64 loop plus complex128 outer applications);
+  complex64 loop plus complex128 outer applications, without the Schur term's D̂ application per
+  pass for its residual; `max_residual` mixes the block term's normal-equation residual and the
+  Schur term's D-system residual, see above);
 - run_meta.json `run.dd`: blocks, blocks per direction, translation, `n_regular` and
   `luscher_step`, `active_fraction` (measured) and `expected_active_fraction` (the paper's
   formula), the number of Schur components, the levels (term classes and substeps), and
@@ -920,6 +956,11 @@ repo convention.
   and counts of the Schur term, an instance wrapper of `_solve` seeing every solve, the
   `on_unconverged` policy (raise, warn once per kind, ignore) and its route through
   `DDHMCHamiltonian(schur_kwargs=...)`.
+- `DSystemSolveTest`: near the critical κ (2D 8×8, κ = 0.254) plain CGNE leaves |b − D x|/|b|
+  12-19 × tol, `solve_d_system` brings every sample within tol (recorded residual = the true one),
+  a zero right-hand side stays zero, samples within tol after the first pass get no extra
+  iterations, `max_iter` bounds all passes together, and a tolerance below roundoff stops at the
+  floor in at most 3 passes.
 
 `test_fermions_ddhmc_fast.py` (CPU, ~25 s; the fused `cpu` variants need a host C++ compiler):
 - block term and Schur term against `BlockTwoFlavour` / `SchurTwoFlavour` on Haar links, batch 2,
@@ -933,6 +974,12 @@ repo convention.
   active link (2e-15);
 - operator caches (on the unmasked links; `_version`; κ), stats, timer hook and policy of the fast
   Schur term;
+- `NearCriticalSolveTest`: the reviewer's near-critical cases (2D 8×8, U = exp(0.03 P), κ = 0.254
+  and 0.248, B = 8; flagged before) with the default policy for the reference, fast double, fast
+  `check_every = 1` and fast mixed: no solve flagged, every solve's D residual within its tolerance
+  (recomputed with `WilsonDirac` and equal to the recorded one to 5% of tol, which pins the
+  recorded residual), refresh R⁻¹R η = η, action (2e-14) and force (1e-10 to 1e-9) against the
+  dense matrices and autograd;
 - whole DD cycles (translation, refresh, three-level MD, Metropolis) of every fast variant against
   the reference from the same generator: dH to 1e-8 (measured 3e-13 to 1e-12 in 2D, 6e-12 in 4D),
   the same accept decisions, links to 1e-10 (2D both time signs; 4D 8^4 SU(2) one short cycle);

@@ -23,15 +23,19 @@ Schur term
 ----------
 `FastSchurTwoFlavour` is `SchurTwoFlavour` (S_R = |R^-1 phi_R|^2, phi_R on the code's dOmega*) with
 every field kept as a pair of half-lattice fields (even, odd sites; `fast.to_half` order) and
-every solve D^-1 b (full operator) or D_bl^-1 b (block operator) done as in `solver.solve` but on
-the half lattice:
+every solve D^-1 b (full operator) or D_bl^-1 b (block operator) done as the reference's
+`ddhmc.solve_d_system` but on the half lattice:
     rhs = b_e + kappa H_eo b_o                       (`HalfLatticeWilson.prepare_rhs_half`),
     D_hat^dag D_hat x_e = D_hat^dag rhs               (`lean_cg`, or `mixed_precision_cg`),
     x_o = b_o + kappa H_oe x_e                        (`reconstruct_odd`),
-from zero (no chronological guess, as the reference). The residual checked by the convergence
-policy is the reference's, the true |b - D x| / |b| of the full-lattice system: its even part is
-rhs - D_hat x_e and its odd part vanishes up to rounding, so it is |rhs - D_hat x_e| / |b| (one
-extra application of D_hat per solve).
+from zero (no chronological guess, as the reference), with the CGNE passes of
+`ddhmc.cgne_d_system`: the tolerance is on the residual of the D system, and a sample whose
+|rhs - D_hat x_e| is still above max(tol, 1e3 eps) |b| after the CGNE pass at tol gets correction
+passes (CGNE on D_hat e = rhs - D_hat x_e from zero, x_e += e; stats `refinements`). The residual
+recorded and checked by the convergence policy is the reference's, the true |b - D x| / |b| of
+the full-lattice system: its even part is rhs - D_hat x_e and its odd part vanishes up to
+rounding, so it is |rhs - D_hat x_e| / |b| (one extra application of D_hat per pass, one of
+D_hat^dag per correction pass).
 The hops between the colours use the FULL operator and site masks only:
     D_dOmega psi  = -kappa P_Omega  H P_Omega* psi,     D_dOmegaS psi = -kappa P_Omega* H P_Omega psi,
 which is exactly the reference's hop through the cut links: the in-block hops join sites of one
@@ -42,8 +46,9 @@ action: chi = P(phi_R - D^-1 D_dOmega phi_R); force: zeta = gamma_5 D^-1 gamma_5
 F_R = -2 kappa `HalfLatticeWilson.hopping_derivative`(zeta, x) masked to the active links (two full
 solves). The full operator (and its complex64 copy with mixed precision) is cached per links tensor
 (identity and `_version`) and operator parameters, as in `FastTwoFlavourWilson`. Same draws
-(eta on the full lattice, then masked and split), stats (plus cg_loop_iterations,
-outer_iterations, double_applications) and `on_unconverged` policy as the reference. With
+(eta on the full lattice, then masked and split), stats (refinements included; plus
+cg_loop_iterations, outer_iterations, double_applications) and `on_unconverged` policy as the
+reference. With
 `kernel` != "off" the operators are `FusedHalfLatticeWilson` (kernel, link_layout, strict).
 
 `FastDDHMCHamiltonian` is `DDHMCHamiltonian` with these terms.
@@ -51,7 +56,7 @@ outer_iterations, double_applications) and `on_unconverged` policy as the refere
 
 import torch
 
-from neoqcd.fermions.ddhmc import DDHMCHamiltonian, SchurTwoFlavour
+from neoqcd.fermions.ddhmc import DDHMCHamiltonian, SchurTwoFlavour, cgne_d_system
 from neoqcd.fermions.fast import (
     COLOUR_PRODUCTS,
     FastTwoFlavourWilson,
@@ -228,28 +233,33 @@ class FastSchurTwoFlavour(SchurTwoFlavour):
         return self._half_lattice(U * self.blocks.link_mask(self.blocks.inblock_links, U))
 
     # ---- solves and hops -------------------------------------------------------------------------
-    def _solve(self, op, b, tol):
-        """x = (x_e, x_o) with D x = b for the full or block half-lattice operator `op` (module doc);
-        bookkeeping and the convergence check on the true residual |b - D x| / |b|."""
-        b_e, b_o = b
-        rhs = op.prepare_rhs_half(b_e, b_o)
-        nrhs = op.apply_dagger(rhs)
+    def _normal_solve(self, op, nrhs, tol, max_iter):
+        """CG on D_hat^dag D_hat x = nrhs from zero (`lean_cg`, or `mixed_precision_cg`), its cost
+        added to the stats; returns (x, iterations (B,), loop iterations) for `cgne_d_system`."""
         info = {}
         if self.precision == "double":
-            res = lean_cg(op.normal, nrhs, tol=tol, max_iter=self.max_iter, check_every=self.check_every, info=info)
+            res = lean_cg(op.normal, nrhs, tol=tol, max_iter=max_iter, check_every=self.check_every, info=info)
         else:
             res = mixed_precision_cg(op, FastTwoFlavourWilson._low_precision(op), nrhs, tol=tol,
-                                     inner_tol=self.inner_tol, max_outer=self.max_outer, max_iter=self.max_iter,
+                                     inner_tol=self.inner_tol, max_outer=self.max_outer, max_iter=max_iter,
                                      check_every=self.check_every, info=info)
             self.stats["outer_iterations"] += info["outer"]
             self.stats["double_applications"] += info["double_applications"]
         self.stats["cg_loop_iterations"] += info["loop_iterations"]
-        x_e = res.x
-        x_o = op.reconstruct_odd(x_e, b_o)
+        return res.x, res.iterations, info["loop_iterations"]
+
+    def _solve(self, op, b, tol):
+        """x = (x_e, x_o) with D x = b for the full or block half-lattice operator `op` (module doc):
+        `ddhmc.cgne_d_system` (CGNE passes until |b - D x| <= max(tol, 1e3 eps) |b|), bookkeeping and
+        the convergence check on that true residual |b - D x| / |b| = |rhs - D_hat x_e| / |b|."""
+        b_e, b_o = b
         b2 = _norm2(b_e) + _norm2(b_o)
-        residual = torch.sqrt(_norm2(rhs - op.apply(x_e)) / torch.where(b2 > 0, b2, torch.ones_like(b2)))
-        self._count(SolverResult(None, res.iterations, residual), tol, self._solve_kind or "solve")
-        return x_e, x_o
+        x_e, iterations, residual, refinements = cgne_d_system(
+            op.apply, op.apply_dagger, lambda nrhs, t, budget: self._normal_solve(op, nrhs, t, budget),
+            op.prepare_rhs_half(b_e, b_o), b2, tol, self.max_iter)
+        self.stats["refinements"] += refinements
+        self._count(SolverResult(None, iterations, residual), tol, self._solve_kind or "solve")
+        return x_e, op.reconstruct_odd(x_e, b_o)
 
     def _hop(self, op, psi, source, target):
         """-kappa P_target H P_source psi with the full hopping H (module doc: = the cut-link hop)."""

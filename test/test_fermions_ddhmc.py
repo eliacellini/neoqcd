@@ -459,7 +459,7 @@ class BookkeepingTest(unittest.TestCase):
         schur = SchurTwoFlavour(self.KAPPA, self.bd, solver_tol=1e-11)
         block = BlockTwoFlavour(self.KAPPA, self.bd, solver_tol=1e-11)
         want = set(TwoFlavourWilson(self.KAPPA, G2_8).stats)
-        self.assertEqual(set(schur.stats), want)
+        self.assertEqual(set(schur.stats), want | {"refinements"})  # + the correction passes of the D solves
         self.assertEqual(set(block.stats), want)
         calls = []
         original = schur._solve
@@ -518,6 +518,71 @@ class BookkeepingTest(unittest.TestCase):
         ops = DDOperators(U, self.KAPPA, self.bd, tol=1e-12, max_iter=2)
         with self.assertRaisesRegex(RuntimeError, "DD solve not converged"):
             ops.full_solve(torch.randn(G2_8.wilson_shape(2), dtype=torch.cdouble, generator=gen))
+
+
+class DSystemSolveTest(unittest.TestCase):
+    """`solve_d_system` / `cgne_d_system`: the tolerance is on |b - D x| / |b| (the D system), not on
+    the normal-equation residual where CGNE stops. Near the critical kappa (2D 8x8 SU(3),
+    U = exp(0.03 P), kappa = 0.254, periodic time, B = 8) the plain CGNE solve (`solver.solve`)
+    leaves |b - D x| / |b| above tol; the correction passes bring every sample within tol."""
+
+    def setUp(self):
+        from neoqcd.fermions.hmc import random_momenta
+        from neoqcd.fermions.algebra import unitarize
+        P = random_momenta(G2_8.link_shape(8), generator=torch.Generator().manual_seed(2), dtype=torch.cdouble)
+        self.U = unitarize(expi(0.03 * P, "auto"))
+        self.kappa = 0.254
+        self.b = torch.randn(G2_8.wilson_shape(8), dtype=torch.cdouble, generator=torch.Generator().manual_seed(3))
+
+    def test_d_residual_within_tol(self):
+        from neoqcd.fermions.ddhmc import solve_d_system
+        from neoqcd.fermions.dirac import WilsonDirac
+        from neoqcd.fermions.solver import solve
+        D = WilsonDirac(self.U, self.kappa, G2_8, time_sign=1.0)
+        b = self.b.clone()
+        b[5] = 0.0  # a zero right-hand side stays at x = 0
+        for tol in (1e-10, 3e-11):  # (at 1e-12 CGNE happens to get there by itself)
+            with self.subTest(tol=tol):
+                plain = solve(D.even_odd(), b, method="cgne", tol=tol, max_iter=50000)
+                info = {}
+                res = solve_d_system(D, b, tol, 50000, info)
+                true = ((b - D.apply(res.x)).abs() ** 2).reshape(8, -1).sum(1).sqrt()
+                true = true / (b.abs() ** 2).reshape(8, -1).sum(1).sqrt().clamp(min=1e-300)
+                say(f"D system at kappa 0.254, tol {tol:.0e}: plain CGNE max |b - Dx|/|b| / tol "
+                    f"{plain.residual.max().item() / tol:.1f}; with the passes {res.residual.max().item() / tol:.2f} "
+                    f"({info['refinements']} correction passes, iterations {res.iterations.tolist()} against "
+                    f"{plain.iterations.tolist()})")
+                self.assertGreater(plain.residual.max().item(), 2 * tol)  # the issue: CGNE stops too early
+                self.assertGreater(info["refinements"], 0)
+                self.assertLess(res.residual.max().item(), tol)
+                self.assertLess((res.residual - true).abs().max().item(), 0.05 * tol)  # recorded = true residual
+                self.assertEqual(res.x[5].abs().max().item(), 0.0)
+                self.assertEqual(int(res.iterations[5]), 0)
+                # the passes only add iterations to the samples that needed them
+                done = plain.residual <= tol
+                self.assertTrue(torch.equal(res.iterations[done], plain.iterations[done]))
+
+    def test_budget_and_floor(self):
+        from neoqcd.fermions.ddhmc import solve_d_system
+        from neoqcd.fermions.dirac import WilsonDirac
+        D = WilsonDirac(self.U, self.kappa, G2_8, time_sign=1.0)
+        # max_iter bounds the loop iterations of all passes together
+        full = solve_d_system(D, self.b, 1e-10, 50000)
+        for budget in (10, int(full.iterations.max()) - 1, int(full.iterations.max()) + 2):
+            with self.subTest(budget=budget):
+                res = solve_d_system(D, self.b, 1e-10, budget)
+                self.assertLessEqual(int(res.iterations.max()), budget)
+        self.assertGreater(solve_d_system(D, self.b, 1e-10, 10).residual.max().item(), 1e-6)
+        ops = DDOperators(self.U, self.kappa, BlockDecomposition(G2_8, 4), time_sign=1.0, tol=1e-10, max_iter=10)
+        with self.assertRaisesRegex(RuntimeError, "DD solve not converged"):
+            ops.full_solve(self.b)
+        # a tolerance below roundoff: the target is the floor 1e3 eps, the passes stop (stagnation or
+        # target) well before MAX_REFINEMENTS x the first pass, and the result is within the policy
+        info = {}
+        floor = solve_d_system(D, self.b, 1e-17, 50000, info)
+        eps = torch.finfo(torch.float64).eps
+        self.assertLess(floor.residual.max().item(), 10 * 1e3 * eps)
+        self.assertLessEqual(info["refinements"], 3)
 
 
 # ---------------------------------------------------------------------------------------------

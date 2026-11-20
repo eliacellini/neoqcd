@@ -324,6 +324,127 @@ class FastSchurTermTest(unittest.TestCase):
         self.assertIsNot(term.full_operator(U), op)
 
 
+class NearCriticalSolveTest(unittest.TestCase):
+    """The tolerance of a Schur solve is on the residual of the D system, |b - D x| / |b| (the
+    term's `last_residual`), not on the normal-equation residual where CGNE stops (up to
+    1 / sigma_min(D_hat) apart). Near the critical kappa (2D 8x8 SU(3), U = exp(0.03 P),
+    kappa 0.248 and 0.254, periodic time, sigma_min ~ 2e-3 to 4e-2, B = 8), before the correction
+    passes of `ddhmc.cgne_d_system` the reference and the fast check_every = 1 / mixed solves were
+    flagged unconverged, and with the default policy ("raise") the run died. Now: no solve flagged,
+    the D residual of every solve within its tolerance (recomputed independently with
+    `WilsonDirac` on the full lattice, and equal to the recorded one), and the action, force and
+    refresh still equal the dense matrices."""
+
+    CASES = ((2, 0.254), (0, 0.248))  # (seed, kappa): flagged before for (ref, ce1) and (ref, mixed)
+    VARIANTS = {"reference": (SchurTwoFlavour, {}), "fast double": (FastSchurTwoFlavour, {}),
+                "fast check_every 1": (FastSchurTwoFlavour, {"check_every": 1}),
+                "fast mixed": (FastSchurTwoFlavour, {"precision": "mixed"})}
+
+    @staticmethod
+    def links(seed, B=8):
+        from neoqcd.fermions.algebra import expi, unitarize
+        from neoqcd.fermions.hmc import random_momenta
+        P = random_momenta(G2.link_shape(B), generator=torch.Generator().manual_seed(seed), dtype=torch.cdouble)
+        return unitarize(expi(0.03 * P, "auto")), unitarize(expi(0.033 * P, "auto"))
+
+    @staticmethod
+    def d_residual(op, b, x, kappa, time_sign):
+        """|b - D x| / |b| per sample with the reference WilsonDirac of the solve's links (the full
+        links, or the block links with the cut links zeroed), fields as full-lattice tensors."""
+        from neoqcd.fermions.dirac import WilsonDirac
+        from neoqcd.fermions.fast import to_full
+        from neoqcd.fermions.solver import _norm2
+        if isinstance(b, tuple):  # fast: half-lattice pairs
+            b, x = to_full(b[0], G2, 0, odd=b[1]), to_full(x[0], G2, 0, odd=x[1])
+        r = b - WilsonDirac(op.U, kappa, G2, time_sign).apply(x)
+        return torch.sqrt(_norm2(r) / _norm2(b))
+
+    def test_d_residual_within_tolerance(self):
+        worst = {}
+        for seed, kappa in self.CASES:
+            U, V = self.links(seed)
+            for name, (cls, kw) in self.VARIANTS.items():
+                with self.subTest(seed=seed, kappa=kappa, variant=name):
+                    term = cls(kappa, BlockDecomposition(G2, 4), time_sign=1.0, max_iter=50000, **kw)  # policy "raise"
+                    solves = []
+                    original = term._solve
+
+                    def recorded(op, b, tol, term=term, original=original, solves=solves):
+                        x = original(op, b, tol)
+                        solves.append((term._solve_kind, tol, self.d_residual(op, b, x, kappa, 1.0),
+                                       term.stats["last_residual"].clone()))
+                        return x
+
+                    term._solve = recorded
+                    term.refresh(U, torch.Generator().manual_seed(1))
+                    term.action(V)
+                    term.force(V)
+                    self.assertEqual(term.stats["unconverged_solves"], 0)
+                    self.assertEqual([s[:2] for s in solves], [("refresh", 1e-12)] * 2 + [("action", 1e-12)]
+                                     + [("force", 1e-10)] * 2)
+                    for kind, tol, true, rec in solves:
+                        # within the tolerance itself (the policy's limit is 10 tol), up to the rounding
+                        # of the independent recomputation
+                        self.assertLess(true.max().item(), 1.05 * tol, msg=kind)
+                        self.assertLess(rec.max().item(), tol, msg=kind)
+                        # the recorded residual is the true D residual (rounding: |x| ~ |b| / sigma_min)
+                        self.assertLess((rec - true).abs().max().item(), 0.05 * tol, msg=kind)
+                    worst[(seed, kappa, name)] = (max(s[2].max().item() / s[1] for s in solves), term.stats["refinements"])
+        say("near-critical Schur solves, worst |b - D x| / (|b| tol) and correction passes: "
+            + ", ".join(f"{k} {v[0]:.2f} ({v[1]})" for k, v in worst.items()))
+        # the correction passes were needed: the reference refines in every case
+        self.assertTrue(all(v[1] > 0 for k, v in worst.items() if k[2] == "reference"))
+
+    def test_against_dense_matrices(self):
+        """One sample of the near-critical batch: R^-1 R eta = eta, the action and the force
+        against the dense matrices (autograd on every active link), reference and fast mixed."""
+        from neoqcd.fermions.algebra import algebra_basis
+        from neoqcd.fermions.exact import assemble_hopping
+        seed, kappa = self.CASES[0]
+        bd = BlockDecomposition(G2, 4)
+        U, V = self.links(seed)
+        N, n = G2.N, G2.volume * G2.spin * G2.N
+        basis = algebra_basis(N)
+        eye = torch.eye(n, dtype=torch.cdouble)
+
+        def site(m):
+            return m.reshape(-1).repeat_interleave(G2.spin * G2.N).to(torch.cdouble)
+
+        black, white, P = site(bd.black), site(bd.white), site(bd.exterior_boundary)
+        cut = bd.link_mask(bd.cut_links, torch.zeros(1, dtype=torch.cdouble))
+
+        def dense_chi(links, phi, theta=None):
+            if theta is not None:
+                X = torch.einsum("...a,aij->...ij", theta.to(links.dtype), basis)
+                links = torch.matmul(torch.linalg.matrix_exp(1j * X), links)
+            D = eye - kappa * assemble_hopping(links, G2, time_sign=1.0)[0]
+            Ddo = black[:, None] * (-kappa * assemble_hopping(links * cut, G2, time_sign=1.0)[0]) * white[None, :]
+            return P * (phi - torch.linalg.solve(D, Ddo @ phi))
+
+        s = 3  # the sample checked
+        active = bd.link_mask(bd.active_links, U)[..., 0, 0]
+        for name in ("reference", "fast mixed"):
+            with self.subTest(variant=name):
+                cls, kw = self.VARIANTS[name]
+                term = cls(kappa, bd, time_sign=1.0, max_iter=50000, **kw)
+                gen = torch.Generator().manual_seed(1)
+                term.refresh(U, gen)
+                eta = term._draw_eta(U, torch.Generator().manual_seed(1))[s].reshape(-1)
+                phi = term.phi[s].reshape(-1)
+                self.assertLess((dense_chi(U[s:s + 1], phi) - eta).abs().max().item(), 1e-9)  # R^-1 R eta = eta
+                theta = torch.zeros(V[s:s + 1].shape[:-2] + (N * N - 1,), dtype=torch.float64, requires_grad=True)
+                chi = dense_chi(V[s:s + 1], phi, theta)
+                S = (chi.conj() * chi).real.sum()
+                g, = torch.autograd.grad(S, theta)
+                F_dense = torch.einsum("...a,aij->...ij", g.to(V.dtype), basis)[0] * active[0, ..., None, None]
+                S_term, F = term.action(V)[s].item(), term.force(V)[s]
+                err_S, err_F = abs(S_term - S.item()) / S.item(), ((F - F_dense).abs().max() / F_dense.abs().max()).item()
+                say(f"near-critical {name} vs dense: action rel. err. {err_S:.1e}, force {err_F:.1e}")
+                self.assertLess(err_S, 1e-11)  # measured 2e-14
+                self.assertLess(err_F, 1e-8)  # measured 1e-10 to 1e-9 (force solves at 1e-10, |D^-1| ~ 500)
+                self.assertEqual(term.stats["unconverged_solves"], 0)
+
+
 def dd_hamiltonians(bd, kw, beta=5.0, kappa=0.2, substeps=2):
     """Reference and fast DD Hamiltonians with the same settings (Schur > block x substeps >
     gauge x substeps)."""
