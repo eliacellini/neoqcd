@@ -194,6 +194,67 @@ class _KernelEquality:
         bc = b.conj()
         self.assertLess(rel(op.normal(bc), ref.normal(bc.resolve_conj())), 1e-14)
 
+    def test_gamma5_hermiticity_per_direction(self):
+        """Links non-trivial in ONE direction at a time (identity elsewhere), both time signs: the
+        dagger hop is the adjoint of the hop for both target parities, <y, H x> = <H^dag y, x>,
+        D_hat^dagger = gamma5 D_hat gamma5, and both equal HalfLatticeWilson (1e-13). A wrong
+        dagger table of one direction cannot hide behind the other directions."""
+        dev = torch.device(self.device)
+        k = kappas(0.12, 0.14)
+
+        def dot(a, b):
+            return (a.conj() * b).reshape(a.shape[0], -1).sum(1)
+
+        for geo in (G46, G2):
+            for mu in range(geo.D):
+                U = torch.eye(geo.N, dtype=C).expand(geo.link_shape(2)).clone()
+                U[:, mu] = links(geo, 2, 70 + mu)[:, mu]
+                U = U.to(dev)
+                psi, phi = field(geo, 2, 80 + mu).to(dev), field(geo, 2, 85 + mu).to(dev)
+                xe, xo = to_half(psi, geo, 0), to_half(psi, geo, 1)
+                ye, yo = to_half(phi, geo, 0), to_half(phi, geo, 1)
+                for ts in (-1.0, 1.0):
+                    with self.subTest(lattice=geo.lattice, mu=mu, time_sign=ts):
+                        op = self.make(U, k, geo, ts)
+                        ref = HalfLatticeWilson(U, k, geo, time_sign=ts)
+                        for t, src, tgt in ((0, xo, ye), (1, xe, yo)):  # H_eo: odd -> even, H_oe: even -> odd
+                            Hx = op.hop(src, t)
+                            Hdy = op.hop(tgt, 1 - t, dagger=True)
+                            self.assertLess((dot(tgt, Hx) - dot(Hdy, src)).abs().max().item(),
+                                            1e-13 * dot(tgt, tgt).abs().max().item() ** 0.5 * dot(src, src).abs().max().item() ** 0.5)
+                            self.assertLess(rel(Hx, ref.hop(src, t)), 1e-14)
+                            self.assertLess(rel(Hdy, ref.hop(tgt, 1 - t, dagger=True)), 1e-14)
+                        self.assertLess(rel(op.apply_dagger(xe), op.gamma5(op.apply(op.gamma5(xe)))), 1e-14)
+                        self.assertLess((dot(ye, op.apply(xe)) - dot(op.apply_dagger(ye), xe)).abs().max().item(), 1e-11)
+
+    def test_with_kappa_on_the_fused_operator(self):
+        """fast_terms._with_kappa (the Hasenbusch heavy operator: a shallow copy at another kappa)
+        on a fused operator: same kernel, shared gathered links, every method at the new kappa;
+        the original keeps its kappa (both dtypes)."""
+        from neoqcd.fermions.fast_terms import _with_kappa
+        dev = torch.device(self.device)
+        geo = G46
+        k1, k2 = kappas(0.12, 0.13), kappas(0.09, 0.10)
+        U = links(geo, 2, 95).to(dev)
+        psi = field(geo, 2, 96).to(dev)
+        e, o = to_half(psi, geo, 0), to_half(psi, geo, 1)
+        op = self.make(U, k1, geo, -1.0)
+        before = op.normal(e)  # argument templates (and the soa copy) exist at k1
+        new = _with_kappa(op, k2)
+        self.assertIsInstance(new, FusedHalfLatticeWilson)
+        self.assertEqual((new.kernel, new.link_layout), (op.kernel, op.link_layout))
+        self.assertIs(new._links[0], op._links[0])
+        for dtype in (C, C64):
+            r2, n = HalfLatticeWilson(U, k2, geo).to(dtype), new.to(dtype)
+            xe, xo = e.to(dtype), o.to(dtype)
+            for name, fn in (("apply", lambda m: m.apply(xe)), ("apply_dagger", lambda m: m.apply_dagger(xe)),
+                             ("normal", lambda m: m.normal(xe)), ("prepare_rhs_half", lambda m: m.prepare_rhs_half(xe, xo)),
+                             ("reconstruct_odd", lambda m: m.reconstruct_odd(xe, xo))):
+                with self.subTest(dtype=dtype, case=name):
+                    self.assertLess(rel(fn(n), fn(r2)), TOL[dtype])
+        self.assertTrue(torch.equal(op.normal(e), before))
+        self.assertLess(rel(before, HalfLatticeWilson(U, k1, geo).normal(e)), 1e-14)
+
     def test_fresh_links_after_in_place_update(self):
         """The term's operator after an in-place update of the links (U._version bumps) is a new
         one whose kernel links (the soa copy included) are those of the new U, in both dtypes."""
@@ -311,21 +372,17 @@ class LoopKernelTest(_KernelEquality, unittest.TestCase):
 
 
 class CpuEmulationKernelTest(_KernelEquality, unittest.TestCase):
-    """The CUDA kernel source compiled for the host: tests its index arithmetic without a GPU."""
+    """The CUDA kernel source compiled for the host: tests its index arithmetic without a GPU.
+    Link layout "soa" (the default); `CpuEmulationSiteKernelTest` runs the same tests with "site"."""
 
     kernel = "cpu"
+    link_layout = "soa"
 
     @classmethod
     def setUpClass(cls):
         reason = cpu_reason()
         if reason is not None:
             raise unittest.SkipTest(f"host build of the kernel source unavailable: {reason}")
-
-
-class CpuEmulationSoaKernelTest(CpuEmulationKernelTest):
-    """As CpuEmulationKernelTest with the site-fastest link layout (the default)."""
-
-    link_layout = "soa"
 
 
 class CpuEmulationSiteKernelTest(CpuEmulationKernelTest):
@@ -335,8 +392,11 @@ class CpuEmulationSiteKernelTest(CpuEmulationKernelTest):
 
 
 class CudaKernelTest(_KernelEquality, unittest.TestCase):
+    """The compiled CUDA kernel, link layout "soa" (the default); `CudaSiteKernelTest`: "site"."""
+
     kernel = "cuda"
     device = "cuda"
+    link_layout = "soa"
 
     @classmethod
     def setUpClass(cls):
@@ -345,12 +405,17 @@ class CudaKernelTest(_KernelEquality, unittest.TestCase):
             raise unittest.SkipTest(f"cuda kernel not testable here: {reason}")
 
 
-class CudaSoaKernelTest(CudaKernelTest):
-    link_layout = "soa"
-
-
 class CudaSiteKernelTest(CudaKernelTest):
     link_layout = "site"
+
+
+class LayoutCoverageTest(unittest.TestCase):
+    def test_each_compiled_kernel_runs_both_link_layouts_once(self):
+        """The equality classes cover every (kernel, layout) of the compiled kernels exactly once."""
+        classes = [c for c in globals().values()
+                   if isinstance(c, type) and issubclass(c, _KernelEquality) and issubclass(c, unittest.TestCase)]
+        runs = sorted((c.kernel, c.link_layout) for c in classes if c.kernel in ("cpu", "cuda"))
+        self.assertEqual(runs, sorted((k, layout) for k in ("cpu", "cuda") for layout in F.LINK_LAYOUTS))
 
 
 class CudaDeviceAndStreamTest(unittest.TestCase):
