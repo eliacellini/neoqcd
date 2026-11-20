@@ -181,6 +181,7 @@ class MainHMCDDTest(unittest.TestCase):
             "integers": DD[:-1] + ["4x4"],
             "--n-block-substeps must be >= 1": DD + ["--n-block-substeps", "0"],
             "3 level": DD + ["--integrator", "omelyan,leapfrog"],
+            "--precision mixed yet": DD + ["--fast", "--precision", "mixed"],
         }
         for pattern, argv in refused.items():
             with self.subTest(pattern=pattern), self.assertRaisesRegex(SystemExit, pattern.strip()):
@@ -196,6 +197,36 @@ class MainHMCDDTest(unittest.TestCase):
         self.assertIsNone(MAIN.dd_key(MAIN.parse_args(COMMON)))
         self.assertIn("_dd8x4_", MAIN.default_name(args))
         self.assertNotIn("_dd", MAIN.default_name(MAIN.parse_args(COMMON)))
+
+    def test_fast_and_fused_match_reference(self):
+        """--fast (and --kernel loop / cpu, the host build of the CUDA source when a C++ compiler
+        is available) reproduce the reference DD run: dH to 1e-8, the same accept pattern."""
+        from neoqcd.fermions.fused import backend_status
+        tight = ["--n-traj", "3", "--therm", "1", "--no-reuse-guess", "--solver-tol", "1e-13", "--action-tol", "1e-13",
+                 "--dd-translation", "luscher"]
+        ref = self.tmp / "reference"
+        MAIN.main(DD + tight + ["--out", str(ref)])
+        want = read_observables(ref / "observables.csv")
+        cases = {"fast": ["--fast"], "loop": ["--fast", "--kernel", "loop"]}
+        if backend_status("cpu")[0]:
+            cases["cpu"] = ["--fast", "--kernel", "cpu"]
+        for name, extra in cases.items():
+            with self.subTest(case=name):
+                out = self.tmp / name
+                MAIN.main(DD + tight + extra + ["--out", str(out)])
+                got = read_observables(out / "observables.csv")
+                self.assertLess(np.abs(got["dH"] - want["dH"]).max(), 1e-8)
+                self.assertTrue(np.array_equal(got["accepted"], want["accepted"]))
+                self.assertLess(np.abs(got["plaquette"] - want["plaquette"]).max(), 1e-10)
+                self.assertTrue(np.all(got["max_residual"] < 1e-11))
+                meta = json.loads((out / "run_meta.json").read_text())
+                self.assertEqual(meta["run"]["fermion_operator"], "half_lattice_fast" if name == "fast"
+                                 else "half_lattice_fused")
+                block = meta["run"]["dd"]["levels"][1][0][0]
+                self.assertEqual(block, "FastBlockTwoFlavour" if name == "fast" else "FusedBlockTwoFlavour")
+        # the solver path is in the resume key
+        with self.assertRaisesRegex(SystemExit, "differ"):
+            MAIN.main(DD + tight[:1] + ["5"] + tight[2:] + ["--out", str(ref), "--resume", "--fast"])
 
     def test_translation_none_warns_and_keeps_the_grid(self):
         out = self.tmp / "none"

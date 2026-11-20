@@ -507,10 +507,18 @@ class DDHMCHamiltonian(Hamiltonian):
     def __init__(self, beta, kappa, blocks, n_block_substeps=1, n_gauge_substeps=1, time_sign=-1.0,
                  block_kwargs=None, schur_kwargs=None):
         self.blocks = blocks
-        self.schur = SchurTwoFlavour(kappa, blocks, time_sign=time_sign, **(schur_kwargs or {}))
-        self.block = BlockTwoFlavour(kappa, blocks, time_sign=time_sign, **(block_kwargs or {}))
+        self.schur = self._make_schur(kappa, blocks, time_sign, dict(schur_kwargs or {}))
+        self.block = self._make_block(kappa, blocks, time_sign, dict(block_kwargs or {}))
         self.gauge = MaskedActionTerm(WilsonGaugeAction(beta, blocks.geometry), blocks)
         super().__init__([([self.schur], 1), ([self.block], n_block_substeps), ([self.gauge], n_gauge_substeps)])
+
+    def _make_schur(self, kappa, blocks, time_sign, kwargs):
+        """The Schur term (a subclass may build another implementation, `fast_ddhmc`)."""
+        return SchurTwoFlavour(kappa, blocks, time_sign=time_sign, **kwargs)
+
+    def _make_block(self, kappa, blocks, time_sign, kwargs):
+        """The block term (a subclass may build another implementation, `fast_ddhmc`)."""
+        return BlockTwoFlavour(kappa, blocks, time_sign=time_sign, **kwargs)
 
 
 def translate(U, shifts):

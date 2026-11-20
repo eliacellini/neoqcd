@@ -65,8 +65,10 @@ Schur-complement term (global solves) outermost with --n-steps steps, the block 
 --n-gauge-substeps steps per block position update (--integrator: one scheme or three); only the
 active links move, and every trajectory is preceded by a translation of the gauge field
 (DDHMC.cycle; --dd-translation random (default) | luscher (appendix C) | odometer | none, the
-last not ergodic, with a WARNING line). Without --dd-blocks the run is plain HMC, bitwise as
-before. Refused with staggered or no fermions and with --kappa-heavy. The CSV columns are those of
+last not ergodic, with a WARNING line). With --fast the block term runs through the half-lattice
+operator on the block links (neoqcd.fermions.fast_ddhmc; --kernel selects the fused hop as for
+plain HMC); the Schur term stays on the reference operators and --precision mixed is refused.
+Without --dd-blocks the run is plain HMC, bitwise as before. Refused with staggered or no fermions and with --kappa-heavy. The CSV columns are those of
 plain HMC (cost columns: Schur + block solves; block solves are global CGs on the block operator,
 one operator application per iteration like a full solve); run_meta.json "run"."dd" records the
 blocks, the active-link fraction (measured and the formula of the paper), the translation and its
@@ -125,6 +127,7 @@ from neoqcd.fermions.fast import FastTwoFlavourHamiltonian, resolve_colour_produ
 from neoqcd.fermions.fast_terms import FastHasenbuschHamiltonian, FastStaggeredHamiltonian  # noqa: E402
 from neoqcd.fermions import fused as fused_mod  # noqa: E402
 from neoqcd.fermions.ddhmc import DDHMC, BlockDecomposition, DDHMCHamiltonian  # noqa: E402
+from neoqcd.fermions.fast_ddhmc import FastDDHMCHamiltonian  # noqa: E402
 from neoqcd.fermions.hasenbusch import HasenbuschHamiltonian  # noqa: E402
 from neoqcd.fermions.lattice import Geometry  # noqa: E402
 from neoqcd.fermions.pseudofermion import TwoFlavourHamiltonian  # noqa: E402
@@ -347,8 +350,8 @@ def validate_dd(args):
         raise SystemExit("--dd-blocks is for --fermions wilson (DD-HMC is N_f = 2 Wilson only)")
     if args.kappa_heavy is not None:
         raise SystemExit("--dd-blocks does not combine with Hasenbusch (--kappa-heavy)")
-    if args.fast:
-        raise SystemExit("--dd-blocks does not support --fast yet")
+    if args.precision == "mixed":
+        raise SystemExit("--dd-blocks does not support --precision mixed yet (the Schur term has no fast path)")
     blocks = parse_dd_blocks(args.dd_blocks, args.D)
     lattice = (args.T,) + (args.L,) * (args.D - 1)
     for mu, (n, b) in enumerate(zip(lattice, blocks)):
@@ -565,9 +568,16 @@ def build_dd_hamiltonian(args, geometry, device=None):
     blocks = BlockDecomposition(geometry, args.dd_blocks, device=device)
     common = dict(solver_tol=args.solver_tol, action_tol=args.action_tol, max_iter=args.max_iter,
                   on_unconverged=args.on_unconverged)
-    ham = DDHMCHamiltonian(args.beta, args.kappa, blocks, n_block_substeps=args.n_block_substeps,
-                           n_gauge_substeps=args.n_gauge_substeps, time_sign=args.time_sign,
-                           block_kwargs=dict(common, reuse_guess=args.reuse_guess), schur_kwargs=common)
+    kw = dict(n_block_substeps=args.n_block_substeps, n_gauge_substeps=args.n_gauge_substeps,
+              time_sign=args.time_sign, block_kwargs=dict(common, reuse_guess=args.reuse_guess), schur_kwargs=common)
+    if args.fast:
+        fast_kwargs = dict(precision=args.precision, check_every=args.check_every, colour_product=args.colour_product,
+                           inner_tol=args.inner_tol, max_outer=args.max_outer)
+        ham = FastDDHMCHamiltonian(args.beta, args.kappa, blocks, fast_kwargs=fast_kwargs, kernel=args.kernel,
+                                   link_layout=args.link_layout or fused_mod.DEFAULT_LINK_LAYOUT,
+                                   strict=args.kernel in ("cuda", "cpu"), **kw)
+    else:
+        ham = DDHMCHamiltonian(args.beta, args.kappa, blocks, **kw)
     return ham, FermionTerms([ham.schur, ham.block])
 
 
