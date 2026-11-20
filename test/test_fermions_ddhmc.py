@@ -11,6 +11,7 @@ import itertools
 import math
 import os
 import unittest
+import warnings
 
 import torch
 
@@ -419,6 +420,106 @@ class TermTest(unittest.TestCase):
             self.check_force(term, U, gen, label, n_links=4, geometry=G)
 
 
+class BookkeepingTest(unittest.TestCase):
+    """Cached device masks, the TwoFlavourWilson stats keys and the on_unconverged policy of the
+    Schur term (2D 8x8 SU(3), 4x4 blocks, kappa = 0.2)."""
+
+    KAPPA = 0.2
+
+    def setUp(self):
+        self.bd = BlockDecomposition(G2_8, 4)
+
+    def test_masks_cached_per_device_and_dtype(self):
+        bd = self.bd
+        U, _ = haar_links(G2_8, 2, 5)
+        m = bd.link_mask(bd.active_links, U)
+        self.assertIs(m, bd.link_mask(bd.active_links, U))
+        self.assertEqual((m.dtype, tuple(m.shape)), (torch.float64, (1, 2) + G2_8.lattice + (1, 1)))
+        self.assertTrue(torch.equal(m[0, ..., 0, 0], bd.active_links.double()))
+        m32 = bd.link_mask(bd.active_links, U.to(torch.complex64))
+        self.assertEqual(m32.dtype, torch.float32)
+        self.assertIsNot(m32, m)
+        psi = torch.zeros(G2_8.wilson_shape(1), dtype=torch.cdouble)
+        f = bd.field_mask(bd.exterior_boundary, psi)
+        self.assertIs(f, bd.field_mask(bd.exterior_boundary, psi))
+        self.assertTrue(torch.equal(f[0, ..., 0, 0], bd.exterior_boundary.double()))
+        n = len(bd._mask_cache)
+        inactive = bd.link_mask(~bd.active_links, U)  # a temporary: converted, not cached
+        self.assertEqual(len(bd._mask_cache), n)
+        self.assertTrue(torch.equal(inactive + m, torch.ones_like(m)))
+        # built on the requested device, same masks
+        on = BlockDecomposition(G2_8, 4, device=torch.device("cpu"))
+        self.assertEqual(on.device, torch.device("cpu"))
+        for name in BlockDecomposition.SITE_MASKS + BlockDecomposition.LINK_MASKS:
+            self.assertTrue(torch.equal(getattr(on, name), getattr(bd, name)), name)
+
+    def test_schur_stats_match_two_flavour_wilson(self):
+        from neoqcd.fermions.pseudofermion import TwoFlavourWilson
+        U, gen = haar_links(G2_8, 2, 6)
+        schur = SchurTwoFlavour(self.KAPPA, self.bd, solver_tol=1e-11)
+        block = BlockTwoFlavour(self.KAPPA, self.bd, solver_tol=1e-11)
+        want = set(TwoFlavourWilson(self.KAPPA, G2_8).stats)
+        self.assertEqual(set(schur.stats), want)
+        self.assertEqual(set(block.stats), want)
+        calls = []
+        original = schur._solve
+
+        def wrapped(*a, **k):  # what main_hmc's SolveTimer does: an instance attribute
+            calls.append(1)
+            return original(*a, **k)
+
+        schur._solve = wrapped
+        schur.refresh(U, gen)
+        self.assertEqual((schur.stats["solves"], schur.stats["refresh_calls"]), (2, 1))  # R eta: two block solves
+        schur.action(U)
+        self.assertEqual((schur.stats["solves"], schur.stats["action_calls"]), (3, 1))
+        schur.force(U)
+        self.assertEqual((schur.stats["solves"], schur.stats["force_calls"]), (5, 1))
+        self.assertEqual(len(calls), 5)
+        s = schur.stats
+        self.assertEqual(tuple(s["cg_iterations_per_sample"].shape), (2,))
+        self.assertLessEqual(int(s["cg_iterations_per_sample"].max()), s["cg_iterations"])
+        self.assertEqual(tuple(s["last_residual"].shape), (2,))
+        self.assertLess(s["last_residual"].max().item(), 1e-10)
+        self.assertEqual(s["unconverged_solves"], 0)
+        schur.reset_stats()
+        self.assertEqual(schur.stats["solves"], 0)
+
+    def test_on_unconverged_policy(self):
+        from neoqcd.fermions.pseudofermion import UnconvergedSolveWarning
+        U, gen = haar_links(G2_8, 2, 7)
+        with self.assertRaises(ValueError):
+            SchurTwoFlavour(self.KAPPA, self.bd, on_unconverged="maybe")
+        term = SchurTwoFlavour(self.KAPPA, self.bd, max_iter=2)
+        with self.assertRaisesRegex(RuntimeError, "SchurTwoFlavour refresh: CG not converged"):
+            term.refresh(U, gen)
+        term = SchurTwoFlavour(self.KAPPA, self.bd, max_iter=2, on_unconverged="warn")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            term.refresh(U, gen)
+            term.action(U)
+            term.force(U)
+            term.force(U)
+        kinds = [str(x.message).split(":")[0] for x in w if issubclass(x.category, UnconvergedSolveWarning)]
+        self.assertEqual(kinds, ["SchurTwoFlavour refresh", "SchurTwoFlavour action", "SchurTwoFlavour force"])
+        self.assertEqual(term.stats["unconverged_solves"], 2 + 1 + 4)
+        term = SchurTwoFlavour(self.KAPPA, self.bd, max_iter=2, on_unconverged="ignore")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            term.refresh(U, gen)
+            term.action(U)
+        self.assertEqual(term.stats["unconverged_solves"], 3)
+        self.assertGreater(term.stats["last_residual"].max().item(), 1e-6)
+        # through the Hamiltonian's kwargs, and the standalone operators still raise
+        ham = DDHMCHamiltonian(5.0, self.KAPPA, self.bd, schur_kwargs={"max_iter": 2, "on_unconverged": "ignore"},
+                               block_kwargs={"max_iter": 2, "on_unconverged": "ignore"})
+        ham.refresh(U, gen)
+        self.assertEqual(ham.schur.stats["unconverged_solves"], 2)
+        ops = DDOperators(U, self.KAPPA, self.bd, tol=1e-12, max_iter=2)
+        with self.assertRaisesRegex(RuntimeError, "DD solve not converged"):
+            ops.full_solve(torch.randn(G2_8.wilson_shape(2), dtype=torch.cdouble, generator=gen))
+
+
 # ---------------------------------------------------------------------------------------------
 # Stage 4: DD-HMC
 # ---------------------------------------------------------------------------------------------
@@ -522,7 +623,7 @@ class DDHMCTest(unittest.TestCase):
         acc = (x.clamp(max=1.0)).mean().item()
         say(f"DD-HMC cycles: <exp(-dH)> = {m:.4f}({e:.4f}), <min(1, exp(-dH))> = {acc:.3f}, "
             f"plaquette {mean_plaquette(plaquette_fields(U, 2), 3).mean().item():.4f}, "
-            f"Schur solves {ham.schur.stats['solves']}, iterations/solve {ham.schur.stats['iterations'] / ham.schur.stats['solves']:.1f}")
+            f"Schur solves {ham.schur.stats['solves']}, iterations/solve {ham.schur.stats['cg_iterations'] / ham.schur.stats['solves']:.1f}")
         self.assertLess(abs(m - 1.0), 4 * e)
         self.assertGreater(acc, 0.7)
 

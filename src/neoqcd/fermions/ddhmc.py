@@ -123,7 +123,7 @@ from neoqcd.fermions._gauge import mean_plaquette, plaquette_fields
 from neoqcd.fermions.algebra import unitarize
 from neoqcd.fermions.dirac import WilsonDirac
 from neoqcd.fermions.hmc import HMC, ActionTerm, Hamiltonian, WilsonGaugeAction, random_momenta
-from neoqcd.fermions.pseudofermion import TwoFlavourWilson, convergence_limit, hopping_derivative
+from neoqcd.fermions.pseudofermion import ON_UNCONVERGED, TwoFlavourWilson, convergence_limit, hopping_derivative
 from neoqcd.fermions.solver import solve
 
 __all__ = ["BlockDecomposition", "BlockWilsonDirac", "DDOperators", "BlockTwoFlavour", "SchurTwoFlavour",
@@ -143,9 +143,18 @@ class BlockDecomposition:
         interior_boundary; exterior_boundary (the code's "dOmega*": white sites with a black
         neighbour = the paper's dOmega, colour-mirrored naming, module doc);
         inblock_links, cut_links, active_links.
+
+    `device`: where the bool masks are built (default CPU). `field_mask` / `link_mask` of one of
+    these attributes return a broadcastable real mask cached per (attribute, device, real dtype),
+    so the trajectory does no host-to-device copy; the cached tensors are shared: never modify
+    them in place. Any other mask tensor is converted on every call (no cache).
     """
 
+    SITE_MASKS = ("black", "white", "interior_boundary", "exterior_boundary")
+    LINK_MASKS = ("inblock_links", "cut_links", "active_links")
+
     def __init__(self, geometry, block_size, device=None):
+        self._mask_cache = {}
         D = geometry.D
         if isinstance(block_size, int):
             block_size = (block_size,) * D
@@ -207,13 +216,34 @@ class BlockDecomposition:
         return total / (D * math.prod(b))
 
     # ---- broadcastable masks -----------------------------------------------------------------
+    @property
+    def device(self):
+        return self.black.device
+
+    def _broadcast(self, mask, like, names):
+        """mask (lattice or (D,) + lattice) as a real (1, mask shape, 1, 1) tensor on like's device;
+        cached when `mask` IS one of the attributes `names` (identity, not equality: a temporary
+        such as ~active_links is never cached)."""
+        dtype = like.real.dtype
+        for name in names:
+            if mask is getattr(self, name, None):
+                key = (name, str(like.device), dtype)
+                out = self._mask_cache.get(key)
+                if out is None:
+                    out = mask.reshape((1,) + mask.shape + (1, 1)).to(device=like.device, dtype=dtype)
+                    self._mask_cache[key] = out
+                return out
+        return mask.reshape((1,) + mask.shape + (1, 1)).to(device=like.device, dtype=dtype)
+
     def field_mask(self, mask, like):
-        """Site mask (lattice) as a real (1, lattice, 1, 1) tensor for Wilson fields like `like`."""
-        return mask.reshape((1,) + mask.shape + (1, 1)).to(device=like.device, dtype=like.real.dtype)
+        """Site mask (lattice) as a real (1, lattice, 1, 1) tensor for Wilson fields like `like`
+        (cached for the attributes in SITE_MASKS)."""
+        return self._broadcast(mask, like, self.SITE_MASKS)
 
     def link_mask(self, mask, like):
-        """Link mask (D, lattice) as a real (1, D, lattice, 1, 1) tensor for links like `like`."""
-        return mask.reshape((1,) + mask.shape + (1, 1)).to(device=like.device, dtype=like.real.dtype)
+        """Link mask (D, lattice) as a real (1, D, lattice, 1, 1) tensor for links like `like`
+        (cached for the attributes in LINK_MASKS)."""
+        return self._broadcast(mask, like, self.LINK_MASKS)
 
 
 class BlockWilsonDirac(WilsonDirac):
@@ -229,16 +259,20 @@ class BlockWilsonDirac(WilsonDirac):
 class DDOperators:
     """D, D_bl, D_dOmega, D_dOmegaS, R and R^-1 at links U (module doc for the formulas).
 
-    `tol` is the relative tolerance of every solve (CGNE, even-odd); a solve whose true residual
-    is above `convergence_limit(tol)` raises. Fields: (B, lattice, S, N).
+    `tol` is the relative tolerance of every solve (CGNE, even-odd). Fields: (B, lattice, S, N).
+    Without `solver` a solve whose true residual is above `convergence_limit(tol)` raises and
+    `solves` / `iterations` count them. With `solver` (a callable (op, b, tol) -> x, the term's
+    `SchurTwoFlavour._solve`, which does the bookkeeping and applies its `on_unconverged` policy)
+    every solve goes through it.
     """
 
-    def __init__(self, U, kappa, blocks, time_sign=-1.0, tol=1e-12, max_iter=5000):
+    def __init__(self, U, kappa, blocks, time_sign=-1.0, tol=1e-12, max_iter=5000, solver=None):
         self.blocks = blocks
         self.geometry = blocks.geometry
         self.kappa = kappa
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        self.solver = solver
         self.full = WilsonDirac(U, kappa, blocks.geometry, time_sign)
         self.block = BlockWilsonDirac(U, kappa, blocks, time_sign)
         self.cut = WilsonDirac(U * blocks.link_mask(blocks.cut_links, U), kappa, blocks.geometry, time_sign)
@@ -264,6 +298,8 @@ class DDOperators:
         return white * (-self.cut._kappa_view(psi) * self.cut_hopping(black * psi))
 
     def _solve(self, op, b):
+        if self.solver is not None:
+            return self.solver(op, b, self.tol)
         res = solve(op.even_odd(), b, method="cgne", tol=self.tol, max_iter=self.max_iter)
         self.solves += 1
         self.iterations += int(res.iterations.max().item())
@@ -319,10 +355,31 @@ class BlockTwoFlavour(TwoFlavourWilson):
 
 
 class SchurTwoFlavour(ActionTerm):
-    """S_R = |R^-1 phi_R|^2 with phi_R on dOmega* (module doc): refresh phi_R = R eta, action with
-    one full solve, force on the active links with two full solves."""
+    """S_R = |R^-1 phi_R|^2 with phi_R on dOmega* (module doc): refresh phi_R = R eta (two block
+    solves at action_tol), action with one full solve (action_tol), force on the active links with
+    two full solves (solver_tol). No chronological guess: every solve starts from zero.
 
-    def __init__(self, kappa, blocks, time_sign=-1.0, solver_tol=1e-10, action_tol=None, max_iter=5000):
+    Bookkeeping and convergence policy as `TwoFlavourWilson` (the same methods): `stats` holds
+    refresh_calls, action_calls, force_calls, solves, cg_iterations (sum over solves of the largest
+    per-sample count), cg_iterations_per_sample ((B,) totals), last_iterations, last_residual
+    (the TRUE relative residual |b - D x| / |b| of the full or block system, per sample) and
+    unconverged_solves; `reset_stats()` zeroes them. After every solve the residual is compared
+    with `convergence_limit(tol)` = 10 max(tol, 1e3 eps): `on_unconverged` "raise" (default) raises
+    a RuntimeError naming the kind ("refresh": the block solves of R eta; "action"; "force"),
+    "warn" warns once per kind, "ignore" only counts. Every solve goes through `_solve(op, b, tol)`
+    (looked up on the instance at call time, so a wrapper such as main_hmc's SolveTimer sees it).
+    """
+
+    _count = TwoFlavourWilson._count
+    _check_converged = TwoFlavourWilson._check_converged
+
+    def __init__(self, kappa, blocks, time_sign=-1.0, solver_tol=1e-10, action_tol=None, max_iter=5000,
+                 on_unconverged="raise"):
+        if on_unconverged not in ON_UNCONVERGED:
+            raise ValueError(f"on_unconverged must be one of {ON_UNCONVERGED}, got {on_unconverged!r}")
+        self.on_unconverged = on_unconverged
+        self._warned = set()
+        self._solve_kind = None
         self.kappa = kappa
         self.blocks = blocks
         self.geometry = blocks.geometry
@@ -333,31 +390,53 @@ class SchurTwoFlavour(ActionTerm):
         self.phi = None
         self._refresh_links = None
         self._refresh_action = None
-        self.stats = {"solves": 0, "iterations": 0}
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.stats = {"refresh_calls": 0, "action_calls": 0, "force_calls": 0, "solves": 0,
+                      "cg_iterations": 0, "cg_iterations_per_sample": None, "last_iterations": None,
+                      "last_residual": None, "unconverged_solves": 0}
+
+    def _solve(self, op, b, tol):
+        """D^-1 b for a `WilsonDirac` op (the full or the block operator): even-odd CGNE from zero,
+        then the bookkeeping and the convergence check on the true residual of D x = b."""
+        res = solve(op.even_odd(), b, method="cgne", tol=tol, max_iter=self.max_iter)
+        self._count(res, tol, self._solve_kind or "solve")
+        return res.x
 
     def operators(self, U, tol):
-        return DDOperators(U, self.kappa, self.blocks, self.time_sign, tol=tol, max_iter=self.max_iter)
+        return DDOperators(U, self.kappa, self.blocks, self.time_sign, tol=tol, max_iter=self.max_iter,
+                           solver=lambda op, b, t: self._solve(op, b, t))
 
-    def _book(self, ops):
-        self.stats["solves"] += ops.solves
-        self.stats["iterations"] += ops.iterations
+    def _as(self, kind, fn, *args):
+        self._solve_kind = kind
+        try:
+            return fn(*args)
+        finally:
+            self._solve_kind = None
 
     @property
     def n_components(self):
         g = self.geometry
         return int(self.blocks.exterior_boundary.sum().item()) * g.spin * g.N
 
-    def refresh(self, U, generator=None):
-        """phi_R = R eta, eta complex Gaussian on dOmega*; S_R(U) = eta^dag eta."""
-        ops = self.operators(U, self.action_tol)
+    def _draw_eta(self, U, generator):
         eta = torch.randn(self.geometry.wilson_shape(U.shape[0]), generator=generator, dtype=U.dtype,
                           device=U.device)
-        eta = self.blocks.field_mask(self.blocks.exterior_boundary, eta) * eta
-        self.phi = ops.R(eta)
-        self._book(ops)
+        return self.blocks.field_mask(self.blocks.exterior_boundary, eta) * eta
+
+    def _set_refresh(self, U, eta):
         self._refresh_links = U
         self._refresh_version = U._version
         self._refresh_action = (eta.conj() * eta).real.reshape(eta.shape[0], -1).sum(1)
+        self.stats["refresh_calls"] += 1
+
+    def refresh(self, U, generator=None):
+        """phi_R = R eta, eta complex Gaussian on dOmega*; S_R(U) = eta^dag eta."""
+        ops = self.operators(U, self.action_tol)
+        eta = self._draw_eta(U, generator)
+        self.phi = self._as("refresh", ops.R, eta)
+        self._set_refresh(U, eta)
 
     def chi(self, U, tol):
         if self.phi is None:
@@ -366,8 +445,8 @@ class SchurTwoFlavour(ActionTerm):
         return ops, ops.R_inverse(self.phi)
 
     def action(self, U):
-        ops, chi = self.chi(U, self.action_tol)
-        self._book(ops)
+        self.stats["action_calls"] += 1
+        _, chi = self._as("action", self.chi, U, self.action_tol)
         return (chi.conj() * chi).real.reshape(chi.shape[0], -1).sum(1)
 
     def action_difference(self, U_old, U_new):
@@ -382,12 +461,12 @@ class SchurTwoFlavour(ActionTerm):
         """F_R = -2 kappa hopping_derivative(D, zeta, x) on the active links (module doc)."""
         if self.phi is None:
             raise RuntimeError("phi_R is not set: call refresh(U, generator) first")
+        self.stats["force_calls"] += 1
         ops = self.operators(U, self.solver_tol)
         P = self.blocks.field_mask(self.blocks.exterior_boundary, self.phi)
-        x = ops.full_solve(ops.D_dOmega(self.phi))
+        x = self._as("force", ops.full_solve, ops.D_dOmega(self.phi))
         chi = P * (self.phi - x)
-        zeta = ops.full_solve_dagger(chi)
-        self._book(ops)
+        zeta = self._as("force", ops.full_solve_dagger, chi)
         G = hopping_derivative(ops.full, zeta, x)
         k = ops.full.kappa.view((-1,) + (1,) * (G.dim() - 1)).to(G.dtype)
         return self.blocks.link_mask(self.blocks.active_links, U) * (-2.0 * k * G)
@@ -418,7 +497,10 @@ class DDHMCHamiltonian(Hamiltonian):
     """Levels: [Schur term] (outermost), [block term] x n_block_substeps, [masked gauge] x
     n_gauge_substeps. All forces vanish off the active links. `block_kwargs` go to
     `BlockTwoFlavour` (i.e. `TwoFlavourWilson`: solver_tol, action_tol, max_iter, reuse_guess,
-    even_odd, ...), `schur_kwargs` to `SchurTwoFlavour` (solver_tol, action_tol, max_iter). No
+    even_odd, on_unconverged, ...), `schur_kwargs` to `SchurTwoFlavour` (solver_tol, action_tol,
+    max_iter, on_unconverged). The hierarchy is the paper's: the Schur (global) force is the
+    smallest and the most expensive, so it has the largest step (the HMC n_steps), the block force
+    the middle one, the gauge force the smallest. No
     `plaquette_weights`: the gauge term has no defect, as required by the translations of
     `DDHMC.cycle` (`check_translation_invariant`)."""
 
